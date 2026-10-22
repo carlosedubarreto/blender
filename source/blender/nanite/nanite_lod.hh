@@ -45,6 +45,18 @@ struct NaniteViewInfo {
  */
 NaniteViewInfo getViewInfo(const float4x4 &viewProj, float viewportHeight);
 
+/** Sphere vs. frustum test (Gribb-Hartmann planes, normalized). */
+bool sphere_in_frustum(const float planes[6][4], const float3 &center,
+                       float radius);
+
+/**
+ * Project a world-space error value to screen pixels, accounting for the
+ * distance of the camera to the cluster (perspective-correct metric).
+ */
+float projectedErrorPx(const float3 &center, float radius, float error,
+                       const float3 &camPos, float viewportHeight,
+                       float projScaleY, bool orthographic);
+
 /**
  * Select clusters to draw for a given camera view and viewport height.
  *

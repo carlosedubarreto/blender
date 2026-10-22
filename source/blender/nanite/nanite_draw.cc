@@ -71,7 +71,46 @@ void NaniteDrawPass::update(const NaniteData &data,
     data_ = data;
     view_proj_ = viewProj;
     viewport_height_ = viewportHeight;
+
+    if (mStreamer != nullptr && mStreamer->isOpen()) {
+        /* Error-driven requests: what would be drawn but is not resident. */
+        NaniteLodParams lod_params;
+        lod_params.pixelError = 1.0f;
+        std::vector<uint32_t> requests;
+        collectStreamingRequests(
+            data_, view_proj_, viewport_height_, lod_params, requests);
+        mStreamer->requestClusters(requests);
+
+        NaniteData assembled;
+        mStreamer->update(++mFrame, assembled);
+        if (assembled.clusters.size() == data_.clusters.size()) {
+            data_ = assembled;
+        }
+    }
+
     renderer_.update(data_, view_proj_, viewport_height_);
+}
+
+bool NaniteDrawPass::openStreaming(const std::string &paged_path,
+                                   const NaniteData &full)
+{
+    if (mStreamer == nullptr) {
+        mStreamer = new NanitePageManager();
+    }
+    if (!mStreamer->open(paged_path)) {
+        return false;
+    }
+    mStreamer->seedRecords(full);
+    return true;
+}
+
+void NaniteDrawPass::closeStreaming()
+{
+    if (mStreamer != nullptr) {
+        mStreamer->close();
+        delete mStreamer;
+        mStreamer = nullptr;
+    }
 }
 
 void NaniteDrawPass::setShadingMode(NaniteShadingMode mode)

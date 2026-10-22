@@ -41,6 +41,8 @@ set(SRC
   nanite_gpu_traverse.cc
   nanite_visibility.hh
   nanite_visibility.cc
+  nanite_paging.hh
+  nanite_paging.cc
   nanite_renderer.hh
   nanite_renderer.cc
   nanite_draw.hh

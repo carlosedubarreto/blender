@@ -67,48 +67,7 @@ void extract_frustum_planes(const float4x4 &viewProj, float planes[6][4])
     }
 }
 
-bool sphere_outside_plane(const float planes[4], const float3 &center,
-                          float radius)
-{
-    const float dist = planes[0] * center.x + planes[1] * center.y +
-                       planes[2] * center.z + planes[3];
-    return dist < -radius;
-}
-
-bool sphere_in_frustum(const float planes[6][4], const float3 &center,
-                       float radius)
-{
-    for (int p = 0; p < 6; ++p) {
-        if (sphere_outside_plane(planes[p], center, radius)) {
-            return false;
-        }
-    }
-    return true;
-}
-
 // --- PART2 ---
-
-/**
- * Project a world-space error value to screen pixels, accounting for the
- * distance of the camera to the cluster (a real perspective-correct metric,
- * unlike the old radius-proportional heuristic).
- */
-float projectedErrorPx(const float3 &center, float radius, float error,
-                       const float3 &camPos, float viewportHeight,
-                       float projScaleY, bool orthographic)
-{
-    if (error <= 0.0f) {
-        return 0.0f;
-    }
-    /* Perspective: divide by the distance to the cluster (minus the radius,
-     * so distant-but-large clusters are not over-refined — same as UE).
-     * Orthographic: pure scale, distance-independent. */
-    const float dist = orthographic ?
-                           1.0f :
-                           std::max(math::distance(camPos, center) - radius,
-                                    1e-6f);
-    return error * projScaleY * (viewportHeight * 0.5f) / dist;
-}
 
 /** Context shared by the traversal recursion. */
 struct TraversalContext {
@@ -175,6 +134,42 @@ void traverseCluster(const TraversalContext &ctx, uint32_t ci)
 }
 
 }  // namespace
+
+bool sphere_outside_plane(const float planes[4], const float3 &center,
+                          float radius)
+{
+    const float dist = planes[0] * center.x + planes[1] * center.y +
+                       planes[2] * center.z + planes[3];
+    return dist < -radius;
+}
+
+bool sphere_in_frustum(const float planes[6][4], const float3 &center,
+                       float radius)
+{
+    for (int p = 0; p < 6; ++p) {
+        if (sphere_outside_plane(planes[p], center, radius)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+float projectedErrorPx(const float3 &center, float radius, float error,
+                       const float3 &camPos, float viewportHeight,
+                       float projScaleY, bool orthographic)
+{
+    if (error <= 0.0f) {
+        return 0.0f;
+    }
+    /* Perspective: divide by the distance to the cluster (minus the radius,
+     * so distant-but-large clusters are not over-refined — same as UE).
+     * Orthographic: pure scale, distance-independent. */
+    const float dist = orthographic ?
+                           1.0f :
+                           std::max(math::distance(camPos, center) - radius,
+                                    1e-6f);
+    return error * projScaleY * (viewportHeight * 0.5f) / dist;
+}
 
 float clusterScreenError(const NaniteCluster &cluster, float viewportHeight)
 {
@@ -401,6 +396,11 @@ std::size_t selectClustersFlat(const NaniteData &data,
     std::size_t emitted = 0;
     for (uint32_t ci = 0; ci < uint32_t(data.clusters.size()); ++ci) {
         const NaniteCluster &cluster = data.clusters[ci];
+        /* Streaming residency: stub clusters (no vertex/index data) are
+         * never drawn; their pages are requested by the page manager. */
+        if (cluster.indexCount == 0) {
+            continue;
+        }
         const float3 center(cluster.sphere[0], cluster.sphere[1],
                             cluster.sphere[2]);
         const float radius = cluster.sphere[3];
@@ -418,6 +418,12 @@ std::size_t selectClustersFlat(const NaniteData &data,
                uint32_t(ancestor) < data.clusters.size())
         {
             const NaniteCluster &a = data.clusters[uint32_t(ancestor)];
+            if (a.indexCount == 0) {
+                /* Non-resident ancestors cannot emit (UE-style: descend
+                 * through missing pages). */
+                ancestor = a.parentGroup;
+                continue;
+            }
             const float3 ac(a.sphere[0], a.sphere[1], a.sphere[2]);
             if (!sphere_in_frustum(view.planes, ac, a.sphere[3])) {
                 ancestor_emitted = true;

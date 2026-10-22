@@ -12,7 +12,11 @@
 #pragma once
 
 #include "nanite.h"
+#include "nanite_paging.hh"
 #include "nanite_renderer.hh"
+
+#include <cstdint>
+#include <string>
 
 #include <cstddef>
 
@@ -37,6 +41,11 @@ bool drawNaniteData(const NaniteData &data,
  * material shading). Add this pass to your engine's pass list and call
  * init()/update()/draw() per frame. The draw step renders into the currently
  * bound framebuffer.
+ *
+ * Optionally the pass drives a #NanitePageManager: when streaming is open,
+ * update() collects error-driven requests from the last frame, pumps the
+ * async loader and renders the resident subset (missing pages appear as
+ * stubs and are simply not drawn until loaded).
  */
 class NaniteDrawPass
 {
@@ -61,12 +70,19 @@ public:
 
     size_t drawCount() const;
 
+    /** Enable streaming from a paged .nc2 file. */
+    bool openStreaming(const std::string &paged_path, const NaniteData &full);
+    void closeStreaming();
+    bool streaming() const { return mStreamer != nullptr; }
+
 private:
     NaniteData data_;
     float4x4 view_proj_;
     float viewport_height_;
 
     mutable NaniteRenderer renderer_;
+    NanitePageManager *mStreamer = nullptr;
+    uint64_t mFrame = 0;
 };
 
 }  // namespace nanite

@@ -64,10 +64,18 @@ void main()
 
   /* Walk up the ancestor chain: if any ancestor would emit, the recursive
    * traversal stopped there and never reached this cluster; if any
-   * ancestor's sphere is outside the frustum, the subtree was pruned. */
-  uint ancestor = parent;
+   * ancestor's sphere is outside the frustum, the subtree was pruned.
+   * Non-resident ancestors (streaming stubs, indexCount == 0) cannot emit,
+   * so the walk descends through them. */
+  uint ancestor = meta.w;
   bool ancestor_emitted = false;
   for (int depth = 0; depth < 64 && ancestor != 0xFFFFFFFFu; ++depth) {
+    uvec4 ameta = cluster_meta[ancestor];
+    if (ameta.y == 0u) {
+      /* Non-resident stub. */
+      ancestor = ameta.w;
+      continue;
+    }
     vec4 asphere = cluster_sphere[ancestor];
     vec3 acenter = asphere.xyz;
     bool a_outside = false;
@@ -98,7 +106,8 @@ void main()
   }
 
   bool leaf = (meta.z == 0u);
-  if (!(leaf || test_c)) {
+  bool resident = (meta.y != 0u);
+  if (!(resident && (leaf || test_c))) {
     return;
   }
 

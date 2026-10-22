@@ -85,7 +85,7 @@ struct NaniteHeader
     uint32_t maxClusterTriangles;
     uint32_t maxClusterVertices;
     uint32_t flags;  // bit0: has UV, bit1: has normals
-    uint32_t pad;
+    uint32_t pageCount;  // v2 paged format: number of pages (0 for v1)
     float    boundsMin[3];
     float    boundsMax[3];
     float    uvMin[2];
