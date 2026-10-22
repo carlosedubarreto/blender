@@ -74,6 +74,8 @@ public:
     bool openStreaming(const std::string &paged_path, const NaniteData &full);
     void closeStreaming();
     bool streaming() const { return mStreamer != nullptr; }
+    /** True when no pages are missing anymore. */
+    bool streamingSettled() const;
 
 private:
     NaniteData data_;

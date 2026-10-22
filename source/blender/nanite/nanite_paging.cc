@@ -625,6 +625,17 @@ void collectStreamingRequests(const NaniteData &data,
             continue; /* resident and drawable */
         }
         out_requests.push_back(ci);
+        /* Prefetch the missing ancestors as well: without them the LOD
+         * cuts cannot engage (every visible leaf would be drawn) and the
+         * resident set never settles. */
+        int32_t up = cluster.parentGroup;
+        while (up >= 0 && uint32_t(up) < data.clusters.size()) {
+            const NaniteCluster &a = data.clusters[uint32_t(up)];
+            if (a.indexCount == 0) {
+                out_requests.push_back(uint32_t(up));
+            }
+            up = a.parentGroup;
+        }
     }
 }
 

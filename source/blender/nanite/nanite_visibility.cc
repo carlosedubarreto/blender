@@ -1,4 +1,4 @@
-/* SPDX-FileCopyrightText: 2006 Blender Authors
+﻿/* SPDX-FileCopyrightText: 2006 Blender Authors
  *
  * SPDX-License-Identifier: GPL-2.0-or-later
  */
@@ -22,6 +22,7 @@
 #include "GPU_vertex_buffer.hh"
 #include "GPU_vertex_format.hh"
 
+#include <cstdio>
 #include <cstring>
 
 namespace blender {
@@ -121,7 +122,9 @@ void main()
   vec2 u2 = vec2(uvs[i2 * 2u], uvs[i2 * 2u + 1u]);
 
   vec3 pos = bary.x * p0 + bary.y * p1 + bary.z * p2;
-  vec3 nor = normalize(bary.x * n0 + bary.y * n1 + bary.z * n2);
+  vec3 nor_v = bary.x * n0 + bary.y * n1 + bary.z * n2;
+  float nor_len = length(nor_v);
+  vec3 nor = nor_len > 1e-20 ? nor_v / nor_len : vec3(0.0, 0.0, 1.0);
   vec2 uv = bary.x * u0 + bary.y * u1 + bary.z * u2;
 
   if (shading_mode == 1u) {
@@ -139,7 +142,7 @@ void main()
   /* Headlight diffuse with a touch of UV tint for orientation. */
   vec3 light_dir = normalize(camera_pos - pos);
   float diffuse = max(dot(nor, light_dir), 0.0);
-  vec3 base = vec3(0.5, 0.5, 0.52) + vec3(0.2, 0.1, 0.0) * uv;
+  vec3 base = vec3(0.5, 0.5, 0.52) + vec3(0.2, 0.1, 0.0) * vec3(uv, 0.0);
   out_color = vec4(base * (0.15 + 0.85 * diffuse), 1.0);
 }
 )";
@@ -149,9 +152,10 @@ gpu::Shader *createVisShader()
 {
     using namespace blender::gpu::shader;
 
-    ShaderCreateInfo info("nanite_vis");
+    ShaderCreateInfo info("pyGPU_Shader");
     info.builtins_ |= BuiltinBits::NO_BUFFER_TYPE_LINTING;
 
+    info.early_fragment_test(true);
     info.vertex_source("nanite_vis");
     info.vertex_source_generated = VIS_VERT_SOURCE;
     info.fragment_source("nanite_vis");
@@ -178,7 +182,7 @@ gpu::Shader *createVisShader()
     info.vertex_out(iface);
 
     const GPUShaderCreateInfo *raw = reinterpret_cast<const GPUShaderCreateInfo *>(&info);
-    return GPU_shader_create_from_info(raw);
+    return GPU_shader_create_from_info_python(raw);
 }
 
 /** Create the material-pass shader (fullscreen shading). */
@@ -186,7 +190,7 @@ gpu::Shader *createMaterialShader()
 {
     using namespace blender::gpu::shader;
 
-    ShaderCreateInfo info("nanite_material");
+    ShaderCreateInfo info("pyGPU_Shader");
     info.builtins_ |= BuiltinBits::NO_BUFFER_TYPE_LINTING;
 
     info.vertex_source("nanite_material");
@@ -207,7 +211,7 @@ gpu::Shader *createMaterialShader()
     info.push_constant(Type::int_t, "shading_mode");
 
     const GPUShaderCreateInfo *raw = reinterpret_cast<const GPUShaderCreateInfo *>(&info);
-    return GPU_shader_create_from_info(raw);
+    return GPU_shader_create_from_info_python(raw);
 }
 
 }  // namespace
@@ -260,10 +264,10 @@ void NaniteVisibilityPass::terminate()
     GPU_FRAMEBUFFER_FREE_SAFE(mFrameBuffer);
     GPU_TEXTURE_FREE_SAFE(mVisTexture);
     GPU_TEXTURE_FREE_SAFE(mDepthTexture);
+    /* The batches own their vertex buffers (GPU_BATCH_OWNS_VBO); discarding
+     * the batch frees the VBO — discarding it again would double-free. */
     GPU_BATCH_DISCARD_SAFE(mFullscreenBatch);
-    GPU_VERTBUF_DISCARD_SAFE(mFullscreenVbo);
     GPU_BATCH_DISCARD_SAFE(mMeshBatch);
-    GPU_VERTBUF_DISCARD_SAFE(mIndexVbo);
     GPU_SHADER_FREE_SAFE(mVisShader);
     GPU_SHADER_FREE_SAFE(mMaterialShader);
     if (mPositionsBuf != nullptr) { GPU_storagebuf_free(mPositionsBuf); mPositionsBuf = nullptr; }
@@ -430,7 +434,7 @@ void NaniteVisibilityPass::render(gpu::StorageBuf *command_buf,
     GPU_depth_test(GPU_DEPTH_NONE);
     GPU_blend(GPU_BLEND_NONE);
 
-    GPU_shader_bind(mMaterialShader);
+    GPU_batch_set_shader(mFullscreenBatch, mMaterialShader);
     GPU_storagebuf_bind(mPositionsBuf, 0);
     GPU_storagebuf_bind(mNormalsBuf, 1);
     GPU_storagebuf_bind(mUvsBuf, 2);
@@ -442,6 +446,7 @@ void NaniteVisibilityPass::render(gpu::StorageBuf *command_buf,
 
     GPU_batch_draw(mFullscreenBatch);
 }
+
 
 void NaniteVisibilityPass::set_data(const NaniteData &data)
 {

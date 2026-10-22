@@ -77,7 +77,7 @@ def serialize_to_memory(data):
     buf = bytearray()
     buf += _pack_header(data.header)
     for c in data.clusters:
-        buf += struct.pack("<10fIIiIIIII",
+        buf += struct.pack("<10fIIiIIII",
                            c["sphere"][0], c["sphere"][1], c["sphere"][2],
                            c["sphere"][3],
                            c["parentSphere"][0], c["parentSphere"][1],
@@ -85,12 +85,12 @@ def serialize_to_memory(data):
                            c["error"], c["parentError"],
                            c["firstIndex"], c["indexCount"],
                            c["parentGroup"], c["group"],
-                           c["level"], c["flags"], 0, 0)
+                           c["level"], c["flags"])
     return bytes(buf)
 
 
 _HEADER_SIZE = 88   # sizeof(NaniteHeader)
-_CLUSTER_SIZE = 72  # sizeof(NaniteCluster)
+_CLUSTER_SIZE = 64  # sizeof(NaniteCluster)
 
 
 def deserialize_from_memory(path):
@@ -127,8 +127,8 @@ def deserialize_from_memory(path):
     offset = _HEADER_SIZE
     for _ in range(cluster_count):
         (s0, s1, s2, s3, p0, p1, p2, p3, error, parent_error,
-         first_index, index_count_c, parent_group, group, level, cflags,
-         _pad0, _pad1) = struct.unpack_from("<10fIIiIIIII", raw, offset)
+         first_index, index_count_c, parent_group, group, level, cflags
+         ) = struct.unpack_from("<10fIIiIIII", raw, offset)
         data.clusters.append({
             "sphere": (s0, s1, s2, s3),
             "parentSphere": (p0, p1, p2, p3),

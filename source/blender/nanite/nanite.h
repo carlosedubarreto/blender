@@ -41,7 +41,11 @@ struct NaniteVertex
 
 static_assert(sizeof(NaniteVertex) == 16, "NaniteVertex must be 16 bytes");
 
-/** LOD cluster (72 bytes). Mirrors Nanite_CUP2 Node. */
+/**
+ * LOD cluster (64 bytes, std430-compatible for direct GPU SSBO mapping).
+ * Mirrors Nanite_CUP2 Node. The layout is shared with the GPU traversal
+ * compute shader (#nanite_traverse.comp.glsl) — keep them in sync!
+ */
 struct NaniteCluster
 {
     float sphere[4];        // own bounding sphere (xyz, r)
@@ -53,11 +57,10 @@ struct NaniteCluster
     int32_t  parentGroup;   // -1 for roots
     uint32_t group;         // own group id
     uint32_t level;         // 0 = finest
-    uint32_t flags;
-    uint32_t pad[2];
+    uint32_t flags;         // bit0: has UV, bit1: has normals
 };
 
-static_assert(sizeof(NaniteCluster) == 72, "NaniteCluster must be 72 bytes");
+static_assert(sizeof(NaniteCluster) == 64, "NaniteCluster must be 64 bytes");
 
 /** Indirect draw command: matches VkDrawIndexedIndirectCommand. */
 struct NaniteDrawCommand

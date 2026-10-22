@@ -68,11 +68,18 @@ void NaniteDrawPass::update(const NaniteData &data,
                             const float4x4 &viewProj,
                             float viewportHeight)
 {
-    data_ = data;
     view_proj_ = viewProj;
     viewport_height_ = viewportHeight;
 
     if (mStreamer != nullptr && mStreamer->isOpen()) {
+        /* Streaming mode: data_ holds the assembled resident subset (with
+         * stubs for missing pages). The full data was seeded at open time;
+         * adopting the caller's full data here would erase the stubs and
+         * silence the request collection. */
+        if (data_.clusters.size() != mStreamer->clusterCount()) {
+            data_ = data; /* first frame: adopt, then immediately stubbed */
+        }
+
         /* Error-driven requests: what would be drawn but is not resident. */
         NaniteLodParams lod_params;
         lod_params.pixelError = 1.0f;
@@ -83,9 +90,12 @@ void NaniteDrawPass::update(const NaniteData &data,
 
         NaniteData assembled;
         mStreamer->update(++mFrame, assembled);
-        if (assembled.clusters.size() == data_.clusters.size()) {
+        if (assembled.clusters.size() == mStreamer->clusterCount()) {
             data_ = assembled;
         }
+    }
+    else {
+        data_ = data;
     }
 
     renderer_.update(data_, view_proj_, viewport_height_);
@@ -111,6 +121,11 @@ void NaniteDrawPass::closeStreaming()
         delete mStreamer;
         mStreamer = nullptr;
     }
+}
+
+bool NaniteDrawPass::streamingSettled() const
+{
+    return mStreamer == nullptr || mStreamer->fullyResident();
 }
 
 void NaniteDrawPass::setShadingMode(NaniteShadingMode mode)

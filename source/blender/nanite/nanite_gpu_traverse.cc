@@ -131,7 +131,10 @@ void main()
 }
 )";
 
-    gshader::ShaderCreateInfo info("nanite_traverse");
+    /* NOTE: The info name must be "pyGPU_Shader": the python-path shader
+     * compiler expands resource declarations through the hardcoded
+     * CREATE_INFO_RES_PASS_pyGPU_Shader hook. */
+    gshader::ShaderCreateInfo info("pyGPU_Shader");
     info.local_group_size(64, 1, 1);
     /* The SSBO element types below are plain GLSL scalar/vector types; flag
      * the info so they are not confused with host-shared struct linting. */
@@ -164,7 +167,7 @@ void main()
     info.compute_source_generated = COMPUTE_SOURCE;
 
     const GPUShaderCreateInfo *raw = reinterpret_cast<const GPUShaderCreateInfo *>(&info);
-    return GPU_shader_create_from_info(raw);
+    return GPU_shader_create_from_info_python(raw);
 }
 
 }  // namespace nanite

@@ -196,6 +196,7 @@ void OBJECT_OT_camera_custom_update(wmOperatorType *ot);
 /* `object_nanite.cc` */
 
 void OBJECT_OT_nanite_build(wmOperatorType *ot);
+void OBJECT_OT_nanite_gpu_test(wmOperatorType *ot);
 
 /* `object_modifier.cc` */
 

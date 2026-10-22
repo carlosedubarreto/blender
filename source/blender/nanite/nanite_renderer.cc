@@ -1,4 +1,4 @@
-/* SPDX-FileCopyrightText: 2006 Blender Authors
+﻿/* SPDX-FileCopyrightText: 2006 Blender Authors
  *
  * SPDX-License-Identifier: GPL-2.0-or-later
  */
@@ -19,6 +19,7 @@
 #include "GPU_context.hh"
 #include "GPU_storage_buffer.hh"
 
+#include <cstdio>
 #include <cfloat>
 
 using namespace blender;

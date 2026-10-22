@@ -295,6 +295,7 @@ void operatortypes_object()
 
   /* Nanite virtual geometry. */
   WM_operatortype_append(OBJECT_OT_nanite_build);
+  WM_operatortype_append(OBJECT_OT_nanite_gpu_test);
 
   object_modifier_add_asset_register();
   collection_importer_register();
