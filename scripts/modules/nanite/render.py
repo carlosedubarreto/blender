@@ -1,23 +1,25 @@
 """Nanite rendering integration.
 
-This module is a thin Python wrapper around the compiled GPU backend
-(``blender::nanite``). The Python API exposes:
+This module is a thin Python wrapper around a renderer object (today the
+pure-Python data path; the compiled ``blender::nanite`` backend exposes the
+same interface). The Python API exposes:
 
     nanite.render.draw_nanite(data, view_proj, viewport_height, batch, renderer)
 
-where ``renderer`` is a :class:`NaniteRenderer` instance and ``batch`` is a
-``gpu::Batch`` configured with the mesh vertex/index buffers.
+where ``data`` is the :class:`NaniteData` returned by
+``nanite.load.get_loaded_data()`` and ``batch`` is a ``gpu.types.GPUBatch``
+configured with the mesh vertex/index buffers.
 
 Example::
 
     import bpy
     import nanite
 
-    data = bpy.context.window_manager.nanite_data
+    data = nanite.load.get_loaded_data()
     view_proj = ...            # compute from the current camera
     viewport_height = ...      # pixels
-    batch = ...                # gpu::Batch for the mesh
-    renderer = nanite.NaniteRenderer()
+    batch = ...                # GPUBatch for the mesh
+    renderer = ...             # object with init/update/draw/drawCount
     renderer.init()
     renderer.update(data, view_proj, viewport_height)
     renderer.draw(batch)
@@ -25,9 +27,7 @@ Example::
 """
 
 import bpy
-from bpy.props import PointerProperty
-
-from ..nanite import NaniteRenderer  # C++ renderer class
+from bpy.props import PointerProperty, StringProperty, BoolProperty
 
 
 def draw_nanite(data, view_proj, viewport_height, batch, renderer):
@@ -65,8 +65,10 @@ class NaniteProperties(bpy.types.PropertyGroup):
 
 
 def register():
+    bpy.utils.register_class(NaniteProperties)
     bpy.types.Object.nanite = PointerProperty(type=NaniteProperties)
 
 
 def unregister():
     del bpy.types.Object.nanite
+    bpy.utils.unregister_class(NaniteProperties)

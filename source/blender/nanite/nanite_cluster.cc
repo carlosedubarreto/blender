@@ -11,11 +11,18 @@
 
 #include "nanite_cluster.hh"
 
+#include "BKE_attribute.hh"
 #include "BKE_mesh.hh"
+
+#include "BLI_index_range.hh"
+#include "BLI_math_vector.hh"
+
+#include "nanite_cluster_builder.hh"
 
 #include <algorithm>
 #include <cstring>
 #include <limits>
+#include <unordered_set>
 #include <vector>
 
 namespace blender {
@@ -28,23 +35,23 @@ void computeTriangleSphere(const float3 &a, const float3 &b, const float3 &c,
     const float3 ab = b - a;
     const float3 ac = c - a;
     const float3 bc = c - b;
-    const float dAB = lengthSquared(ab);
-    const float dAC = lengthSquared(ac);
-    const float dBC = lengthSquared(bc);
-    const float3 &e1 = (dAB >= dAC) ? ((dAB >= dBC) ? ab : bc)
-                                     : ((dAC >= dBC) ? ac : bc);
-    const float3 &e2 = (dAB >= dAC) ? ((dAB >= dBC) ? ac : bc)
-                                     : ((dAC >= dBC) ? ab : bc);
+    const float dAB = math::length_squared(ab);
+    const float dAC = math::length_squared(ac);
+    const float dBC = math::length_squared(bc);
+    const float3 e1 = (dAB >= dAC) ? ((dAB >= dBC) ? ab : bc)
+                                   : ((dAC >= dBC) ? ac : bc);
+    const float3 e2 = (dAB >= dAC) ? ((dAB >= dBC) ? ac : bc)
+                                   : ((dAC >= dBC) ? ab : bc);
     const float3 mid = (e1 + e2) * 0.5f;
-    float len = length(e2 - e1);
+    float len = math::length(e2 - e1);
     len = len > 0.0f ? len : 1.0f;
     center = mid;
-    radius = length(e2 - mid);
-    float d = length(a - center);
+    radius = math::length(e2 - mid);
+    float d = math::distance(a, center);
     if (d > radius) { radius = d; }
-    d = length(b - center);
+    d = math::distance(b, center);
     if (d > radius) { radius = d; }
-    d = length(c - center);
+    d = math::distance(c, center);
     if (d > radius) { radius = d; }
 }
 
@@ -52,109 +59,179 @@ void computeTriangleSphere(const float3 &a, const float3 &b, const float3 &c,
 
 bool buildFromMesh(const Mesh &mesh, NaniteData &out)
 {
-    if (mesh.totvert == 0 || mesh.totface == 0) {
+    const Span<float3> vert_positions = mesh.vert_positions();
+    const Span<int> corner_verts = mesh.corner_verts();
+    const OffsetIndices<int> faces = mesh.faces();
+    const Span<float3> vert_normals = mesh.vert_normals();
+    const bke::AttributeReader<float2> uvs_reader = mesh.attributes().lookup<float2>(
+        "uv_map", bke::AttrDomain::Corner);
+    const bool has_uvs = bool(uvs_reader);
+
+    const int verts_num = vert_positions.size();
+    const int faces_num = faces.size();
+    if (verts_num == 0 || faces_num == 0) {
         return false;
     }
 
     out.header.magic = kNc2Magic;
     out.header.version = kNc2Version;
-    out.header.vertexCount = static_cast<uint32_t>(mesh.totvert);
-    out.header.indexCount = static_cast<uint32_t>(mesh.totface * 3);
     out.header.flags = 0;
-    if (mesh.totloop > 0) { out.header.flags |= 1; }  // has UV
-    if (mesh.rtvert > 0) { out.header.flags |= 2; }   // has normals
-    out.header.boundsMin = float3(std::numeric_limits<float>::max());
-    out.header.boundsMax = float3(-std::numeric_limits<float>::max());
-    out.header.pad = 0;
-    out.header.levelCount = 1;
-    out.header.maxClusterTriangles = mesh.totface;
-    out.header.maxClusterVertices = mesh.totvert;
-    out.header.proxyVertexCount = mesh.totvert;
-    out.header.proxyIndexCount = mesh.totface * 3;
+    if (has_uvs) { out.header.flags |= 1; }                   // has UV
+    if (!vert_normals.is_empty()) { out.header.flags |= 2; }  // has normals
 
-    out.positions.reserve(mesh.totvert);
-    out.indices.reserve(mesh.totface * 3);
-    if (mesh.rtvert > 0) { out.normals.reserve(mesh.totvert); }
-    if ((out.header.flags & 1) != 0 && mesh.totloop > 0) {
-        out.uvs.reserve(mesh.totloop);
+    /* Input vertex pool with attributes. */
+    std::vector<detail::BuildVertex> input_verts;
+    input_verts.resize(size_t(verts_num));
+    for (const int i : IndexRange(verts_num)) {
+        input_verts[i].position = vert_positions[i];
+        input_verts[i].normal = vert_normals.is_empty() ? float3(0.0f) :
+                                                          vert_normals[i];
+        input_verts[i].uv = has_uvs ? uvs_reader.varray[i] : float2(0.0f);
     }
 
-    // Vertices
-    for (int i = 0; i < mesh.totvert; ++i) {
-        const MVert &v = mesh.verts[i];
-        out.positions.push_back(float3(v.co.x, v.co.y, v.co.z));
-        if (mesh.rtvert > 0) {
-            out.normals.push_back(float3(v.norm[0], v.norm[1], v.norm[2]));
+    /* Input triangles: fan triangulation of every face. */
+    size_t tri_reserve = 0;
+    for (const int i : faces.index_range()) {
+        const int face_size = faces[i].size();
+        if (face_size >= 3) {
+            tri_reserve += face_size - 2;
         }
     }
-    // UVs
-    if ((out.header.flags & 1) != 0 && mesh.totloop > 0) {
-        for (int i = 0; i < mesh.totloop; ++i) {
-            const MLoop &l = mesh.loops[i];
-            out.uvs.push_back(float2(l.tx, l.ty));
+    if (tri_reserve == 0) {
+        return false;
+    }
+    std::vector<uint32_t> tri_verts;
+    tri_verts.reserve(tri_reserve * 3);
+    for (const int i : faces.index_range()) {
+        const IndexRange face = faces[i];
+        if (face.size() < 3) {
+            continue;
+        }
+        const int v0 = corner_verts[face.start()];
+        for (int k = 1; k + 1 < face.size(); ++k) {
+            tri_verts.push_back(uint32_t(v0));
+            tri_verts.push_back(uint32_t(corner_verts[face.start() + k]));
+            tri_verts.push_back(uint32_t(corner_verts[face.start() + k + 1]));
         }
     }
 
-    // Clusters
-    out.header.clusterCount = static_cast<uint32_t>(mesh.totface);
-    out.clusters.reserve(mesh.totface);
+    /* Build the cluster DAG: region-growing clustering plus hierarchical
+     * merge + QEM simplification. This is the core Nanite front end. */
+    detail::BuilderParams params;
+    const detail::BuildResult dag = detail::buildClusterDAG(
+        input_verts, tri_verts, params);
+    if (dag.clusters.empty()) {
+        return false;
+    }
+
+    /* Per-vertex attribute buffers (all clusters share one vertex pool). */
+    out.positions.resize(dag.verts.size());
+    out.normals.resize(dag.verts.size());
+    out.uvs.resize(dag.verts.size());
+    for (size_t i = 0; i < dag.verts.size(); ++i) {
+        out.positions[i] = dag.verts[i].position;
+        out.normals[i] = dag.verts[i].normal;
+        out.uvs[i] = dag.verts[i].uv;
+    }
+
+    // Clusters: assign contiguous index-buffer ranges and convert DAG nodes.
+    out.header.clusterCount = static_cast<uint32_t>(dag.clusters.size());
+    out.clusters.reserve(dag.clusters.size());
+    out.indices.reserve(dag.tris.size() * 3);
+    uint32_t max_cluster_tris = 0;
+    uint32_t max_cluster_verts = 0;
+
+    for (const auto &c : dag.clusters) {
+        const uint32_t first_index = uint32_t(out.indices.size());
+        for (const uint32_t t : c.tris) {
+            out.indices.push_back(dag.tris[t].v[0]);
+            out.indices.push_back(dag.tris[t].v[1]);
+            out.indices.push_back(dag.tris[t].v[2]);
+        }
+
+        NaniteCluster nc = {};
+        nc.error = c.error;
+        nc.parentError = c.parentError;
+        nc.firstIndex = first_index;
+        nc.indexCount = uint32_t(c.tris.size() * 3);
+        nc.parentGroup = -1;
+        nc.group = uint32_t(out.clusters.size());
+        nc.level = c.level;
+        nc.sphere[0] = c.sphereCenter.x;
+        nc.sphere[1] = c.sphereCenter.y;
+        nc.sphere[2] = c.sphereCenter.z;
+        nc.sphere[3] = c.sphereRadius;
+        nc.parentSphere[0] = c.sphereCenter.x;
+        nc.parentSphere[1] = c.sphereCenter.y;
+        nc.parentSphere[2] = c.sphereCenter.z;
+        nc.parentSphere[3] = c.sphereRadius;
+        nc.flags = out.header.flags;
+
+        /* Unique vertices referenced by this cluster. */
+        std::unordered_set<uint32_t> unique_verts;
+        for (const uint32_t t : c.tris) {
+            for (int k = 0; k < 3; ++k) {
+                unique_verts.insert(dag.tris[t].v[k]);
+            }
+        }
+        max_cluster_tris = std::max(max_cluster_tris, uint32_t(c.tris.size()));
+        max_cluster_verts = std::max(max_cluster_verts,
+                                     uint32_t(unique_verts.size()));
+
+        out.clusters.push_back(nc);
+    }
+
+    /* Parent links (DAG edges). */
+    for (size_t ci = 0; ci < dag.clusters.size(); ++ci) {
+        const auto &c = dag.clusters[ci];
+        for (const uint32_t child : c.children) {
+            out.clusters[child].parentGroup = int32_t(ci);
+            out.clusters[child].parentSphere[0] = c.sphereCenter.x;
+            out.clusters[child].parentSphere[1] = c.sphereCenter.y;
+            out.clusters[child].parentSphere[2] = c.sphereCenter.z;
+            out.clusters[child].parentSphere[3] = c.sphereRadius;
+        }
+    }
+
+    out.header.vertexCount = uint32_t(dag.verts.size());
+    out.header.indexCount = uint32_t(out.indices.size());
+    out.header.maxClusterTriangles = max_cluster_tris;
+    out.header.maxClusterVertices = max_cluster_verts;
+
+    /* Proxy: the finest (level 0) geometry, used for simple non-Nanite
+     * rendering and for occlusion proxying. */
     out.proxyPositions = out.positions;
-    out.proxyIndices.resize(out.indices.size());
-
-    uint32_t nextIndex = 0;
-    for (int i = 0; i < mesh.totface; ++i) {
-        const Poly &p = mesh.polygons[i];
-        const MVert *va = &mesh.verts[p.loopStart];
-        const MVert *vb = &mesh.verts[p.loopStart + 1];
-        const MVert *vc = &mesh.verts[p.loopStart + 2];
-
-        float3 center = float3(0.0f);
-        float radius = 0.0f;
-        detail::computeTriangleSphere(float3(va->co), float3(vb->co),
-                                      float3(vc->co), center, radius);
-
-        NaniteCluster cluster;
-        cluster.error = 0.0f;
-        cluster.parentError = std::numeric_limits<float>::max();
-        cluster.group = 0;
-        cluster.parentGroup = -1;
-        cluster.level = 0;
-        cluster.firstIndex = nextIndex;
-        cluster.indexCount = 3;
-        cluster.sphere[0] = center.x;
-        cluster.sphere[1] = center.y;
-        cluster.sphere[2] = center.z;
-        cluster.sphere[3] = radius;
-        cluster.parentSphere[0] = center.x;
-        cluster.parentSphere[1] = center.y;
-        cluster.parentSphere[2] = center.z;
-        cluster.parentSphere[3] = radius;
-        cluster.flags = out.header.flags;
-
-        out.proxyIndices[nextIndex + 0] = p.loopStart;
-        out.proxyIndices[nextIndex + 1] = p.loopStart + 1;
-        out.proxyIndices[nextIndex + 2] = p.loopStart + 2;
-        out.clusters.push_back(cluster);
-
-        out.indices.push_back(p.loopStart);
-        out.indices.push_back(p.loopStart + 1);
-        out.indices.push_back(p.loopStart + 2);
-        nextIndex += 3;
-
-        for (int k = 0; k < 3; ++k) {
-            const float3 &pos = out.positions[p.loopStart + k];
-            out.header.boundsMin.x = std::min(out.header.boundsMin.x, pos.x);
-            out.header.boundsMin.y = std::min(out.header.boundsMin.y, pos.y);
-            out.header.boundsMin.z = std::min(out.header.boundsMin.z, pos.z);
-            out.header.boundsMax.x = std::max(out.header.boundsMax.x, pos.x);
-            out.header.boundsMax.y = std::max(out.header.boundsMax.y, pos.y);
-            out.header.boundsMax.z = std::max(out.header.boundsMax.z, pos.z);
+    out.proxyIndices.clear();
+    uint32_t proxy_tris = 0;
+    for (const auto &nc : out.clusters) {
+        if (nc.level != 0) {
+            continue;
+        }
+        proxy_tris += nc.indexCount / 3;
+        for (uint32_t k = 0; k < nc.indexCount; ++k) {
+            out.proxyIndices.push_back(out.indices[nc.firstIndex + k]);
         }
     }
+    out.header.proxyVertexCount = uint32_t(dag.verts.size());
+    out.header.proxyIndexCount = uint32_t(out.proxyIndices.size());
 
+    /* Total bounds from the finest geometry. */
+    out.header.boundsMin[0] = out.header.boundsMin[1] = out.header.boundsMin[2] =
+        std::numeric_limits<float>::max();
+    out.header.boundsMax[0] = out.header.boundsMax[1] = out.header.boundsMax[2] =
+        -std::numeric_limits<float>::max();
+    for (const uint32_t idx : out.proxyIndices) {
+        const float3 &pos = out.positions[idx];
+        out.header.boundsMin[0] = std::min(out.header.boundsMin[0], pos.x);
+        out.header.boundsMin[1] = std::min(out.header.boundsMin[1], pos.y);
+        out.header.boundsMin[2] = std::min(out.header.boundsMin[2], pos.z);
+        out.header.boundsMax[0] = std::max(out.header.boundsMax[0], pos.x);
+        out.header.boundsMax[1] = std::max(out.header.boundsMax[1], pos.y);
+        out.header.boundsMax[2] = std::max(out.header.boundsMax[2], pos.z);
+    }
     if (out.positions.empty()) {
-        out.header.boundsMin = float3(0.0f);
-        out.header.boundsMax = float3(0.0f);
+        out.header.boundsMin[0] = out.header.boundsMin[1] = out.header.boundsMin[2] = 0.0f;
+        out.header.boundsMax[0] = out.header.boundsMax[1] = out.header.boundsMax[2] = 0.0f;
     }
     return true;
 }

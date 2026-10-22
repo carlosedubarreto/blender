@@ -17,11 +17,33 @@
 
 #include "nanite.h"
 
+#include "BLI_math_matrix_types.hh"
+#include "BLI_math_vector_types.hh"
+
 #include <cstddef>
 #include <vector>
 
 namespace blender {
 namespace nanite {
+
+/** Per-view values shared by the CPU and GPU traversal paths. */
+struct NaniteViewInfo {
+    /** World-space camera position (perspective) or origin (orthographic). */
+    float3 camPos;
+    /** Six frustum planes (a*x + b*y + c*z + d >= 0 inside), normalized. */
+    float planes[6][4];
+    /** Vertical projection scale: proj[1][1]. */
+    float projScaleY = 0.0f;
+    /** True for orthographic views (no eye point; unit-distance metric). */
+    bool orthographic = false;
+};
+
+/**
+ * Extract the frustum planes, camera position and projection scale from a
+ * view-projection matrix. Shared by the recursive CPU traversal, the flat CPU
+ * traversal and the GPU compute traversal.
+ */
+NaniteViewInfo getViewInfo(const float4x4 &viewProj, float viewportHeight);
 
 /**
  * Select clusters to draw for a given camera view and viewport height.
@@ -37,11 +59,25 @@ namespace nanite {
  * \param out         output draw command list
  * \returns number of draw commands written
  */
-size_t selectClusters(const NaniteData &data,
-                      const float4x4 &viewProj,
-                      float viewportHeight,
-                      const NaniteLodParams &params,
-                      std::vector<NaniteDrawCommand> &out);
+std::size_t selectClusters(const NaniteData &data,
+                           const float4x4 &viewProj,
+                           float viewportHeight,
+                           const NaniteLodParams &params,
+                           std::vector<NaniteDrawCommand> &out);
+
+/**
+ * Flat (fully parallelizable) variant of the traversal rule: a cluster is
+ * drawn when it has no children, or when the error of its coarser parent
+ * projects below the pixel threshold. Produces the same draw set as
+ * #selectClusters (when the cluster budget is disabled) but requires no DAG
+ * recursion — every cluster can be evaluated independently. This is the CPU
+ * mirror of the GPU compute traversal and doubles as the CPU fallback.
+ */
+std::size_t selectClustersFlat(const NaniteData &data,
+                               const float4x4 &viewProj,
+                               float viewportHeight,
+                               const NaniteLodParams &params,
+                               std::vector<NaniteDrawCommand> &out);
 
 /**
  * Approximate the screen-space error of a cluster in pixels.

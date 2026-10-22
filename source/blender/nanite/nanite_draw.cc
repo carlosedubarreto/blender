@@ -34,6 +34,9 @@ bool drawNaniteData(const NaniteData &data,
         return true;  // nothing to draw this frame
     }
 
+    renderer->draw(batch);
+    return true;
+}
 
 // ----------------------------------------------------------------------------
 // NaniteDrawPass
@@ -42,9 +45,7 @@ bool drawNaniteData(const NaniteData &data,
 NaniteDrawPass::NaniteDrawPass(const NaniteData &data,
                                const float4x4 &viewProj,
                                float viewportHeight)
-    : data_(data)
-    , view_proj_(viewProj)
-    , viewport_height_(viewportHeight)
+    : data_(data), view_proj_(viewProj), viewport_height_(viewportHeight)
 {
 }
 
@@ -85,3 +86,5 @@ size_t NaniteDrawPass::drawCount() const
     return renderer_.drawCount();
 }
 
+}  // namespace nanite
+}  // namespace blender

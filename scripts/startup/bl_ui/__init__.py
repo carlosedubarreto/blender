@@ -181,11 +181,19 @@ def register():
 
     bpy.app.handlers.translation_update_post.append(translation_update)
 
+    # Nanite virtual geometry module (core, shipped in scripts/modules/nanite).
+    import nanite
+    nanite.register()
+
     # done...
 
 
 def unregister():
     from bpy.utils import unregister_class
+
+    # Nanite virtual geometry module (registered in register() above).
+    import nanite
+    nanite.unregister()
 
     properties_paint_common.unregister()
 

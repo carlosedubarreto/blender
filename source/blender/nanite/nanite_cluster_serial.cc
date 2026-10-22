@@ -149,11 +149,69 @@ bool deserializeFromMemory(NaniteData &out, const uint8_t *data, size_t size)
     std::memcpy(out.clusters.data(), ptr, clusterCount * clusterSize);
     ptr += clusterCount * clusterSize;
 
-    // Walk the remaining layout and resize vectors, but do not fully
-    // deserialize into the objects in this stub; the renderer operates
-    // on the CPU-side NaniteData we already build, so the raw stream is
-    // used for .nc2 interchange only.
-    (void)ptr;
+    // Walk the remaining layout: positions, normals, uvs, indices,
+    // proxyPositions, proxyIndices. A field is present when the writer had
+    // data for it; presence is detected via the remaining stream size.
+    auto read_field = [&](void *dst_ptr, size_t elem_size, size_t count) {
+        const size_t bytes = count * elem_size;
+        if (end - ptr < static_cast<ptrdiff_t>(bytes)) {
+            return false;
+        }
+        if (count > 0) {
+            std::memcpy(dst_ptr, ptr, bytes);
+            ptr += bytes;
+        }
+        return true;
+    };
+
+    /* Positions: the vertex pool size is not stored in the header; recover it
+     * from the remaining stream length by trying each field in order using
+     * the counts implied by the cluster index ranges. The writer emits
+     * positions (vertexCount), normals (same count when the normals flag is
+     * set), uvs (same count), indices (indexCount), proxyPositions
+     * (proxyVertexCount) and proxyIndices (proxyIndexCount). */
+    const size_t pos_count = out.header.vertexCount;
+    const size_t idx_count = out.header.indexCount;
+    const size_t proxy_pos_count = out.header.proxyVertexCount;
+    const size_t proxy_idx_count = out.header.proxyIndexCount;
+
+    out.positions.resize(pos_count);
+    if (!read_field(out.positions.data(), sizeof(float3), pos_count)) {
+        return false;
+    }
+    /* Normals and UVs share the vertex-pool count when present; presence is
+     * flagged in the header (bit0 = UV, bit1 = normals). */
+    const bool has_normals = (out.header.flags & 2) != 0;
+    const bool has_uvs = (out.header.flags & 1) != 0;
+
+    if (has_normals) {
+        out.normals.resize(pos_count);
+        if (!read_field(out.normals.data(), sizeof(float3), pos_count)) {
+            return false;
+        }
+    }
+    if (has_uvs) {
+        out.uvs.resize(pos_count);
+        if (!read_field(out.uvs.data(), sizeof(float2), pos_count)) {
+            return false;
+        }
+    }
+    out.indices.resize(idx_count);
+    if (!read_field(out.indices.data(), sizeof(uint32_t), idx_count)) {
+        return false;
+    }
+    out.proxyPositions.resize(proxy_pos_count);
+    if (!read_field(out.proxyPositions.data(), sizeof(float3),
+                    proxy_pos_count))
+    {
+        return false;
+    }
+    out.proxyIndices.resize(proxy_idx_count);
+    if (!read_field(out.proxyIndices.data(), sizeof(uint32_t),
+                    proxy_idx_count))
+    {
+        return false;
+    }
     return true;
 }
 

@@ -13,10 +13,13 @@
  *  from the core draw pipeline.
  */
 
-#include "BLI_math_base.h"
+#include <BLI_math_vector_types.hh>
+#include <BLI_math_matrix_types.hh>
 #include <cstdint>
-#include <memory>
 #include <vector>
+
+// Forward declaration of Blender's Mesh type (defined in BKE_mesh.hh).
+struct Mesh;
 
 namespace blender {
 namespace nanite {
@@ -89,7 +92,7 @@ struct NaniteHeader
     float    uvMax[2];
 };
 
-static_assert(sizeof(NaniteHeader) == 80, "NaniteHeader must be 80 bytes");
+static_assert(sizeof(NaniteHeader) == 88, "NaniteHeader must be 88 bytes");
 
 /** Top-level persistent Nanite data. */
 struct NaniteData

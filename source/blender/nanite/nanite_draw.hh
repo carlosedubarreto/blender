@@ -58,11 +58,11 @@ public:
     size_t drawCount() const;
 
 private:
-    const NaniteData &data_;
+    NaniteData data_;
     float4x4 view_proj_;
     float viewport_height_;
 
-    NaniteRenderer renderer_;
+    mutable NaniteRenderer renderer_;
 };
 
 }  // namespace nanite

@@ -18,7 +18,6 @@
 
 namespace blender {
 namespace nanite {
-
 namespace detail {
 
 // Quantize a float in [0,1] to a fixed-point u16.
@@ -40,8 +39,5 @@ void computeTriangleSphere(const float3 &a, const float3 &b, const float3 &c,
                            float3 &center, float &radius);
 
 }  // namespace detail
-
-bool buildFromMesh(const Mesh &mesh, NaniteData &out);
-
 }  // namespace nanite
 }  // namespace blender
