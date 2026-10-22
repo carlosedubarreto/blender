@@ -77,7 +77,7 @@ def serialize_to_memory(data):
     buf = bytearray()
     buf += _pack_header(data.header)
     for c in data.clusters:
-        buf += struct.pack("<10fIIiIIII",
+        buf += struct.pack("<10fIIiIII",
                            c["sphere"][0], c["sphere"][1], c["sphere"][2],
                            c["sphere"][3],
                            c["parentSphere"][0], c["parentSphere"][1],
@@ -96,7 +96,9 @@ _CLUSTER_SIZE = 64  # sizeof(NaniteCluster)
 def deserialize_from_memory(path):
     """Read a NaniteData from a .nc2 file."""
     data = NaniteData()
-    with open(path, "rb") as f:
+    # Resolve blend-relative "//" paths (the build operator stores those).
+    abs_path = bpy.path.abspath(path)
+    with open(abs_path, "rb") as f:
         raw = f.read()
     if len(raw) < _HEADER_SIZE:
         raise ValueError("File too small to contain a Nanite header")
@@ -128,7 +130,7 @@ def deserialize_from_memory(path):
     for _ in range(cluster_count):
         (s0, s1, s2, s3, p0, p1, p2, p3, error, parent_error,
          first_index, index_count_c, parent_group, group, level, cflags
-         ) = struct.unpack_from("<10fIIiIIII", raw, offset)
+         ) = struct.unpack_from("<10fIIiIII", raw, offset)
         data.clusters.append({
             "sphere": (s0, s1, s2, s3),
             "parentSphere": (p0, p1, p2, p3),
@@ -151,14 +153,11 @@ def build_from_mesh(obj):
     operator, backed by `blender::nanite::buildFromMesh` with real QEM
     simplification). Returns the deserialized data so callers can inspect it.
     """
-    import os
-    bpy.ops.object.nanite_build(filepath="")
+    if "FINISHED" not in bpy.ops.object.nanite_build(filepath=""):
+        raise RuntimeError("Nanite: backend build operator failed")
     path = obj.get("nanite_nc2", "")
     if not path:
-        # Fall back to the default path the operator derives from the mesh name.
-        path = os.path.splitext(obj.data.name)[0] + ".nc2"
-        if not os.path.isfile(path):
-            raise RuntimeError("Nanite: backend did not produce a .nc2 file")
+        raise RuntimeError("Nanite: backend did not record the .nc2 output path")
     return deserialize_from_memory(path)
 
 
@@ -181,18 +180,17 @@ class NaniteBuild(bpy.types.Operator):
             self.report({"ERROR"}, "Active object is not a mesh")
             return {"CANCELLED"}
 
-        import os
-        if self.path:
-            # Delegate with an explicit output path.
-            bpy.ops.object.nanite_build(filepath=self.path)
-        else:
-            bpy.ops.object.nanite_build(filepath="")
+        if "FINISHED" not in bpy.ops.object.nanite_build(filepath=self.path):
+            self.report(
+                {"ERROR"}, "Nanite: cluster build failed (see Info log for details)"
+            )
+            return {"CANCELLED"}
 
-        # Remember the file path on the object (N-panel / load.py pick it up).
+        # The C++ operator records the actual .nc2 path on the object.
         path = obj.get("nanite_nc2", "")
         if not path:
-            path = self.path or (os.path.splitext(obj.data.name)[0] + ".nc2")
-        obj["nanite_nc2"] = path
+            self.report({"ERROR"}, "Nanite: backend did not record the output path")
+            return {"CANCELLED"}
         if hasattr(bpy.types.Object, "nanite"):
             obj.nanite.nc2_path = path
 

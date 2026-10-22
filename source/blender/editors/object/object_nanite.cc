@@ -31,6 +31,7 @@
 
 #include "BKE_context.hh"
 #include "BKE_global.hh"
+#include "BKE_idprop.hh"
 #include "BKE_main.hh"
 #include "BKE_report.hh"
 
@@ -79,8 +80,21 @@ static wmOperatorStatus object_nanite_build_exec(bContext *C, wmOperator *op)
   char filepath[FILE_MAX];
   RNA_string_get(op->ptr, "filepath", filepath);
   if (filepath[0] == '\0') {
-    BLI_snprintf(filepath, sizeof(filepath), "//%s.nc2", mesh->id.name + 2);
-    BLI_path_abs(filepath, BKE_main_blendfile_path_from_global());
+    const char *blend_path = BKE_main_blendfile_path_from_global();
+    if (blend_path[0] != '\0') {
+      /* Saved .blend: use a blend-relative path. */
+      BLI_snprintf(filepath, sizeof(filepath), "//%s.nc2", mesh->id.name + 2);
+      BLI_path_abs(filepath, blend_path);
+    }
+    else {
+      /* Unsaved .blend: "//" cannot be resolved, so anchor the file to the
+       * current working directory to keep the recorded path valid. */
+      char cwd[FILE_MAX];
+      BLI_current_working_dir(cwd, sizeof(cwd));
+      char nc2_name[FILE_MAX];
+      BLI_snprintf(nc2_name, sizeof(nc2_name), "%s.nc2", mesh->id.name + 2);
+      BLI_path_join(filepath, sizeof(filepath), cwd, nc2_name);
+    }
   }
 
   std::vector<uint8_t> blob;
@@ -100,6 +114,22 @@ static wmOperatorStatus object_nanite_build_exec(bContext *C, wmOperator *op)
   if (written != blob.size()) {
     BKE_reportf(op->reports, RPT_ERROR, "Nanite: short write to '%s'", filepath);
     return OPERATOR_CANCELLED;
+  }
+
+  /* Record the .nc2 path on the object so the draw engine can find the
+   * Nanite data without Python involvement (blend-relative when the file
+   * has been saved). */
+  if (IDProperty *idgroup = IDP_EnsureProperties(&ob->id)) {
+    char stored_path[FILE_MAX];
+    BLI_strncpy(stored_path, filepath, sizeof(stored_path));
+    const char *blend_path = BKE_main_blendfile_path_from_global();
+    if (blend_path[0] != '\0') {
+      BLI_path_rel(stored_path, blend_path);
+    }
+    if (IDProperty *prev = IDP_GetPropertyFromGroup(idgroup, "nanite_nc2")) {
+      IDP_FreeFromGroup(idgroup, prev);
+    }
+    IDP_AddToGroup(idgroup, bke::idprop::create("nanite_nc2", stored_path).release());
   }
 
   BKE_reportf(op->reports,

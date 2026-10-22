@@ -66,6 +66,15 @@ public:
 
     void setShadingMode(NaniteShadingMode mode);
 
+    /**
+     * Screen-space error threshold in pixels for LOD selection.
+     * Higher values select coarser clusters (faster, less detail).
+     */
+    void setPixelError(float pixelError)
+    {
+        renderer_.setPixelError(pixelError);
+    }
+
     void draw(int viewportWidth, int viewportHeight) const;
 
     size_t drawCount() const;

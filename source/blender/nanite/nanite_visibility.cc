@@ -88,7 +88,7 @@ void main()
 static const char *MATERIAL_VERT_SOURCE = R"(
 void main()
 {
-  gl_Position = vec4(pos, 1.0);
+  gl_Position = vec4(pos.xy, 1.0, 1.0);
 }
 )";
 
@@ -99,8 +99,9 @@ void main()
   uvec4 vis = texelFetch(vis_texture, px, 0);
   uint tri = vis.x;
   if (tri == 0xFFFFFFFFu) {
-    out_color = vec4(0.0, 0.0, 0.0, 1.0);
-    return;
+    /* No Nanite geometry here: leave the target pixel untouched so the pass
+     * can composite over an existing scene render (draw-manager path). */
+    discard;
   }
   vec2 bary_xy = unpackHalf2x16(vis.y);
   vec3 bary = vec3(bary_xy.x, bary_xy.y, 1.0 - bary_xy.x - bary_xy.y);
@@ -431,7 +432,12 @@ void NaniteVisibilityPass::render(gpu::StorageBuf *command_buf,
 
     /* ---------------- Pass 2: material ---------------- */
     GPU_framebuffer_bind(previous_fb != nullptr ? previous_fb : mFrameBuffer);
-    GPU_depth_test(GPU_DEPTH_NONE);
+    /* Composite with depth-testing against the target's depth buffer, so the
+     * resolved Nanite pixels only replace fragments where no opaque geometry
+     * is in front (draw-manager integration). The full-screen quad is placed
+     * at the far plane so it never occludes scene geometry. */
+    GPU_depth_test(GPU_DEPTH_LESS_EQUAL);
+    GPU_depth_mask(false);
     GPU_blend(GPU_BLEND_NONE);
 
     GPU_batch_set_shader(mFullscreenBatch, mMaterialShader);

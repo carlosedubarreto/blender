@@ -2,12 +2,19 @@
  *
  * SPDX-License-Identifier: GPL-2.0-or-later */
 
+#include "BLI_fileops.hh"
+#include "BLI_map.hh"
+#include "BLI_math_matrix_types.hh"
+#include "BLI_path_utils.hh"
 #include "BLI_rect.h"
 #include "BLI_string.h"
 
 #include "DNA_fluid_types.h"
+#include "DNA_ID.h"
 
 #include "BKE_editmesh.hh"
+#include "BKE_idprop.hh"
+#include "BKE_main.hh"
 #include "BKE_material.hh"
 #include "BKE_modifier.hh"
 #include "BKE_object.hh"
@@ -27,6 +34,8 @@
 #include "GPU_context.hh"
 #include "IMB_imbuf_types.hh"
 
+#include "MEM_guardedalloc.h"
+
 #include "RE_engine.h"
 #include "RE_pipeline.h"
 
@@ -35,9 +44,15 @@
 #include "draw_sculpt.hh"
 #include "draw_view_data.hh"
 
+#include "nanite.h"
+#include "nanite_draw.hh"
+
 #include "workbench_private.hh"
 
 #include "workbench_engine.h" /* Own include. */
+
+#include <memory>
+#include <mutex>
 
 namespace blender {
 
@@ -47,6 +62,192 @@ using namespace draw;
 
 class Instance : public DrawEngine {
  private:
+  /* -------------------------------------------------------------------- */
+  /** \name Nanite integration (experimental)
+   *
+   * Objects owning Nanite cluster data (custom IDProperty `nanite_nc2`)
+   * are rendered through the Nanite visibility-buffer pipeline instead of
+   * the regular Workbench mesh passes.
+   * \{ */
+
+  struct NaniteObjectState {
+    std::string nc2_path;
+    int64_t file_mtime = 0;
+    float4x4 object_mat = float4x4::identity();
+    bool visualize_clusters = false;
+    bool nanite_enabled = true;
+    float pixel_error = 1.0f;
+    bool used = false;
+    nanite::NaniteData data;
+    std::unique_ptr<nanite::NaniteDrawPass> pass;
+  };
+
+  /** Nanite objects found during sync, keyed by object name. */
+  Map<std::string, std::unique_ptr<NaniteObjectState>> nanite_objects_;
+  /** Guards #nanite_objects_ (object_sync may run on extraction threads). */
+  std::mutex nanite_mutex_;
+
+  /* Nanite data ownership helpers. */
+
+  static bool nanite_path_get(Object *ob, std::string &r_path)
+  {
+    const IDProperty *group = IDP_GetProperties(&ob->id);
+    if (group == nullptr) {
+      return false;
+    }
+    const IDProperty *prop = IDP_GetPropertyTypeFromGroup(group, "nanite_nc2", IDP_STRING);
+    if (prop == nullptr || prop->data.pointer == nullptr) {
+      return false;
+    }
+    r_path = static_cast<const char *>(prop->data.pointer);
+    return !r_path.empty();
+  }
+
+  static bool nanite_visualize_get(Object *ob)
+  {
+    const IDProperty *group = IDP_GetProperties(&ob->id);
+    if (group == nullptr) {
+      return false;
+    }
+    const IDProperty *prop = IDP_GetPropertyFromGroup(group, "nanite_visualize_clusters");
+    if (prop == nullptr) {
+      return false;
+    }
+    return prop->data.val != 0;
+  }
+
+  /** Master switch: false disables the Nanite path (falls back to the regular
+   * mesh draw). Defaults to true when the property is absent. */
+  static bool nanite_enabled_get(Object *ob)
+  {
+    IDProperty *group = IDP_GetProperties(&ob->id);
+    if (group == nullptr) {
+      return true;
+    }
+    IDProperty *prop = IDP_GetPropertyFromGroup(group, "nanite_enabled");
+    if (prop == nullptr) {
+      return true;
+    }
+    return prop->data.val != 0;
+  }
+
+  /** LOD quality control: tolerated screen-space error in pixels. */
+  static float nanite_pixel_error_get(Object *ob)
+  {
+    IDProperty *group = IDP_GetProperties(&ob->id);
+    if (group == nullptr) {
+      return 1.0f;
+    }
+    IDProperty *prop = IDP_GetPropertyTypeFromGroup(group, "nanite_pixel_error", IDP_DOUBLE);
+    if (prop == nullptr) {
+      return 1.0f;
+    }
+    const double value = IDP_double_get(prop);
+    return (value > 0.0f) ? float(value) : 1.0f;
+  }
+
+  /**
+   * Record a Nanite-enabled object for rendering in the draw phase.
+   * \return true when the object is owned by the Nanite pipeline (the caller
+   * must skip the regular Workbench mesh draw for it).
+   */
+  bool nanite_record(Object *ob)
+  {
+    if (!nanite_enabled_get(ob)) {
+      return false;
+    }
+    std::string idprop_path;
+    if (!nanite_path_get(ob, idprop_path)) {
+      return false;
+    }
+
+    /* Resolve blend-relative paths. */
+    char abs_path[FILE_MAX];
+    BLI_strncpy(abs_path, idprop_path.c_str(), sizeof(abs_path));
+    BLI_path_abs(abs_path, BKE_main_blendfile_path_from_global());
+
+    BLI_stat_t file_info;
+    const int64_t file_mtime = (BLI_stat(abs_path, &file_info) == 0) ?
+                                   int64_t(file_info.st_mtime) :
+                                   int64_t(-1);
+
+    std::lock_guard lock(this->nanite_mutex_);
+    std::unique_ptr<NaniteObjectState> &entry = nanite_objects_.lookup_or_add_default(
+        std::string(ob->id.name + 2));
+    if (entry == nullptr) {
+      entry = std::make_unique<NaniteObjectState>();
+    }
+    NaniteObjectState &state = *entry;
+
+    state.used = true;
+    state.visualize_clusters = nanite_visualize_get(ob);
+    state.pixel_error = nanite_pixel_error_get(ob);
+    state.object_mat = ob->object_to_world();
+
+    /* (Re)load the cluster data when the file path or content changed. The
+     * pass itself is only created in the draw phase (it needs an active GPU
+     * context, which is not guaranteed during the sync phase). */
+    const bool stale = (state.nc2_path != abs_path) || (state.file_mtime != file_mtime);
+    if (state.pass == nullptr || stale) {
+      if (stale || state.data.clusters.empty()) {
+        size_t data_size = 0;
+        if (void *file_data = BLI_file_read_binary_as_mem(abs_path, 0, &data_size)) {
+          nanite::NaniteData loaded;
+          if (nanite::deserializeFromMemory(loaded,
+                                            static_cast<const uint8_t *>(file_data),
+                                            data_size) &&
+              !loaded.clusters.empty())
+          {
+            state.data = std::move(loaded);
+          }
+          MEM_delete_void(file_data);
+        }
+        state.file_mtime = file_mtime;
+        state.nc2_path = abs_path;
+        /* Drop the pass so it is rebuilt with the new data on draw. */
+        state.pass.reset();
+      }
+    }
+    /* Objects whose data failed to load fall back to the regular mesh path. */
+    return !state.data.clusters.empty();
+  }
+
+  /** Render all Nanite objects recorded during sync into the target. */
+  void nanite_draw(const int2 &resolution)
+  {
+    if (nanite_objects_.is_empty()) {
+      return;
+    }
+    std::lock_guard lock(this->nanite_mutex_);
+    const float4x4 persmat = view_.persmat();
+
+    for (auto item : nanite_objects_.items()) {
+      NaniteObjectState &state = *item.value;
+      if (!state.used || state.data.clusters.empty()) {
+        continue;
+      }
+      if (state.pass == nullptr) {
+        state.pass = std::make_unique<blender::nanite::NaniteDrawPass>(
+            state.data, persmat * state.object_mat, float(resolution.y));
+        if (!state.pass->init()) {
+          state.pass.reset();
+          continue;
+        }
+      }
+      state.pass->setPixelError(state.pixel_error);
+      state.pass->setShadingMode(state.visualize_clusters ?
+                                     nanite::NANITE_SHADING_CLUSTERS :
+                                     nanite::NANITE_SHADING_DIFFUSE);
+      state.pass->update(state.data, persmat * state.object_mat, float(resolution.y));
+      if (state.pass->drawCount() != 0) {
+        state.pass->draw(resolution.x, resolution.y);
+      }
+      state.used = false;
+    }
+  }
+
+  /** \} */
+
   View view_ = {"DefaultView"};
 
   SceneState scene_state_;
@@ -189,6 +390,10 @@ class Instance : public DrawEngine {
     ResourceHandleRange emitter_handle = {};
 
     if (is_object_data_visible) {
+      if (this->nanite_record(ob)) {
+        /* Nanite-owned object: rendered by the Nanite pass in draw(). */
+        return;
+      }
       if (object_state.sculpt_pbvh) {
         ResourceHandleRange handle = manager.unique_handle_for_sculpt(ob_ref);
         this->sculpt_sync(ob_ref, handle, object_state);
@@ -497,6 +702,11 @@ class Instance : public DrawEngine {
         manager, view_, resources_, resolution, scene_state_.draw_shadows ? &shadow_ps_ : nullptr);
     transparent_ps_.draw(manager, view_, resources_, resolution);
     transparent_depth_ps_.draw(manager, view_, resources_);
+
+    /* Nanite objects (experimental): render through the visibility-buffer
+     * pipeline, compositing over the scene depth. */
+    resources_.clear_fb.bind();
+    this->nanite_draw(resolution);
 
     volume_ps_.draw(manager, view_, resources_);
     outline_ps_.draw(manager, resources_);

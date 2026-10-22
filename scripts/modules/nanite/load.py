@@ -50,9 +50,49 @@ class NaniteLoad(bpy.types.Operator):
         return {"FINISHED"}
 
 
+class NaniteClear(bpy.types.Operator):
+    """Remove Nanite data from the active object (falls back to regular mesh rendering)"""
+    bl_idname = "nanite.clear"
+    bl_label = "Clear Nanite Data"
+    bl_options = {"REGISTER", "UNDO"}
+
+    @classmethod
+    def poll(cls, context):
+        ob = context.active_object
+        return ob is not None and "nanite_nc2" in ob
+
+    def execute(self, context):
+        ob = context.active_object
+
+        # Reset the RNA properties first: their update callbacks write the
+        # IDProperties back, so the IDProperty removal must come last.
+        if hasattr(bpy.types.Object, "nanite"):
+            props = ob.nanite
+            props.enabled = True
+            props.pixel_error = 1.0
+            props.visualize_clusters = False
+            props.nc2_path = ""
+
+        for key in ("nanite_nc2",
+                    "nanite_enabled",
+                    "nanite_pixel_error",
+                    "nanite_visualize_clusters"):
+            if key in ob:
+                del ob[key]
+
+        ob.update_tag()
+        if context.area is not None:
+            context.area.tag_redraw()
+
+        self.report({"INFO"}, "Nanite data cleared")
+        return {"FINISHED"}
+
+
 def register():
     bpy.utils.register_class(NaniteLoad)
+    bpy.utils.register_class(NaniteClear)
 
 
 def unregister():
+    bpy.utils.unregister_class(NaniteClear)
     bpy.utils.unregister_class(NaniteLoad)
