@@ -37,8 +37,6 @@
 
 #include "workbench_private.hh"
 
-#include "nanite_draw.hh" /* Nanite integration. */
-
 #include "workbench_engine.h" /* Own include. */
 
 namespace blender {
@@ -49,8 +47,6 @@ using namespace draw;
 
 class Instance : public DrawEngine {
  private:
-  /* Nanite draw pass (managed per-object or as a global pass depending on use case). */
-  blender::nanite::NaniteDrawPass nanite_pass_;
   View view_ = {"DefaultView"};
 
   SceneState scene_state_;
@@ -160,13 +156,6 @@ class Instance : public DrawEngine {
 
   void object_sync(ObjectRef &ob_ref, Manager &manager) final
   {
-    if (ob_ref.is_nanite()) {
-      /* Update the Nanite draw pass for this object. */
-      nanite_pass_.update(ob_ref);
-    }
-    /* Existing Workbench object synchronization logic. */
-    ...
-  }
     if (scene_state_.render_finished) {
       return;
     }
@@ -538,12 +527,6 @@ class Instance : public DrawEngine {
 
   void draw(Manager &manager) final
   {
-    /* Draw Nanite surfaces if any are active. */
-    if (nanite_pass_.has_active_surfaces()) {
-      nanite_pass_.draw(manager);
-    }
-    ...
-  }
     DefaultTextureList *dtxl = draw_ctx->viewport_texture_list_get();
 
     DRW_submission_start();
