@@ -39,6 +39,8 @@ set(SRC
   nanite_gpu_data.cc
   nanite_gpu_traverse.hh
   nanite_gpu_traverse.cc
+  nanite_visibility.hh
+  nanite_visibility.cc
   nanite_renderer.hh
   nanite_renderer.cc
   nanite_draw.hh
@@ -47,8 +49,6 @@ set(SRC
 )
 
 set(LIB
-  PRIVATE bf_math
-  PRIVATE bf_blender
   PRIVATE bf_gpu
   PRIVATE bf::blenlib
   PRIVATE bf::intern::guardedalloc

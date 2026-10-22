@@ -48,6 +48,7 @@ set(SRC
   object_vgroup.cc
   object_visual_geometry_to_objects.cc
   object_volume.cc
+  object_nanite.cc
   object_warp.cc
 
   object_intern.hh
@@ -60,6 +61,7 @@ set(LIB
   PRIVATE bf::blenkernel
   PRIVATE bf::blenlib
   PRIVATE bf::blentranslation
+  PRIVATE bf::nanite
   PRIVATE bf::bmesh
   PRIVATE bf::depsgraph
   PRIVATE bf::dna

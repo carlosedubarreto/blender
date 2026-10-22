@@ -111,13 +111,14 @@ void main()
     return;
   }
 
-  /* VkDrawIndexedIndirectCommand layout (5 x uint32). */
-  uint base = slot * 5u;
+  /* DrawArraysIndirectCommand layout (4 x uint32): the visibility pass uses
+   * vertex pulling, so `first` is the absolute index-buffer position and the
+   * triangle id is derived from gl_VertexID directly. */
+  uint base = slot * 4u;
   draw_commands[base + 0u] = meta.y;
   draw_commands[base + 1u] = 1u;
   draw_commands[base + 2u] = meta.x;
   draw_commands[base + 3u] = 0u;
-  draw_commands[base + 4u] = 0u;
 }
 )";
 

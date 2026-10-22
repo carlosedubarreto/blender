@@ -195,6 +195,7 @@ bool buildFromMesh(const Mesh &mesh, NaniteData &out)
 
     out.header.vertexCount = uint32_t(dag.verts.size());
     out.header.indexCount = uint32_t(out.indices.size());
+    out.header.levelCount = dag.levelCount;
     out.header.maxClusterTriangles = max_cluster_tris;
     out.header.maxClusterVertices = max_cluster_verts;
 

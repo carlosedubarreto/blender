@@ -145,36 +145,21 @@ def deserialize_from_memory(path):
 # ---------------------------------------------------------------------------
 
 def build_from_mesh(obj):
-    """Placeholder cluster builder.
+    """Build the Nanite cluster DAG from a Blender object.
 
-    In a full implementation this would call the C++ :func:`buildFromMesh`;
-    here it creates a trivial single-cluster data set for early testing.
+    Delegates to the compiled C++ backend (the `OBJECT_OT_nanite_build`
+    operator, backed by `blender::nanite::buildFromMesh` with real QEM
+    simplification). Returns the deserialized data so callers can inspect it.
     """
-    data = NaniteData()
-    mesh = obj.data
-    n_verts = len(mesh.vertices)
-    n_faces = len(mesh.polygons)
-    data.header["vertexCount"] = n_verts
-    data.header["proxyVertexCount"] = n_verts
-    data.header["indexCount"] = n_faces * 3
-    data.header["proxyIndexCount"] = n_faces * 3
-    data.header["maxClusterTriangles"] = n_faces
-    data.header["maxClusterVertices"] = n_verts
-    data.header["boundsMin"] = (0.0, 0.0, 0.0)
-    data.header["boundsMax"] = (0.0, 0.0, 0.0)
-    data.positions = [(0.0, 0.0, 0.0)]
-    data.indices = [0]
-    data.clusters.append({
-        "sphere": (0.0, 0.0, 0.0, 1.0),
-        "parentSphere": (0.0, 0.0, 0.0, 1.0),
-        "error": 0.0, "parentError": 99999.0,
-        "firstIndex": 0, "indexCount": 3,
-        "parentGroup": -1, "group": 0, "level": 0, "flags": 0,
-    })
-    data.header["clusterCount"] = len(data.clusters)
-    data.header["levelCount"] = 1
-    data.header["flags"] = 0
-    return data
+    import os
+    bpy.ops.object.nanite_build(filepath="")
+    path = obj.get("nanite_nc2", "")
+    if not path:
+        # Fall back to the default path the operator derives from the mesh name.
+        path = os.path.splitext(obj.data.name)[0] + ".nc2"
+        if not os.path.isfile(path):
+            raise RuntimeError("Nanite: backend did not produce a .nc2 file")
+    return deserialize_from_memory(path)
 
 
 class NaniteBuild(bpy.types.Operator):
@@ -197,24 +182,29 @@ class NaniteBuild(bpy.types.Operator):
             return {"CANCELLED"}
 
         import os
-        if not self.path:
-            self.path = os.path.splitext(obj.data.name)[0] + ".nc2"
+        if self.path:
+            # Delegate with an explicit output path.
+            bpy.ops.object.nanite_build(filepath=self.path)
+        else:
+            bpy.ops.object.nanite_build(filepath="")
 
-        data = build_from_mesh(obj)
-
-        # Save a minimal placeholder .nc2 (full serialization uses the C++ backend
-        # for production).
-        try:
-            with open(self.path, "wb") as f:
-                f.write(serialize_to_memory(data))
-        except OSError as err:
-            self.report({"ERROR"}, f"Could not write file: {err}")
-            return {"CANCELLED"}
-
-        obj["nanite_nc2"] = self.path
+        # Remember the file path on the object (N-panel / load.py pick it up).
+        path = obj.get("nanite_nc2", "")
+        if not path:
+            path = self.path or (os.path.splitext(obj.data.name)[0] + ".nc2")
+        obj["nanite_nc2"] = path
         if hasattr(bpy.types.Object, "nanite"):
-            obj.nanite.nc2_path = self.path
-        self.report({"INFO"}, f"Built Nanite data -> {self.path}")
+            obj.nanite.nc2_path = path
+
+        try:
+            data = deserialize_from_memory(path)
+            self.report(
+                {"INFO"},
+                f"Built Nanite data: {data.header['clusterCount']} clusters"
+                f", {data.header['levelCount']} levels -> {path}",
+            )
+        except (OSError, ValueError) as err:
+            self.report({"WARNING"}, f"Built, but could not verify file: {err}")
         return {"FINISHED"}
 
 

@@ -55,5 +55,48 @@ void flattenClustersForGpu(const NaniteData &data, NaniteGpuClusterData &out)
     }
 }
 
+void flattenVertexDataForGpu(const NaniteData &data, NaniteGpuVertexData &out)
+{
+    out.vertex_count = data.positions.size();
+    out.index_count = data.indices.size();
+    out.positions.clear();
+    out.normals.clear();
+    out.uvs.clear();
+    out.indices.clear();
+    if (out.vertex_count == 0 || out.index_count == 0) {
+        out.vertex_count = 0;
+        out.index_count = 0;
+        return;
+    }
+
+    out.positions.reserve(out.vertex_count * 3);
+    out.normals.reserve(out.vertex_count * 3);
+    out.uvs.reserve(out.vertex_count * 2);
+    out.indices.reserve(out.index_count);
+
+    for (const float3 &p : data.positions) {
+        out.positions.push_back(p.x);
+        out.positions.push_back(p.y);
+        out.positions.push_back(p.z);
+    }
+    for (const float3 &n : data.normals) {
+        out.normals.push_back(n.x);
+        out.normals.push_back(n.y);
+        out.normals.push_back(n.z);
+    }
+    const bool has_uvs = !data.uvs.empty();
+    for (size_t i = 0; i < out.vertex_count; ++i) {
+        if (has_uvs && i < data.uvs.size()) {
+            out.uvs.push_back(data.uvs[i].x);
+            out.uvs.push_back(data.uvs[i].y);
+        }
+        else {
+            out.uvs.push_back(0.0f);
+            out.uvs.push_back(0.0f);
+        }
+    }
+    out.indices = data.indices;
+}
+
 }  // namespace nanite
 }  // namespace blender

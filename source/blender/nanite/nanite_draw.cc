@@ -13,7 +13,7 @@
 
 #include "nanite_lod.hh"
 
-#include "GPU_batch.hh"
+#include <cstring>
 
 namespace blender {
 namespace nanite {
@@ -21,10 +21,11 @@ namespace nanite {
 bool drawNaniteData(const NaniteData &data,
                     const float4x4 &viewProj,
                     float viewportHeight,
-                    gpu::Batch *batch,
+                    int viewportWidth,
+                    int viewportHeightPixels,
                     NaniteRenderer *renderer)
 {
-    if (batch == nullptr || renderer == nullptr) {
+    if (renderer == nullptr) {
         return false;
     }
 
@@ -34,7 +35,7 @@ bool drawNaniteData(const NaniteData &data,
         return true;  // nothing to draw this frame
     }
 
-    renderer->draw(batch);
+    renderer->draw(viewportWidth, viewportHeightPixels);
     return true;
 }
 
@@ -73,12 +74,14 @@ void NaniteDrawPass::update(const NaniteData &data,
     renderer_.update(data_, view_proj_, viewport_height_);
 }
 
-void NaniteDrawPass::draw(gpu::Batch *batch) const
+void NaniteDrawPass::setShadingMode(NaniteShadingMode mode)
 {
-    if (batch == nullptr) {
-        return;
-    }
-    renderer_.draw(batch);
+    renderer_.setShadingMode(mode);
+}
+
+void NaniteDrawPass::draw(int viewportWidth, int viewportHeight) const
+{
+    renderer_.draw(viewportWidth, viewportHeight);
 }
 
 size_t NaniteDrawPass::drawCount() const

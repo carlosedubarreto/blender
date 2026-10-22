@@ -41,5 +41,26 @@ struct NaniteGpuClusterData {
  */
 void flattenClustersForGpu(const NaniteData &data, NaniteGpuClusterData &out);
 
+/** Flat vertex/index arrays consumed by the visibility-buffer shaders
+ * (std430 layout: plain float / uint arrays, tightly packed). */
+struct NaniteGpuVertexData {
+    /** 3 floats per vertex (x, y, z). */
+    std::vector<float> positions;
+    /** 3 floats per vertex. */
+    std::vector<float> normals;
+    /** 2 floats per vertex (u, v); zeros when the source has no UVs. */
+    std::vector<float> uvs;
+    /** Index buffer (copy of #NaniteData::indices). */
+    std::vector<uint32_t> indices;
+    size_t vertex_count = 0;
+    size_t index_count = 0;
+};
+
+/**
+ * Flatten the vertex/index arrays of a #NaniteData for the visibility-buffer
+ * passes (vertex pulling + material-pass attribute fetch).
+ */
+void flattenVertexDataForGpu(const NaniteData &data, NaniteGpuVertexData &out);
+
 }  // namespace nanite
 }  // namespace blender

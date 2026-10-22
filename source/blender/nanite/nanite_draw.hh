@@ -14,27 +14,29 @@
 #include "nanite.h"
 #include "nanite_renderer.hh"
 
-#include "GPU_batch.hh"
-
 #include <cstddef>
 
 namespace blender {
 namespace nanite {
 
-// Convenience wrapper: update the renderer (LOD selection) and issue the
-// indirect draw command for a NaniteData buffer.
+// Convenience wrapper: update the renderer (LOD selection) and render the
+// selected clusters with the visibility-buffer pipeline into the currently
+// bound framebuffer.
 bool drawNaniteData(const NaniteData &data,
                     const float4x4 &viewProj,
                     float viewportHeight,
-                    gpu::Batch *batch,
+                    int viewportWidth,
+                    int viewportHeightPixels,
                     NaniteRenderer *renderer);
 
 /**
  * Minimal draw pass for Nanite clusters.
  *
- * The pass owns a NaniteRenderer and renders the provided NaniteData with a
- * single indirect-multi-draw call, exactly like the Nanite_CUP2 viewer. Add
- * this pass to your engine's pass list and call init()/draw() per frame.
+ * The pass owns a NaniteRenderer and renders the provided NaniteData with the
+ * two-pass visibility-buffer pipeline (visibility rasterization + full-screen
+ * material shading). Add this pass to your engine's pass list and call
+ * init()/update()/draw() per frame. The draw step renders into the currently
+ * bound framebuffer.
  */
 class NaniteDrawPass
 {
@@ -53,7 +55,9 @@ public:
                 const float4x4 &viewProj,
                 float viewportHeight);
 
-    void draw(gpu::Batch *batch) const;
+    void setShadingMode(NaniteShadingMode mode);
+
+    void draw(int viewportWidth, int viewportHeight) const;
 
     size_t drawCount() const;
 

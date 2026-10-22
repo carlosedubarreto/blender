@@ -293,6 +293,9 @@ void operatortypes_object()
   /* Custom cameras. */
   WM_operatortype_append(OBJECT_OT_camera_custom_update);
 
+  /* Nanite virtual geometry. */
+  WM_operatortype_append(OBJECT_OT_nanite_build);
+
   object_modifier_add_asset_register();
   collection_importer_register();
   collection_exporter_register();

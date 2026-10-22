@@ -53,8 +53,9 @@ NaniteRenderer::~NaniteRenderer()
 
 bool NaniteRenderer::init()
 {
-    // Reserve a large static capacity for indirect draw commands (std430).
-    const size_t byteSize = sizeof(NaniteDrawCommand) * kDrawCommandCapacity;
+    // Reserve a large static capacity for indirect draw commands.
+    // Each command is a DrawArraysIndirectCommand (4 x uint32).
+    const size_t byteSize = sizeof(uint32_t) * 4 * kDrawCommandCapacity;
     mDrawBuffer = GPU_storagebuf_create(byteSize);
     if (mDrawBuffer == nullptr) {
         return false;
@@ -99,8 +100,11 @@ void NaniteRenderer::terminate()
         GPU_storagebuf_free(mCounterBuf);
         mCounterBuf = nullptr;
     }
+    mVisibilityPass.terminate();
+    mVisibilityInitialized = false;
     mGpuClusters = NaniteGpuClusterData();
     mPendingCommands.clear();
+    mCpuCommandStream.clear();
     mDrawCount = 0;
     mGpuTraversalActive = false;
     mGpuPathFailed = false;
@@ -119,6 +123,9 @@ void NaniteRenderer::update(const NaniteData &data,
     if (data.clusters.empty() || mDrawBuffer == nullptr) {
         return;
     }
+
+    mLastData = &data;
+    mLastViewProj = viewProj;
 
     /* Try to bring up the compute traversal once. If it cannot be created
      * (no context, unsupported backend, compile error) fall back to the CPU
@@ -229,31 +236,42 @@ void NaniteRenderer::updateWithCpuTraversal(const NaniteData &data,
         return;
     }
 
-    // Upload the draw commands to the GPU storage buffer.
-    // The buffer was allocated with enough capacity (kDrawCommandCapacity),
-    // so a direct memcpy-like upload is safe.
-    GPU_storagebuf_update(mDrawBuffer, mPendingCommands.data());
+    /* Convert to DrawArraysIndirectCommand stream (16 bytes per command):
+     * the visibility pass uses vertex pulling, so `first` is the cluster's
+     * absolute index-buffer position. */
+    mCpuCommandStream.resize(count * 4);
+    for (size_t i = 0; i < count; ++i) {
+        mCpuCommandStream[i * 4 + 0] = mPendingCommands[i].indexCount;
+        mCpuCommandStream[i * 4 + 1] = 1;
+        mCpuCommandStream[i * 4 + 2] = mPendingCommands[i].firstIndex;
+        mCpuCommandStream[i * 4 + 3] = 0;
+    }
+    GPU_storagebuf_update(mDrawBuffer, mCpuCommandStream.data());
 }
 
-void NaniteRenderer::draw(gpu::Batch *batch)
+void NaniteRenderer::draw(int viewportWidth, int viewportHeight)
 {
-    if (batch == nullptr || mDrawBuffer == nullptr) {
+    if (mDrawBuffer == nullptr || mDrawCount == 0) {
         return;
     }
-
-    // Ensure the host-visible storage buffer is synchronized as an indirect
-    // buffer before issuing the draw.
+    if (!mVisibilityInitialized) {
+        if (!mVisibilityPass.init()) {
+            return;
+        }
+        mVisibilityInitialized = true;
+    }
+    /* Make sure the traversal commands are visible before the indirect
+     * draw (also covers the CPU fallback upload). */
     GPU_storagebuf_sync_as_indirect_buffer(mDrawBuffer);
-
-    const int count = static_cast<int>(mDrawCount);
-    if (count <= 0) {
-        return;
-    }
-
-    // Stride is sizeof(NaniteDrawCommand) (20 bytes), matching the
-    // VkDrawIndexedIndirectCommand layout.
-    GPU_batch_multi_draw_indirect(batch, mDrawBuffer, count, 0,
-                                   static_cast<intptr_t>(sizeof(NaniteDrawCommand)));
+    mVisibilityPass.set_data(mLastData == nullptr ? NaniteData() : *mLastData);
+    const NaniteViewInfo view = getViewInfo(mLastViewProj, 0.0f);
+    mVisibilityPass.render(mDrawBuffer,
+                           mDrawCount,
+                           mLastViewProj,
+                           view.camPos,
+                           viewportWidth,
+                           viewportHeight,
+                           int(mShadingMode));
 }
 
 }  // namespace nanite

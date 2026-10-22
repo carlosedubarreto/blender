@@ -17,6 +17,7 @@
 
 #include "nanite.h"
 #include "nanite_gpu_traverse.hh"
+#include "nanite_visibility.hh"
 
 #include "GPU_batch.hh"
 #include "GPU_shader.hh"
@@ -30,14 +31,16 @@ namespace blender {
 namespace nanite {
 
 /**
- * GPU renderer: phase 1 — fully GPU-driven traversal.
+ * GPU renderer: phases 1 + 2 — GPU-driven traversal and visibility-buffer
+ * shading.
  *
  * Every frame a single compute-shader dispatch performs frustum culling and
  * LOD selection for all clusters in parallel and atomically appends indirect
  * draw commands into a storage buffer. The only CPU work left is one
  * dispatch, one 4-byte counter readback and (only when the mesh changes) one
- * cluster-data upload. Draw calls are issued through Blender's GPU batch
- * abstraction (GPU_batch_multi_draw_indirect).
+ * cluster-data upload. The draw step is the two-pass visibility-buffer
+ * pipeline (visibility rasterization + full-screen material pass); no
+ * caller-supplied batch is needed.
  *
  * When compute shaders are unavailable the renderer transparently falls back
  * to the validated CPU traversal (selectClustersFlat) and uploads the result.
@@ -65,12 +68,14 @@ public:
     /** Override the LOD pixel error threshold for the next frames. */
     void setPixelError(float pixelError) { mPixelError = pixelError; }
 
+    /** Select the material-pass shading mode (diffuse/clusters/normals). */
+    void setShadingMode(NaniteShadingMode mode) { mShadingMode = mode; }
+
     /**
-     * Call once per frame to issue the draw call.
-     * \param batch The gpu::Batch describing the mesh vertex/index buffers.
-     *              The batch must be configured before calling this function.
+     * Call once per frame to render the selected clusters into the currently
+     * bound framebuffer with the visibility-buffer pipeline.
      */
-    void draw(gpu::Batch *batch);
+    void draw(int viewportWidth, int viewportHeight);
 
     size_t drawCount() const { return mDrawCount; }
 
@@ -93,12 +98,18 @@ private:
 
     // Staging host-side command list produced by the CPU fallback path.
     std::vector<NaniteDrawCommand> mPendingCommands;
+    // DrawArraysIndirectCommand stream for the CPU fallback upload.
+    std::vector<uint32_t> mCpuCommandStream;
 
     // GPU storage buffer holding the indirect draw commands (std430 layout).
     gpu::StorageBuf *mDrawBuffer = nullptr;
 
     // Compute shader implementing the traversal (created lazily).
     gpu::Shader *mTraverseShader = nullptr;
+
+    // Visibility-buffer pipeline (phase 2).
+    NaniteVisibilityPass mVisibilityPass;
+    bool mVisibilityInitialized = false;
 
     // Per-cluster data buffers (uploaded only when the mesh changes).
     gpu::StorageBuf *mSphereBuf = nullptr;
@@ -117,8 +128,15 @@ private:
     // Number of draw calls written this frame.
     size_t mDrawCount = 0;
 
+    // Data/matrix used by the last update (consumed by the draw step).
+    const NaniteData *mLastData = nullptr;
+    float4x4 mLastViewProj = float4x4::identity();
+
     // LOD pixel error threshold (pixels).
     float mPixelError = 1.0f;
+
+    // Material-pass shading mode.
+    NaniteShadingMode mShadingMode = NANITE_SHADING_DIFFUSE;
 
     // Set once the GPU path is proven working; set permanently if the
     // compute shader could not be created.
@@ -126,7 +144,7 @@ private:
     bool mGpuPathFailed = false;
 
     // Constant host-side capacity. Granularity is kept to avoid reallocation.
-    static constexpr size_t kDrawCommandCapacity = 2000000;  // 40 MB
+    static constexpr size_t kDrawCommandCapacity = 2000000;
 };
 
 }  // namespace nanite
