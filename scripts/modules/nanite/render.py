@@ -27,7 +27,13 @@ Example::
 """
 
 import bpy
-from bpy.props import PointerProperty, StringProperty, BoolProperty, FloatProperty
+from bpy.props import (
+    BoolProperty,
+    EnumProperty,
+    FloatProperty,
+    PointerProperty,
+    StringProperty,
+)
 
 
 def _tag_nanite_redraw(self, context):
@@ -59,6 +65,11 @@ def _visualize_clusters_update(self, context):
 
 def _pixel_error_update(self, context):
     self.id_data["nanite_pixel_error"] = float(self.pixel_error)
+    _tag_nanite_redraw(self, context)
+
+
+def _view_source_update(self, context):
+    self.id_data["nanite_view_source"] = int(self.view_source == 'CAMERA')
     _tag_nanite_redraw(self, context)
 
 
@@ -109,6 +120,20 @@ class NaniteProperties(bpy.types.PropertyGroup):
         soft_max=10.0,
         precision=2,
         update=_pixel_error_update,
+    )
+
+    # LOD view source: which view drives the screen-space error test.
+    view_source: EnumProperty(
+        name="View Source",
+        description="View used for Nanite LOD selection (screen-space error)",
+        items=(
+            ('VIEWPORT', "Viewport View",
+             "Select LODs from the current viewport view"),
+            ('CAMERA', "Active Camera",
+             "Select LODs from the scene's active camera"),
+        ),
+        default='VIEWPORT',
+        update=_view_source_update,
     )
 
     # Toggle cluster visualization mode.

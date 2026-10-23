@@ -1,4 +1,4 @@
-﻿/* SPDX-FileCopyrightText: 2006 Blender Authors
+/* SPDX-FileCopyrightText: 2006 Blender Authors
  *
  * SPDX-License-Identifier: GPL-2.0-or-later
  */
@@ -112,21 +112,54 @@ void NaniteRenderer::terminate()
     mUploadedClusterCount = size_t(-1);
     mUploadedIndexCount = size_t(-1);
     mUploadedMaxParentError = -1.0f;
+    mMatricesCurrent = false;
+    mLastData = nullptr;
+    mLastViewProj = float4x4::identity();
+    mLastLodViewProj = float4x4::identity();
+    mLastProjScaleY = 1.0f;
+    mLastLodProjScaleY = 1.0f;
 }
 
 void NaniteRenderer::update(const NaniteData &data,
                             const float4x4 &viewProj,
-                            float viewportHeight)
+                            float projScaleY,
+                            float viewportHeight,
+                            const float4x4 *lodViewProj,
+                            const float *lodProjScaleY)
 {
-    mPendingCommands.clear();
-    mDrawCount = 0;
-
     if (data.clusters.empty() || mDrawBuffer == nullptr) {
+        mPendingCommands.clear();
+        mDrawCount = 0;
         return;
     }
 
+    const float4x4 &lod_vp = (lodViewProj != nullptr) ? *lodViewProj : viewProj;
+    const float lod_scale_y = (lodProjScaleY != nullptr) ? *lodProjScaleY : projScaleY;
+
+    /* Freshness check — only re-traverse if matrices, data or view parameters changed */
+    bool data_changed = (mLastData == nullptr) || (&data != mLastData);
+    bool view_changed = !mMatricesCurrent ||
+                        (mLastViewProj != viewProj) ||
+                        (mLastLodViewProj != lod_vp) ||
+                        (mLastProjScaleY != projScaleY) ||
+                        (mLastLodProjScaleY != lod_scale_y) ||
+                        (mLastViewportHeight != viewportHeight) ||
+                        (mLastPixelError != mPixelError);
+
+    if (!data_changed && !view_changed && (mGpuTraversalActive || !mCpuCommandStream.empty())) {
+        // Matrices, parameters and data are identical to last frame; retain existing draw commands and count
+        return;
+    }
+    mMatricesCurrent = true;
+    mPendingCommands.clear();
+
     mLastData = &data;
     mLastViewProj = viewProj;
+    mLastLodViewProj = lod_vp;
+    mLastProjScaleY = projScaleY;
+    mLastLodProjScaleY = lod_scale_y;
+    mLastViewportHeight = viewportHeight;
+    mLastPixelError = mPixelError;
 
     /* Try to bring up the compute traversal once. If it cannot be created
      * (no context, unsupported backend, compile error) fall back to the CPU
@@ -138,16 +171,17 @@ void NaniteRenderer::update(const NaniteData &data,
         }
     }
     if (mTraverseShader != nullptr) {
-        updateWithGpuTraversal(data, viewProj, viewportHeight);
+        updateWithGpuTraversal(data, lod_vp, lod_scale_y, viewportHeight);
     }
     else {
         mGpuPathFailed = true;
-        updateWithCpuTraversal(data, viewProj, viewportHeight);
+        updateWithCpuTraversal(data, lod_vp, lod_scale_y, viewportHeight);
     }
 }
 
 void NaniteRenderer::updateWithGpuTraversal(const NaniteData &data,
                                             const float4x4 &viewProj,
+                                            float projScaleY,
                                             float viewportHeight)
 {
     const size_t clusterCount = data.clusters.size();
@@ -175,7 +209,7 @@ void NaniteRenderer::updateWithGpuTraversal(const NaniteData &data,
             !ensureStorageBuf(&mCounterBuf, sizeof(uint32_t), "nanite_draw_counter"))
         {
             mGpuPathFailed = true;
-            return updateWithCpuTraversal(data, viewProj, viewportHeight);
+            return updateWithCpuTraversal(data, viewProj, projScaleY, viewportHeight);
         }
         GPU_storagebuf_update(mSphereBuf, mGpuClusters.spheres.data());
         GPU_storagebuf_update(mParentErrBuf, mGpuClusters.parent_errors.data());
@@ -189,7 +223,7 @@ void NaniteRenderer::updateWithGpuTraversal(const NaniteData &data,
      * cluster. */
     GPU_storagebuf_clear_to_zero(mCounterBuf);
 
-    const NaniteViewInfo view = getViewInfo(viewProj, viewportHeight);
+    const NaniteViewInfo view = getViewInfo(viewProj, viewportHeight, projScaleY);
 
     GPU_shader_bind(mTraverseShader);
     GPU_storagebuf_bind(mSphereBuf, 0);
@@ -224,12 +258,13 @@ void NaniteRenderer::updateWithGpuTraversal(const NaniteData &data,
 
 void NaniteRenderer::updateWithCpuTraversal(const NaniteData &data,
                                             const float4x4 &viewProj,
+                                            float projScaleY,
                                             float viewportHeight)
 {
     NaniteLodParams params;
     params.pixelError = mPixelError;
     const size_t count = selectClustersFlat(
-        data, viewProj, viewportHeight, params, mPendingCommands);
+        data, viewProj, projScaleY, viewportHeight, params, mPendingCommands);
     mDrawCount = count;
     mGpuTraversalActive = false;
 
@@ -265,7 +300,7 @@ void NaniteRenderer::draw(int viewportWidth, int viewportHeight)
      * draw (also covers the CPU fallback upload). */
     GPU_storagebuf_sync_as_indirect_buffer(mDrawBuffer);
     mVisibilityPass.set_data(mLastData == nullptr ? NaniteData() : *mLastData);
-    const NaniteViewInfo view = getViewInfo(mLastViewProj, 0.0f);
+    const NaniteViewInfo view = getViewInfo(mLastViewProj, 0.0f, mLastProjScaleY);
     mVisibilityPass.render(mDrawBuffer,
                            mDrawCount,
                            mLastViewProj,

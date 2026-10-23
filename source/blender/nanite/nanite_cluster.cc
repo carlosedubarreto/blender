@@ -126,12 +126,28 @@ bool buildFromMesh(const Mesh &mesh, NaniteData &out)
 
     /* Per-vertex attribute buffers (all clusters share one vertex pool). */
     out.positions.resize(dag.verts.size());
-    out.normals.resize(dag.verts.size());
-    out.uvs.resize(dag.verts.size());
     for (size_t i = 0; i < dag.verts.size(); ++i) {
         out.positions[i] = dag.verts[i].position;
-        out.normals[i] = dag.verts[i].normal;
-        out.uvs[i] = dag.verts[i].uv;
+    }
+    const bool has_normals = (out.header.flags & 2) != 0;
+    if (has_normals) {
+        out.normals.resize(dag.verts.size());
+        for (size_t i = 0; i < dag.verts.size(); ++i) {
+            out.normals[i] = dag.verts[i].normal;
+        }
+    }
+    else {
+        out.normals.clear();
+    }
+    const bool has_uvs_flag = (out.header.flags & 1) != 0;
+    if (has_uvs_flag) {
+        out.uvs.resize(dag.verts.size());
+        for (size_t i = 0; i < dag.verts.size(); ++i) {
+            out.uvs[i] = dag.verts[i].uv;
+        }
+    }
+    else {
+        out.uvs.clear();
     }
 
     // Clusters: assign contiguous index-buffer ranges and convert DAG nodes.

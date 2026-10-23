@@ -48,6 +48,7 @@ class NANITE_PT_object(bpy.types.Panel):
                 col.use_property_decorate = False
                 col.prop(nanite_props, "enabled", text="Use Nanite")
                 col.prop(nanite_props, "pixel_error", text="Pixel Error")
+                col.prop(nanite_props, "view_source", text="View Source")
                 col.prop(nanite_props, "visualize_clusters")
         else:
             if nanite_props is not None:

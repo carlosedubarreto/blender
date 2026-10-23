@@ -52,6 +52,7 @@ class NaniteDrawPass
 public:
     NaniteDrawPass(const NaniteData &data,
                    const float4x4 &viewProj,
+                   float projScaleY,
                    float viewportHeight);
     ~NaniteDrawPass();
 
@@ -62,7 +63,10 @@ public:
 
     void update(const NaniteData &data,
                 const float4x4 &viewProj,
-                float viewportHeight);
+                float projScaleY,
+                float viewportHeight,
+                const float4x4 *lodViewProj = nullptr,
+                const float *lodProjScaleY = nullptr);
 
     void setShadingMode(NaniteShadingMode mode);
 
@@ -90,6 +94,7 @@ private:
     NaniteData data_;
     float4x4 view_proj_;
     float viewport_height_;
+    float proj_scale_y_;
 
     mutable NaniteRenderer renderer_;
     NanitePageManager *mStreamer = nullptr;

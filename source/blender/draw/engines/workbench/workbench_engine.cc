@@ -11,7 +11,9 @@
 
 #include "DNA_fluid_types.h"
 #include "DNA_ID.h"
+#include "DNA_camera_types.h"
 
+#include "BKE_camera.h"
 #include "BKE_editmesh.hh"
 #include "BKE_idprop.hh"
 #include "BKE_main.hh"
@@ -77,6 +79,8 @@ class Instance : public DrawEngine {
     bool visualize_clusters = false;
     bool nanite_enabled = true;
     float pixel_error = 1.0f;
+    /* LOD view source: 0 = viewport view, 1 = the scene's active camera. */
+    int view_source = 0;
     bool used = false;
     nanite::NaniteData data;
     std::unique_ptr<nanite::NaniteDrawPass> pass;
@@ -138,12 +142,72 @@ class Instance : public DrawEngine {
     if (group == nullptr) {
       return 1.0f;
     }
-    IDProperty *prop = IDP_GetPropertyTypeFromGroup(group, "nanite_pixel_error", IDP_DOUBLE);
+    IDProperty *prop = IDP_GetPropertyFromGroup(group, "nanite_pixel_error");
     if (prop == nullptr) {
       return 1.0f;
     }
-    const double value = IDP_double_get(prop);
-    return (value > 0.0f) ? float(value) : 1.0f;
+    float value = 1.0f;
+    if (prop->type == IDP_DOUBLE) {
+      value = float(IDP_double_get(prop));
+    }
+    else if (prop->type == IDP_FLOAT) {
+      value = IDP_float_get(prop);
+    }
+    else if (prop->type == IDP_INT) {
+      value = float(IDP_int_get(prop));
+    }
+    return (value > 0.0f) ? value : 1.0f;
+  }
+
+  /** LOD view source: 0 = viewport view, 1 = the scene's active camera. */
+  static int nanite_view_source_get(Object *ob)
+  {
+    IDProperty *group = IDP_GetProperties(&ob->id);
+    if (group == nullptr) {
+      return 0;
+    }
+    IDProperty *prop = IDP_GetPropertyFromGroup(group, "nanite_view_source");
+    if (prop == nullptr) {
+      return 0;
+    }
+    return prop->data.val;
+  }
+
+  /**
+   * Projection*view matrix of the scene's active camera, fitted to the target
+   * resolution. Returns false when the scene has no usable camera.
+   */
+  static bool nanite_camera_persmat(const Scene *scene,
+                                    const DRWContext *draw_ctx,
+                                    const int2 &resolution,
+                                    float4x4 &r_persmat,
+                                    float &r_proj_scale_y)
+  {
+    if (scene == nullptr || scene->camera == nullptr ||
+        draw_ctx->depsgraph == nullptr)
+    {
+      return false;
+    }
+    const Object *cam_ob = DEG_get_evaluated(draw_ctx->depsgraph, scene->camera);
+    if (cam_ob == nullptr || cam_ob->type != OB_CAMERA || cam_ob->data == nullptr) {
+      return false;
+    }
+    CameraParams params;
+    BKE_camera_params_init(&params);
+    BKE_camera_params_from_object(&params, cam_ob);
+    BKE_camera_params_compute_viewplane(
+        &params, resolution.x, resolution.y, scene->r.xasp, scene->r.yasp);
+    BKE_camera_params_compute_matrix(&params);
+    float4x4 winmat = float4x4::identity();
+    for (int i = 0; i < 4; ++i) {
+      for (int j = 0; j < 4; ++j) {
+        winmat[i][j] = params.winmat[i][j];
+      }
+    }
+    const float4x4 viewmat = math::invert(cam_ob->object_to_world());
+    r_persmat = winmat * viewmat;
+    r_proj_scale_y = std::abs(winmat[1][1]);
+    return true;
   }
 
   /**
@@ -182,6 +246,7 @@ class Instance : public DrawEngine {
     state.used = true;
     state.visualize_clusters = nanite_visualize_get(ob);
     state.pixel_error = nanite_pixel_error_get(ob);
+    state.view_source = nanite_view_source_get(ob);
     state.object_mat = ob->object_to_world();
 
     /* (Re)load the cluster data when the file path or content changed. The
@@ -219,16 +284,38 @@ class Instance : public DrawEngine {
       return;
     }
     std::lock_guard lock(this->nanite_mutex_);
-    const float4x4 persmat = view_.persmat();
+    const draw::View &default_view = draw::View::default_get();
+    const float4x4 viewport_persmat = view_.persmat();
+    /* Vertical projection scale from the pure projection matrix (not corrupted
+     * by object rotation). For orthographic views winmat[1][1] == 2/height. */
+    const float viewport_proj_scale_y = std::abs(default_view.winmat()[1][1]);
 
     for (auto item : nanite_objects_.items()) {
       NaniteObjectState &state = *item.value;
       if (!state.used || state.data.clusters.empty()) {
         continue;
       }
+      /* Rasterization matrix: always projects to the active viewport framebuffer. */
+      const float4x4 object_persmat = viewport_persmat * state.object_mat;
+
+      /* LOD view source: optional override to evaluate LOD selection and culling
+       * from the scene's active camera perspective instead of the viewport. */
+      float4x4 cam_persmat;
+      float cam_proj_scale_y = viewport_proj_scale_y;
+      bool has_cam_lod = false;
+      if (state.view_source != 0) {
+        if (nanite_camera_persmat(
+                scene_state_.scene, this->draw_ctx, resolution, cam_persmat, cam_proj_scale_y)) {
+          has_cam_lod = true;
+        }
+      }
+      const float4x4 lod_object_persmat = has_cam_lod ? (cam_persmat * state.object_mat) :
+                                                        object_persmat;
+      const float lod_proj_scale_y = has_cam_lod ? cam_proj_scale_y : viewport_proj_scale_y;
+
       if (state.pass == nullptr) {
         state.pass = std::make_unique<blender::nanite::NaniteDrawPass>(
-            state.data, persmat * state.object_mat, float(resolution.y));
+            state.data, object_persmat, viewport_proj_scale_y, float(resolution.y));
         if (!state.pass->init()) {
           state.pass.reset();
           continue;
@@ -238,11 +325,15 @@ class Instance : public DrawEngine {
       state.pass->setShadingMode(state.visualize_clusters ?
                                      nanite::NANITE_SHADING_CLUSTERS :
                                      nanite::NANITE_SHADING_DIFFUSE);
-      state.pass->update(state.data, persmat * state.object_mat, float(resolution.y));
+      state.pass->update(state.data,
+                         object_persmat,
+                         viewport_proj_scale_y,
+                         float(resolution.y),
+                         has_cam_lod ? &lod_object_persmat : nullptr,
+                         has_cam_lod ? &lod_proj_scale_y : nullptr);
       if (state.pass->drawCount() != 0) {
         state.pass->draw(resolution.x, resolution.y);
       }
-      state.used = false;
     }
   }
 
@@ -312,6 +403,13 @@ class Instance : public DrawEngine {
 
   void begin_sync() final
   {
+    {
+      std::lock_guard lock(this->nanite_mutex_);
+      for (auto item : nanite_objects_.items()) {
+        item.value->used = false;
+      }
+    }
+
     resources_.material_buf.clear_and_trim();
 
     opaque_ps_.sync(scene_state_, resources_);

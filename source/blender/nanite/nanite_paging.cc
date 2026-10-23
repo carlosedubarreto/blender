@@ -551,6 +551,7 @@ bool NanitePageManager::update(uint64_t frame, NaniteData &out_assembled)
 
 void collectStreamingRequests(const NaniteData &data,
                               const float4x4 &viewProj,
+                              float projScaleY,
                               float viewportHeight,
                               const NaniteLodParams &params,
                               std::vector<uint32_t> &out_requests)
@@ -560,7 +561,7 @@ void collectStreamingRequests(const NaniteData &data,
         return;
     }
 
-    const NaniteViewInfo view = getViewInfo(viewProj, viewportHeight);
+    const NaniteViewInfo view = getViewInfo(viewProj, viewportHeight, projScaleY);
 
     std::vector<uint32_t> children_count(data.clusters.size(), 0);
     for (const auto &c : data.clusters) {

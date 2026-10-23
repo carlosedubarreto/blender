@@ -42,8 +42,16 @@ struct NaniteViewInfo {
  * Extract the frustum planes, camera position and projection scale from a
  * view-projection matrix. Shared by the recursive CPU traversal, the flat CPU
  * traversal and the GPU compute traversal.
+ *
+ * \\note \\a projScaleY must come from the projection matrix alone, not from
+ * the combined view-projection matrix: when the object transform is baked into
+ * viewProj (as the draw engine does so clusters can stay in object space),
+ * viewProj[1][1] is corrupted by object rotation and no longer equals the
+ * vertical field-of-view scale.
  */
-NaniteViewInfo getViewInfo(const float4x4 &viewProj, float viewportHeight);
+NaniteViewInfo getViewInfo(const float4x4 &viewProj,
+                           float viewportHeight,
+                           float projScaleY);
 
 /** Sphere vs. frustum test (Gribb-Hartmann planes, normalized). */
 bool sphere_in_frustum(const float planes[6][4], const float3 &center,
@@ -73,6 +81,7 @@ float projectedErrorPx(const float3 &center, float radius, float error,
  */
 std::size_t selectClusters(const NaniteData &data,
                            const float4x4 &viewProj,
+                           float projScaleY,
                            float viewportHeight,
                            const NaniteLodParams &params,
                            std::vector<NaniteDrawCommand> &out);
@@ -87,6 +96,7 @@ std::size_t selectClusters(const NaniteData &data,
  */
 std::size_t selectClustersFlat(const NaniteData &data,
                                const float4x4 &viewProj,
+                               float projScaleY,
                                float viewportHeight,
                                const NaniteLodParams &params,
                                std::vector<NaniteDrawCommand> &out);

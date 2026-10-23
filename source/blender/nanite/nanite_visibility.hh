@@ -84,7 +84,8 @@ class NaniteVisibilityPass
                 const float3 &cam_pos,
                 int viewport_width,
                 int viewport_height,
-                int shading_mode);
+                int shading_mode,
+                const float4x4 &object_model = float4x4::identity());
 
  private:
     bool ensure_targets(int width, int height);
@@ -97,6 +98,9 @@ class NaniteVisibilityPass
     // Visibility targets.
     gpu::Texture *mVisTexture = nullptr;
     gpu::Texture *mDepthTexture = nullptr;
+
+    // Object model matrix for transforming object-space vertices to world space.
+    float4x4 object_model = float4x4::identity();
     gpu::FrameBuffer *mFrameBuffer = nullptr;
     int mWidth = 0;
     int mHeight = 0;

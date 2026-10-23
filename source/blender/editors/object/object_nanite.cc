@@ -309,7 +309,7 @@ static wmOperatorStatus object_nanite_gpu_test_exec(bContext *C, wmOperator *op)
     return OPERATOR_CANCELLED;
   }
 
-  nanite::NaniteDrawPass pass(data, vp, float(H));
+  nanite::NaniteDrawPass pass(data, vp, 1.0f, float(H));
   if (!pass.init()) {
     BKE_report(
         op->reports, RPT_ERROR, "Nanite GPU test: renderer init failed");
@@ -323,7 +323,7 @@ static wmOperatorStatus object_nanite_gpu_test_exec(bContext *C, wmOperator *op)
   const char *mode_names[3] = {"diffuse", "clusters", "normals"};
   for (int mode = 0; mode < 3; ++mode) {
     pass.setShadingMode(nanite::NaniteShadingMode(mode));
-    pass.update(data, vp, float(H));
+    pass.update(data, vp, 1.0f, float(H));
     GPU_framebuffer_bind(targets.fb);
     GPU_framebuffer_clear_color_depth(targets.fb, double4(0.0, 0.0, 0.0, 1.0), 1.0f);
     pass.draw(W, H);
@@ -366,7 +366,7 @@ static wmOperatorStatus object_nanite_gpu_test_exec(bContext *C, wmOperator *op)
       pass.setShadingMode(nanite::NANITE_SHADING_DIFFUSE);
       size_t first_count = 0;
       for (int frame = 0; frame < 300 && !pass.streamingSettled(); ++frame) {
-    pass.update(data, vp, float(H));
+    pass.update(data, vp, 1.0f, float(H));
         GPU_framebuffer_bind(targets.fb);
         GPU_framebuffer_clear_color_depth(targets.fb, double4(0.0, 0.0, 0.0, 1.0), 1.0f);
     pass.draw(W, H);

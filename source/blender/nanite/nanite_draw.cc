@@ -20,6 +20,7 @@ namespace nanite {
 
 bool drawNaniteData(const NaniteData &data,
                     const float4x4 &viewProj,
+                    float projScaleY,
                     float viewportHeight,
                     int viewportWidth,
                     int viewportHeightPixels,
@@ -29,7 +30,7 @@ bool drawNaniteData(const NaniteData &data,
         return false;
     }
 
-    renderer->update(data, viewProj, viewportHeight);
+    renderer->update(data, viewProj, projScaleY, viewportHeight);
 
     if (renderer->drawCount() == 0) {
         return true;  // nothing to draw this frame
@@ -45,8 +46,10 @@ bool drawNaniteData(const NaniteData &data,
 
 NaniteDrawPass::NaniteDrawPass(const NaniteData &data,
                                const float4x4 &viewProj,
+                               float projScaleY,
                                float viewportHeight)
-    : data_(data), view_proj_(viewProj), viewport_height_(viewportHeight)
+    : data_(data), view_proj_(viewProj), viewport_height_(viewportHeight),
+      proj_scale_y_(projScaleY)
 {
 }
 
@@ -60,18 +63,29 @@ bool NaniteDrawPass::init()
     if (!renderer_.init()) {
         return false;
     }
-    renderer_.update(data_, view_proj_, viewport_height_);
+    renderer_.update(data_, view_proj_, proj_scale_y_, viewport_height_);
     return true;
 }
 
 void NaniteDrawPass::update(const NaniteData &data,
                             const float4x4 &viewProj,
-                            float viewportHeight)
+                            float projScaleY,
+                            float viewportHeight,
+                            const float4x4 *lodViewProj,
+                            const float *lodProjScaleY)
 {
     view_proj_ = viewProj;
+    proj_scale_y_ = projScaleY;
     viewport_height_ = viewportHeight;
 
+    /* Always forward to renderer::update() — this ensures matrices are
+     * fresh each frame and triggers traversal when needed. */
+    renderer_.update(data, viewProj, projScaleY, viewportHeight, lodViewProj, lodProjScaleY);
+
     if (mStreamer != nullptr && mStreamer->isOpen()) {
+        const float4x4 &lod_vp = (lodViewProj != nullptr) ? *lodViewProj : view_proj_;
+        const float lod_scale = (lodProjScaleY != nullptr) ? *lodProjScaleY : proj_scale_y_;
+
         /* Streaming mode: data_ holds the assembled resident subset (with
          * stubs for missing pages). The full data was seeded at open time;
          * adopting the caller's full data here would erase the stubs and
@@ -85,7 +99,7 @@ void NaniteDrawPass::update(const NaniteData &data,
         lod_params.pixelError = 1.0f;
         std::vector<uint32_t> requests;
         collectStreamingRequests(
-            data_, view_proj_, viewport_height_, lod_params, requests);
+            data_, lod_vp, lod_scale, viewport_height_, lod_params, requests);
         mStreamer->requestClusters(requests);
 
         NaniteData assembled;
@@ -97,8 +111,6 @@ void NaniteDrawPass::update(const NaniteData &data,
     else {
         data_ = data;
     }
-
-    renderer_.update(data_, view_proj_, viewport_height_);
 }
 
 bool NaniteDrawPass::openStreaming(const std::string &paged_path,

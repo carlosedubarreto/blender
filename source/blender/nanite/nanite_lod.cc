@@ -241,9 +241,9 @@ static bool solve3x3(const double A[3][3], const double b[3], double out[3])
     for (int i = 0; i < 3; ++i) {
         double M[3][3] = {A[0][0], A[0][1], A[0][2], A[1][0], A[1][1],
                           A[1][2], A[2][0], A[2][1], A[2][2]};
-        M[i][0] = b[0];
-        M[i][1] = b[1];
-        M[i][2] = b[2];
+        M[0][i] = b[0];
+        M[1][i] = b[1];
+        M[2][i] = b[2];
         const double sub = M[0][0] * (M[1][1] * M[2][2] - M[1][2] * M[2][1]) -
                            M[0][1] * (M[1][0] * M[2][2] - M[1][2] * M[2][0]) +
                            M[0][2] * (M[1][0] * M[2][1] - M[1][1] * M[2][0]);
@@ -252,48 +252,45 @@ static bool solve3x3(const double A[3][3], const double b[3], double out[3])
     return true;
 }
 
-NaniteViewInfo getViewInfo(const float4x4 &viewProj, float viewportHeight)
+NaniteViewInfo getViewInfo(const float4x4 &viewProj, float viewportHeight, float projScaleY)
 {
     (void)viewportHeight;
 
     NaniteViewInfo view;
     extract_frustum_planes(viewProj, view.planes);
 
-    /* Camera position: the eye is the world point that the view transform
-     * maps to the view-space origin, i.e. VP·eye = (0, 0, VP[3][2], 0) (the
-     * last column of the perspective projection). Recovered exactly with the
-     * inverse view-projection. For orthographic projections there is no eye;
-     * the error metric then uses a unit distance (pure scale). */
-    const bool perspective = viewProj[2][3] != 0.0f;
-    if (perspective) {
-        float4x4 inv_vp;
-        if (invert4x4(viewProj, inv_vp)) {
-            const float b_term = viewProj[3][2];
-            float4 eye4(0.0f);
-            for (int c = 0; c < 4; ++c) {
-                const float qc = (c == 2) ? b_term : 0.0f;
-                for (int r = 0; r < 4; ++r) {
-                    eye4[r] += inv_vp[c][r] * qc;
-                }
-            }
-            if (std::abs(eye4.w) > 1e-8f) {
-                view.camPos = eye4.xyz() / eye4.w;
-            }
-        }
+    /* Camera position: solve for the intersection of the frustum's side planes
+     * (left, right, top). For perspective views this gives the exact camera
+     * apex in the coordinate space of viewProj (e.g., object space if viewProj
+     * includes the object matrix). For orthographic views the planes are parallel
+     * so solve3x3 returns false and the error metric uses distance-independent scale. */
+    const double A[3][3] = {
+        {double(view.planes[0][0]), double(view.planes[0][1]), double(view.planes[0][2])},
+        {double(view.planes[1][0]), double(view.planes[1][1]), double(view.planes[1][2])},
+        {double(view.planes[3][0]), double(view.planes[3][1]), double(view.planes[3][2])}
+    };
+    const double b[3] = {-double(view.planes[0][3]), -double(view.planes[1][3]), -double(view.planes[3][3])};
+    double apex[3];
+    if (solve3x3(A, b, apex)) {
+        view.camPos = float3(float(apex[0]), float(apex[1]), float(apex[2]));
+        view.orthographic = false;
     }
     else {
+        view.camPos = float3(0.0f);
         view.orthographic = true;
     }
 
-    /* Vertical projection scale: proj[1][1] = 1/tan(fov/2) (perspective) or
-     * 2/height (orthographic); both convert world error to pixels with the
-     * same formula. */
-    view.projScaleY = std::abs(viewProj[1][1]);
+    /* Vertical projection scale: taken from the projection matrix alone
+     * (passed in as projScaleY). Deriving it from the combined viewProj is
+     * incorrect when the object transform is baked into viewProj, because
+     * object rotation corrupts viewProj[1][1]. */
+    view.projScaleY = projScaleY;
     return view;
 }
 
 std::size_t selectClusters(const NaniteData &data,
                            const float4x4 &viewProj,
+                           float projScaleY,
                            float viewportHeight,
                            const NaniteLodParams &params,
                            std::vector<NaniteDrawCommand> &out)
@@ -303,7 +300,7 @@ std::size_t selectClusters(const NaniteData &data,
         return 0;
     }
 
-    const NaniteViewInfo view = getViewInfo(viewProj, viewportHeight);
+    const NaniteViewInfo view = getViewInfo(viewProj, viewportHeight, projScaleY);
 
     /* Build the DAG child lists from the parent links. */
     std::vector<std::vector<uint32_t>> children(data.clusters.size());
@@ -342,6 +339,7 @@ std::size_t selectClusters(const NaniteData &data,
 
 std::size_t selectClustersFlat(const NaniteData &data,
                                const float4x4 &viewProj,
+                               float projScaleY,
                                float viewportHeight,
                                const NaniteLodParams &params,
                                std::vector<NaniteDrawCommand> &out)
@@ -356,7 +354,7 @@ std::size_t selectClustersFlat(const NaniteData &data,
         return 0;
     }
 
-    const NaniteViewInfo view = getViewInfo(viewProj, viewportHeight);
+    const NaniteViewInfo view = getViewInfo(viewProj, viewportHeight, projScaleY);
     const std::size_t maxClusters = params.maxClustersPerFrame > 0
                                         ? std::size_t(params.maxClustersPerFrame)
                                         : std::numeric_limits<std::size_t>::max();

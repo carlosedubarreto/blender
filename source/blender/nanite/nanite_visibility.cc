@@ -1,4 +1,4 @@
-﻿/* SPDX-FileCopyrightText: 2006 Blender Authors
+/* SPDX-FileCopyrightText: 2006 Blender Authors
  *
  * SPDX-License-Identifier: GPL-2.0-or-later
  */
@@ -50,20 +50,21 @@ bool gpu_available()
 static const char *VIS_VERT_SOURCE = R"(
 void main()
 {
-  uint corner = gl_VertexID % 3u;
-  uint idx = tri_indices[gl_VertexID];
+  uint global_idx = vid;
+  uint corner = global_idx % 3u;
+  uint idx = tri_indices[global_idx];
   vec3 pos = vec3(positions[idx * 3u], positions[idx * 3u + 1u],
                   positions[idx * 3u + 2u]);
   gl_Position = view_proj * vec4(pos, 1.0);
 
   bary = vec2(corner == 0u ? 1.0 : 0.0, corner == 1u ? 1.0 : 0.0);
-  tri_id = gl_VertexID / 3u;
+  tri_id = global_idx / 3u;
 
   cluster_id = 0u;
   if (debug_clusters != 0) {
     for (uint c = 0u; c < uint(cluster_count); ++c) {
       uvec4 meta = cluster_meta[c];
-      if (gl_VertexID >= meta.x && gl_VertexID < meta.x + meta.y) {
+      if (global_idx >= meta.x && global_idx < meta.x + meta.y) {
         cluster_id = c;
         break;
       }
@@ -103,6 +104,7 @@ void main()
      * can composite over an existing scene render (draw-manager path). */
     discard;
   }
+  gl_FragDepth = texelFetch(depth_texture, px, 0).r;
   vec2 bary_xy = unpackHalf2x16(vis.y);
   vec3 bary = vec3(bary_xy.x, bary_xy.y, 1.0 - bary_xy.x - bary_xy.y);
 
@@ -129,10 +131,21 @@ void main()
   vec2 uv = bary.x * u0 + bary.y * u1 + bary.z * u2;
 
   if (shading_mode == 1u) {
-    /* Cluster visualization: hash the cluster id to a flat color. */
+    /* Cluster visualization: the hue hashes the cluster id, and the value
+     * (brightness) is hashed per triangle so the individual triangles forming
+     * each cluster are distinguishable while the cluster keeps one
+     * recognizable hue. The +1/32 offset avoids the degenerate near-black
+     * hues of low cluster ids. */
     uint cid = vis.z;
-    float hue = float((cid * 2654435761u) & 0xFFFFFFu) / float(0xFFFFFFu);
-    out_color = vec4(fract(hue * 7.23), fract(hue * 3.71), fract(hue * 5.13), 1.0);
+    uint tri = vis.x;
+    float hue = fract(float((cid * 2654435761u) & 0xFFFFFFu) / float(0xFFFFFFu) +
+                      0.03125);
+    float val = 0.45 + 0.55 * (float((tri * 1973u + cid * 7919u) & 0xFFFFu) / 65535.0);
+    /* HSV -> RGB (s = 0.85). */
+    vec4 K = vec4(1.0, 2.0 / 3.0, 1.0 / 3.0, 3.0);
+    vec3 p = abs(fract(vec3(hue) + K.xyz) * 6.0 - K.www);
+    vec3 rgb = mix(K.xxx, clamp(p - K.xxx, 0.0, 1.0), 0.85);
+    out_color = vec4(rgb * val, 1.0);
     return;
   }
   if (shading_mode == 2u) {
@@ -162,7 +175,8 @@ gpu::Shader *createVisShader()
     info.fragment_source("nanite_vis");
     info.fragment_source_generated = VIS_FRAG_SOURCE;
 
-    /* Vertex pulling: no vertex attributes are consumed. */
+    /* Vertex pulling: vid attribute supplies the absolute index position. */
+    info.vertex_in(0, Type::uint_t, "vid");
     info.storage_buf(0, Qualifier::read, "uint", "tri_indices[]");
     info.storage_buf(1, Qualifier::read, "float", "positions[]");
     info.storage_buf(2, Qualifier::read, "uvec4", "cluster_meta[]");
@@ -202,11 +216,13 @@ gpu::Shader *createMaterialShader()
     info.vertex_in(0, Type::float3_t, "pos");
     info.fragment_out(0, Type::float4_t, "out_color");
 
+    info.depth_write(DepthWrite::ANY);
     info.storage_buf(0, Qualifier::read, "float", "positions[]");
     info.storage_buf(1, Qualifier::read, "float", "normals[]");
     info.storage_buf(2, Qualifier::read, "float", "uvs[]");
     info.storage_buf(3, Qualifier::read, "uint", "tri_indices[]");
     info.sampler(0, ImageType::Uint2D, "vis_texture");
+    info.sampler(1, ImageType::Float2D, "depth_texture");
 
     info.push_constant(Type::float3_t, "camera_pos");
     info.push_constant(Type::int_t, "shading_mode");
@@ -379,7 +395,8 @@ void NaniteVisibilityPass::render(gpu::StorageBuf *command_buf,
                                   const float3 &cam_pos,
                                   int viewport_width,
                                   int viewport_height,
-                                  int shading_mode)
+                                  int shading_mode,
+                                  const float4x4 &object_model)
 {
     if (command_buf == nullptr || draw_count == 0 || mVisShader == nullptr ||
         mMaterialShader == nullptr || mPositionsBuf == nullptr ||
@@ -400,6 +417,8 @@ void NaniteVisibilityPass::render(gpu::StorageBuf *command_buf,
     const uint32_t clear_value[4] = {0xFFFFFFFFu, 0u, 0u, 0u};
     GPU_texture_clear(
         mVisTexture, GPU_DATA_UINT, static_cast<const void *>(clear_value));
+
+    (void)object_model;
 
     /* ---------------- Pass 1: visibility ---------------- */
     GPU_framebuffer_bind(mFrameBuffer);
@@ -423,7 +442,6 @@ void NaniteVisibilityPass::render(gpu::StorageBuf *command_buf,
         "debug_clusters",
         shading_mode == NANITE_SHADING_CLUSTERS ? 1 : 0);
     GPU_shader_uniform_1i(mVisShader, "cluster_count", int(mClusterCount));
-
     GPU_batch_multi_draw_indirect(
         mMeshBatch, command_buf, int(draw_count), 0, sizeof(uint32_t) * 4);
 
@@ -432,12 +450,8 @@ void NaniteVisibilityPass::render(gpu::StorageBuf *command_buf,
 
     /* ---------------- Pass 2: material ---------------- */
     GPU_framebuffer_bind(previous_fb != nullptr ? previous_fb : mFrameBuffer);
-    /* Composite with depth-testing against the target's depth buffer, so the
-     * resolved Nanite pixels only replace fragments where no opaque geometry
-     * is in front (draw-manager integration). The full-screen quad is placed
-     * at the far plane so it never occludes scene geometry. */
     GPU_depth_test(GPU_DEPTH_LESS_EQUAL);
-    GPU_depth_mask(false);
+    GPU_depth_mask(true);
     GPU_blend(GPU_BLEND_NONE);
 
     GPU_batch_set_shader(mFullscreenBatch, mMaterialShader);
@@ -446,6 +460,7 @@ void NaniteVisibilityPass::render(gpu::StorageBuf *command_buf,
     GPU_storagebuf_bind(mUvsBuf, 2);
     GPU_storagebuf_bind(mIndicesBuf, 3);
     GPU_texture_bind(mVisTexture, 0);
+    GPU_texture_bind(mDepthTexture, 1);
     GPU_shader_uniform_3f(
         mMaterialShader, "camera_pos", cam_pos.x, cam_pos.y, cam_pos.z);
     GPU_shader_uniform_1i(mMaterialShader, "shading_mode", shading_mode);

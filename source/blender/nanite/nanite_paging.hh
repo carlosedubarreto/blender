@@ -193,6 +193,7 @@ class NanitePageManager
  */
 void collectStreamingRequests(const NaniteData &data,
                               const float4x4 &viewProj,
+                              float projScaleY,
                               float viewportHeight,
                               const NaniteLodParams &params,
                               std::vector<uint32_t> &out_requests);

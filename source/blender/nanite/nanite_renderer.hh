@@ -63,7 +63,10 @@ public:
     /** Call once per frame to recompute LOD selection and update the command buffer. */
     void update(const NaniteData &data,
                 const float4x4 &viewProj,
-                float viewportHeight);
+                float projScaleY,
+                float viewportHeight,
+                const float4x4 *lodViewProj = nullptr,
+                const float *lodProjScaleY = nullptr);
 
     /** Override the LOD pixel error threshold for the next frames. */
     void setPixelError(float pixelError) { mPixelError = pixelError; }
@@ -86,11 +89,13 @@ private:
     /** CPU fallback: run the flat traversal and upload the commands. */
     void updateWithCpuTraversal(const NaniteData &data,
                                 const float4x4 &viewProj,
+                                float projScaleY,
                                 float viewportHeight);
 
     /** GPU path: upload cluster data (if changed), dispatch, read back count. */
     void updateWithGpuTraversal(const NaniteData &data,
                                 const float4x4 &viewProj,
+                                float projScaleY,
                                 float viewportHeight);
 
     /** (Re)create or resize one SSBO to at least \a byteSize. */
@@ -131,6 +136,12 @@ private:
     // Data/matrix used by the last update (consumed by the draw step).
     const NaniteData *mLastData = nullptr;
     float4x4 mLastViewProj = float4x4::identity();
+    float4x4 mLastLodViewProj = float4x4::identity();
+    float mLastProjScaleY = 1.0f;
+    float mLastLodProjScaleY = 1.0f;
+    float mLastViewportHeight = 0.0f;
+    float mLastPixelError = -1.0f;
+    bool mMatricesCurrent = false;  // track if matrices have been updated this frame
 
     // LOD pixel error threshold (pixels).
     float mPixelError = 1.0f;

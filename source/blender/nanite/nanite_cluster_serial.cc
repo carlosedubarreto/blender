@@ -23,25 +23,19 @@ namespace nanite {
 static size_t offsetOf(const NaniteData &data,
                        int fieldIndex /* 0=pos,1=nrm,2=uv,3=idx,4=proxyPos,5=proxyIdx */)
 {
+    const bool has_normals = (data.header.flags & 2) != 0;
+    const bool has_uvs = (data.header.flags & 1) != 0;
     size_t off = sizeof(NaniteHeader) + data.clusters.size() * sizeof(NaniteCluster);
-    if (fieldIndex == 0 && !data.positions.empty()) {
-        off += data.positions.size() * sizeof(float3);
-    }
-    if (fieldIndex == 1 && !data.normals.empty()) {
-        off += data.normals.size() * sizeof(float3);
-    }
-    if (fieldIndex == 2 && !data.uvs.empty()) {
-        off += data.uvs.size() * sizeof(float2);
-    }
-    if (fieldIndex == 3 && !data.indices.empty()) {
-        off += data.indices.size() * sizeof(uint32_t);
-    }
-    if (fieldIndex == 4 && !data.proxyPositions.empty()) {
-        off += data.proxyPositions.size() * sizeof(float3);
-    }
-    if (fieldIndex == 5 && !data.proxyIndices.empty()) {
-        off += data.proxyIndices.size() * sizeof(uint32_t);
-    }
+    if (fieldIndex <= 0) return off;
+    if (!data.positions.empty()) off += data.positions.size() * sizeof(float3);
+    if (fieldIndex <= 1) return off;
+    if (has_normals && !data.normals.empty()) off += data.normals.size() * sizeof(float3);
+    if (fieldIndex <= 2) return off;
+    if (has_uvs && !data.uvs.empty()) off += data.uvs.size() * sizeof(float2);
+    if (fieldIndex <= 3) return off;
+    if (!data.indices.empty()) off += data.indices.size() * sizeof(uint32_t);
+    if (fieldIndex <= 4) return off;
+    if (!data.proxyPositions.empty()) off += data.proxyPositions.size() * sizeof(float3);
     return off;
 }
 
@@ -49,16 +43,18 @@ bool serializeToMemory(const NaniteData &data, std::vector<uint8_t> &out)
 {
     const size_t headerSize = sizeof(NaniteHeader);
     const size_t clusterSize = sizeof(NaniteCluster);
+    const bool has_normals = (data.header.flags & 2) != 0;
+    const bool has_uvs = (data.header.flags & 1) != 0;
 
     // Reserve space for header + clusters + all sub-buffers.
     size_t total = headerSize + data.clusters.size() * clusterSize;
     if (!data.positions.empty()) {
         total += data.positions.size() * sizeof(float3);
     }
-    if (!data.normals.empty()) {
+    if (has_normals && !data.normals.empty()) {
         total += data.normals.size() * sizeof(float3);
     }
-    if (!data.uvs.empty()) {
+    if (has_uvs && !data.uvs.empty()) {
         total += data.uvs.size() * sizeof(float2);
     }
     if (!data.indices.empty()) {
@@ -89,13 +85,13 @@ bool serializeToMemory(const NaniteData &data, std::vector<uint8_t> &out)
         ptr += data.positions.size() * sizeof(float3);
     }
     // Normals
-    if (!data.normals.empty()) {
+    if (has_normals && !data.normals.empty()) {
         std::memcpy(ptr, data.normals.data(),
                     data.normals.size() * sizeof(float3));
         ptr += data.normals.size() * sizeof(float3);
     }
     // UVs
-    if (!data.uvs.empty()) {
+    if (has_uvs && !data.uvs.empty()) {
         std::memcpy(ptr, data.uvs.data(),
                     data.uvs.size() * sizeof(float2));
         ptr += data.uvs.size() * sizeof(float2);
