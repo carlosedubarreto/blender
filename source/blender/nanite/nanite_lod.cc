@@ -98,19 +98,23 @@ void traverseCluster(const TraversalContext &ctx, uint32_t ci)
     const auto &children = (*ctx.children)[ci];
     const bool has_children = !children.empty();
 
-    /* Screen error of the coarser parent (FLT_MAX for roots -> always
-     * refine). */
+    const float cluster_screen_err = (cluster.error <= 0.0f)
+        ? 0.0f
+        : projectedErrorPx(center, cluster.sphere[3], cluster.error,
+                           ctx.camPos, ctx.viewportHeight,
+                           ctx.projScaleY, ctx.orthographic);
+
+    const float3 pcenter(cluster.parentSphere[0], cluster.parentSphere[1], cluster.parentSphere[2]);
     const float parent_screen_err =
-        (cluster.parentError >= std::numeric_limits<float>::max())
+        (cluster.parentError >= 1e38f)
             ? std::numeric_limits<float>::max()
-            : projectedErrorPx(center, cluster.sphere[3], cluster.parentError,
+            : projectedErrorPx(pcenter, cluster.parentSphere[3], cluster.parentError,
                                ctx.camPos, ctx.viewportHeight,
                                ctx.projScaleY, ctx.orthographic);
 
-    /* Emit when the coarse version suffices, when the cluster itself is
-     * already accurate enough, or when there is nothing finer to use. */
-    const bool emit = !has_children || parent_screen_err <= ctx.pixelError;
-    if (emit) {
+    /* UE5 Nanite Cut Criterion:
+     * Emit cluster if its error is acceptable (<= tau) AND its parent error is unacceptable (> tau). */
+    if (cluster_screen_err <= ctx.pixelError && parent_screen_err > ctx.pixelError) {
         if (ctx.out->size() >= ctx.maxClusters) {
             ctx.budget_exhausted = true;
             return;
@@ -125,10 +129,12 @@ void traverseCluster(const TraversalContext &ctx, uint32_t ci)
         return;
     }
 
-    for (const uint32_t child : children) {
-        traverseCluster(ctx, child);
-        if (ctx.budget_exhausted) {
-            return;
+    if (cluster_screen_err > ctx.pixelError && has_children) {
+        for (const uint32_t child : children) {
+            traverseCluster(ctx, child);
+            if (ctx.budget_exhausted) {
+                return;
+            }
         }
     }
 }
@@ -359,38 +365,6 @@ std::size_t selectClustersFlat(const NaniteData &data,
                                         ? std::size_t(params.maxClustersPerFrame)
                                         : std::numeric_limits<std::size_t>::max();
 
-    /* Children counts and parent lookups from the parent links. */
-    std::vector<uint32_t> children_count(data.clusters.size(), 0);
-    for (const auto &c : data.clusters) {
-        if (c.parentGroup >= 0 &&
-            uint32_t(c.parentGroup) < data.clusters.size())
-        {
-            children_count[uint32_t(c.parentGroup)]++;
-        }
-    }
-
-    /* Per-cluster emit predicate (flat mirror of the recursive traversal):
-     *
-     *   emit(C) = no ancestor of C passes its own test
-     *             AND (leaf(C) OR test(C))
-     *
-     * where test(X) checks whether the error of X's parent projects below
-     * the pixel threshold. The recursive traversal stops descending as soon
-     * as an ancestor emits, so a cluster is only drawn when it is *reached*
-     * (no ancestor emitted) and it is a leaf, or its own parent test passes.
-     * The ancestor walk is bounded by the DAG depth (a handful of levels),
-     * keeping the rule embarrassingly parallel — one thread per cluster on
-     * the GPU, no queues. */
-    const auto cluster_test = [&](const NaniteCluster &cluster) {
-        if (cluster.parentError >= std::numeric_limits<float>::max()) {
-            return false;
-        }
-        const float3 c(cluster.sphere[0], cluster.sphere[1], cluster.sphere[2]);
-        return projectedErrorPx(c, cluster.sphere[3], cluster.parentError,
-                                view.camPos, viewportHeight, view.projScaleY,
-                                view.orthographic) <= params.pixelError;
-    };
-
     std::size_t emitted = 0;
     for (uint32_t ci = 0; ci < uint32_t(data.clusters.size()); ++ci) {
         const NaniteCluster &cluster = data.clusters[ci];
@@ -399,60 +373,43 @@ std::size_t selectClustersFlat(const NaniteData &data,
         if (cluster.indexCount == 0) {
             continue;
         }
-        const float3 center(cluster.sphere[0], cluster.sphere[1],
-                            cluster.sphere[2]);
+        const float3 center(cluster.sphere[0], cluster.sphere[1], cluster.sphere[2]);
         const float radius = cluster.sphere[3];
         if (!sphere_in_frustum(view.planes, center, radius)) {
             continue;
         }
 
-        /* Walk up the ancestor chain: if any ancestor would emit, the
-         * recursive traversal stopped there and never reached this cluster;
-         * if any ancestor's sphere is outside the frustum, the subtree was
-         * pruned and this cluster is unreachable as well. */
-        bool ancestor_emitted = false;
-        int32_t ancestor = cluster.parentGroup;
-        while (ancestor >= 0 &&
-               uint32_t(ancestor) < data.clusters.size())
-        {
-            const NaniteCluster &a = data.clusters[uint32_t(ancestor)];
-            if (a.indexCount == 0) {
-                /* Non-resident ancestors cannot emit (UE-style: descend
-                 * through missing pages). */
-                ancestor = a.parentGroup;
-                continue;
-            }
-            const float3 ac(a.sphere[0], a.sphere[1], a.sphere[2]);
-            if (!sphere_in_frustum(view.planes, ac, a.sphere[3])) {
-                ancestor_emitted = true;
-                break;
-            }
-            if (cluster_test(a)) {
-                ancestor_emitted = true;
-                break;
-            }
-            ancestor = a.parentGroup;
-        }
-        if (ancestor_emitted) {
-            continue;
-        }
+        /* Nanite DAG Cut Criterion:
+         * A cluster is rendered iff:
+         *   projectedError(cluster) <= tau  AND  projectedError(parent) > tau
+         */
+        const float err_c = (cluster.error <= 0.0f)
+            ? 0.0f
+            : projectedErrorPx(center, radius, cluster.error,
+                               view.camPos, viewportHeight, view.projScaleY,
+                               view.orthographic);
 
-        const bool leaf = children_count[ci] == 0;
-        const bool emit = leaf || cluster_test(cluster);
-        if (!emit) {
-            continue;
+        const float3 pcenter(cluster.parentSphere[0], cluster.parentSphere[1], cluster.parentSphere[2]);
+        const float pradius = cluster.parentSphere[3];
+        const float err_p = (cluster.parentError >= 1e38f)
+            ? std::numeric_limits<float>::max()
+            : projectedErrorPx(pcenter, pradius, cluster.parentError,
+                               view.camPos, viewportHeight, view.projScaleY,
+                               view.orthographic);
+
+        if (err_c <= params.pixelError && err_p > params.pixelError) {
+            if (emitted >= maxClusters) {
+                break;
+            }
+            NaniteDrawCommand cmd = {};
+            cmd.indexCount = cluster.indexCount;
+            cmd.instanceCount = 1;
+            cmd.firstIndex = cluster.firstIndex;
+            cmd.vertexOffset = 0;
+            cmd.firstInstance = 0;
+            out.push_back(cmd);
+            emitted++;
         }
-        if (emitted >= maxClusters) {
-            break;
-        }
-        NaniteDrawCommand cmd = {};
-        cmd.indexCount = cluster.indexCount;
-        cmd.instanceCount = 1;
-        cmd.firstIndex = cluster.firstIndex;
-        cmd.vertexOffset = 0;
-        cmd.firstInstance = 0;
-        out.push_back(cmd);
-        emitted++;
     }
     return out.size();
 }

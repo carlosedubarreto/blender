@@ -89,9 +89,13 @@ void NaniteRenderer::terminate()
         GPU_storagebuf_free(mSphereBuf);
         mSphereBuf = nullptr;
     }
-    if (mParentErrBuf != nullptr) {
-        GPU_storagebuf_free(mParentErrBuf);
-        mParentErrBuf = nullptr;
+    if (mParentSphereBuf != nullptr) {
+        GPU_storagebuf_free(mParentSphereBuf);
+        mParentSphereBuf = nullptr;
+    }
+    if (mErrorsBuf != nullptr) {
+        GPU_storagebuf_free(mErrorsBuf);
+        mErrorsBuf = nullptr;
     }
     if (mMetaBuf != nullptr) {
         GPU_storagebuf_free(mMetaBuf);
@@ -202,8 +206,10 @@ void NaniteRenderer::updateWithGpuTraversal(const NaniteData &data,
         flattenClustersForGpu(data, mGpuClusters);
         if (!ensureStorageBuf(&mSphereBuf, clusterCount * 4 * sizeof(float),
                               "nanite_cluster_spheres") ||
-            !ensureStorageBuf(&mParentErrBuf, clusterCount * sizeof(float),
-                              "nanite_cluster_parent_err") ||
+            !ensureStorageBuf(&mParentSphereBuf, clusterCount * 4 * sizeof(float),
+                              "nanite_cluster_parent_spheres") ||
+            !ensureStorageBuf(&mErrorsBuf, clusterCount * 2 * sizeof(float),
+                              "nanite_cluster_errors") ||
             !ensureStorageBuf(&mMetaBuf, clusterCount * 4 * sizeof(uint32_t),
                               "nanite_cluster_meta") ||
             !ensureStorageBuf(&mCounterBuf, sizeof(uint32_t), "nanite_draw_counter"))
@@ -212,7 +218,8 @@ void NaniteRenderer::updateWithGpuTraversal(const NaniteData &data,
             return updateWithCpuTraversal(data, viewProj, projScaleY, viewportHeight);
         }
         GPU_storagebuf_update(mSphereBuf, mGpuClusters.spheres.data());
-        GPU_storagebuf_update(mParentErrBuf, mGpuClusters.parent_errors.data());
+        GPU_storagebuf_update(mParentSphereBuf, mGpuClusters.parent_spheres.data());
+        GPU_storagebuf_update(mErrorsBuf, mGpuClusters.errors.data());
         GPU_storagebuf_update(mMetaBuf, mGpuClusters.meta.data());
         mUploadedClusterCount = clusterCount;
         mUploadedIndexCount = indexCount;
@@ -227,10 +234,11 @@ void NaniteRenderer::updateWithGpuTraversal(const NaniteData &data,
 
     GPU_shader_bind(mTraverseShader);
     GPU_storagebuf_bind(mSphereBuf, 0);
-    GPU_storagebuf_bind(mParentErrBuf, 1);
-    GPU_storagebuf_bind(mMetaBuf, 2);
-    GPU_storagebuf_bind(mDrawBuffer, 3);
-    GPU_storagebuf_bind(mCounterBuf, 4);
+    GPU_storagebuf_bind(mParentSphereBuf, 1);
+    GPU_storagebuf_bind(mErrorsBuf, 2);
+    GPU_storagebuf_bind(mMetaBuf, 3);
+    GPU_storagebuf_bind(mDrawBuffer, 4);
+    GPU_storagebuf_bind(mCounterBuf, 5);
 
     GPU_shader_uniform_3f(mTraverseShader, "camera_pos", view.camPos.x,
                           view.camPos.y, view.camPos.z);
@@ -308,6 +316,27 @@ void NaniteRenderer::draw(int viewportWidth, int viewportHeight)
                            viewportWidth,
                            viewportHeight,
                            int(mShadingMode));
+}
+
+void NaniteRenderer::getLevelCounts(const NaniteData &data,
+                                    const float4x4 &lodViewProj,
+                                    float projScaleY,
+                                    float viewportHeight,
+                                    std::map<uint32_t, uint32_t> &out_counts) const
+{
+    out_counts.clear();
+    std::vector<NaniteDrawCommand> cmds;
+    NaniteLodParams params;
+    params.pixelError = mPixelError;
+    selectClustersFlat(data, lodViewProj, projScaleY, viewportHeight, params, cmds);
+    for (const auto &cmd : cmds) {
+        for (const auto &c : data.clusters) {
+            if (c.firstIndex == cmd.firstIndex && c.indexCount == cmd.indexCount) {
+                out_counts[c.level]++;
+                break;
+            }
+        }
+    }
 }
 
 }  // namespace nanite

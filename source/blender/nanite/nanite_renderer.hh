@@ -25,6 +25,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <map>
 #include <vector>
 
 namespace blender {
@@ -70,6 +71,7 @@ public:
 
     /** Override the LOD pixel error threshold for the next frames. */
     void setPixelError(float pixelError) { mPixelError = pixelError; }
+    float getPixelError() const { return mPixelError; }
 
     /** Select the material-pass shading mode (diffuse/clusters/normals). */
     void setShadingMode(NaniteShadingMode mode) { mShadingMode = mode; }
@@ -81,6 +83,13 @@ public:
     void draw(int viewportWidth, int viewportHeight);
 
     size_t drawCount() const { return mDrawCount; }
+
+    /** Diagnostic helper: count active clusters per LOD level. */
+    void getLevelCounts(const NaniteData &data,
+                        const float4x4 &lodViewProj,
+                        float projScaleY,
+                        float viewportHeight,
+                        std::map<uint32_t, uint32_t> &out_counts) const;
 
     /** True when the GPU compute traversal is in use. */
     bool usesGpuTraversal() const { return mGpuTraversalActive; }
@@ -118,7 +127,8 @@ private:
 
     // Per-cluster data buffers (uploaded only when the mesh changes).
     gpu::StorageBuf *mSphereBuf = nullptr;
-    gpu::StorageBuf *mParentErrBuf = nullptr;
+    gpu::StorageBuf *mParentSphereBuf = nullptr;
+    gpu::StorageBuf *mErrorsBuf = nullptr;
     gpu::StorageBuf *mMetaBuf = nullptr;
     // Shared atomic counter written by the compute shader, read back on CPU.
     gpu::StorageBuf *mCounterBuf = nullptr;

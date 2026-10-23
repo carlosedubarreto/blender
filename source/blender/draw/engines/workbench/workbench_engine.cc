@@ -53,8 +53,11 @@
 
 #include "workbench_engine.h" /* Own include. */
 
+#include <cstdio>
+#include <map>
 #include <memory>
 #include <mutex>
+#include <string>
 
 namespace blender {
 
@@ -331,6 +334,34 @@ class Instance : public DrawEngine {
                          float(resolution.y),
                          has_cam_lod ? &lod_object_persmat : nullptr,
                          has_cam_lod ? &lod_proj_scale_y : nullptr);
+
+      /* Diagnostic logging: frame camera vs mesh distance, projScaleY, pixel error, and active LOD cluster counts. */
+      const float3 cam_pos = default_view.location();
+      const float3 mesh_pos = state.object_mat.location();
+      const float dist = math::distance(cam_pos, mesh_pos);
+      std::map<uint32_t, uint32_t> level_counts;
+      state.pass->getLevelCounts(state.data,
+                                 has_cam_lod ? lod_object_persmat : object_persmat,
+                                 lod_proj_scale_y,
+                                 float(resolution.y),
+                                 level_counts);
+      std::string lod_str;
+      for (const auto &pair : level_counts) {
+        if (!lod_str.empty()) {
+          lod_str += ", ";
+        }
+        lod_str += "LOD" + std::to_string(pair.first) + ": " + std::to_string(pair.second);
+      }
+      printf("[Nanite LOD] Cam: (%.2f, %.2f, %.2f) | Mesh: (%.2f, %.2f, %.2f) | Dist: %.2f | ProjScaleY: %.4f | PixelError: %.1f | %zu clusters (%s)\n",
+             cam_pos.x, cam_pos.y, cam_pos.z,
+             mesh_pos.x, mesh_pos.y, mesh_pos.z,
+             dist,
+             lod_proj_scale_y,
+             state.pass->getPixelError(),
+             state.pass->drawCount(),
+             lod_str.empty() ? "none" : lod_str.c_str());
+      fflush(stdout);
+
       if (state.pass->drawCount() != 0) {
         state.pass->draw(resolution.x, resolution.y);
       }

@@ -16,6 +16,7 @@
 #include "nanite_renderer.hh"
 
 #include <cstdint>
+#include <map>
 #include <string>
 
 #include <cstddef>
@@ -77,6 +78,20 @@ public:
     void setPixelError(float pixelError)
     {
         renderer_.setPixelError(pixelError);
+    }
+
+    float getPixelError() const
+    {
+        return renderer_.getPixelError();
+    }
+
+    void getLevelCounts(const NaniteData &data,
+                        const float4x4 &lodViewProj,
+                        float projScaleY,
+                        float viewportHeight,
+                        std::map<uint32_t, uint32_t> &out_counts) const
+    {
+        renderer_.getLevelCounts(data, lodViewProj, projScaleY, viewportHeight, out_counts);
     }
 
     void draw(int viewportWidth, int viewportHeight) const;

@@ -26,8 +26,10 @@ namespace nanite {
 struct NaniteGpuClusterData {
     /** Spheres: 4 floats per cluster (x, y, z = center, w = radius). */
     std::vector<float> spheres;
-    /** Parent simplification error, 1 float per cluster. */
-    std::vector<float> parent_errors;
+    /** Parent spheres: 4 floats per cluster (x, y, z = center, w = radius). */
+    std::vector<float> parent_spheres;
+    /** Cluster & parent error: 2 floats per cluster (x = error, y = parentError). */
+    std::vector<float> errors;
     /** Meta: 4 uints per cluster (firstIndex, indexCount, childrenCount,
      * encodedParentIndex; 0xFFFFFFFF for roots). */
     std::vector<uint32_t> meta;

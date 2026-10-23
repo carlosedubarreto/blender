@@ -21,13 +21,15 @@ void flattenClustersForGpu(const NaniteData &data, NaniteGpuClusterData &out)
     const size_t n = data.clusters.size();
     out.count = n;
     out.spheres.clear();
-    out.parent_errors.clear();
+    out.parent_spheres.clear();
+    out.errors.clear();
     out.meta.clear();
     if (n == 0) {
         return;
     }
     out.spheres.reserve(n * 4);
-    out.parent_errors.reserve(n);
+    out.parent_spheres.reserve(n * 4);
+    out.errors.reserve(n * 2);
     out.meta.reserve(n * 4);
 
     /* Children counts from the parent links (used for the leaf test). */
@@ -44,12 +46,19 @@ void flattenClustersForGpu(const NaniteData &data, NaniteGpuClusterData &out)
         out.spheres.push_back(c.sphere[1]);
         out.spheres.push_back(c.sphere[2]);
         out.spheres.push_back(c.sphere[3]);
-        out.parent_errors.push_back(c.parentError);
+
+        out.parent_spheres.push_back(c.parentSphere[0]);
+        out.parent_spheres.push_back(c.parentSphere[1]);
+        out.parent_spheres.push_back(c.parentSphere[2]);
+        out.parent_spheres.push_back(c.parentSphere[3]);
+
+        out.errors.push_back(c.error);
+        out.errors.push_back(c.parentError);
+
         out.meta.push_back(c.firstIndex);
         out.meta.push_back(c.indexCount);
         out.meta.push_back(children_count[i]);
-        /* Encoded parent index (0xFFFFFFFF for roots) — needed by the GPU
-         * traversal for the parent-of-parent test. */
+        /* Encoded parent index (0xFFFFFFFF for roots). */
         out.meta.push_back(c.parentGroup >= 0 ? uint32_t(c.parentGroup) :
                                                 0xFFFFFFFFu);
     }

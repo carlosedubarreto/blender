@@ -599,13 +599,21 @@ BuildResult buildClusterDAG(const std::vector<BuildVertex> &verts,
                 coarse_tri_array, coarse_all, coarse_positions,
                 params.maxClusterTris);
 
+            /* Cumulative error: a parent cluster must have an error at least as
+             * large as all its children plus the current simplification error. */
+            float max_child_error = 0.0f;
+            for (const uint32_t cid : mg) {
+                max_child_error = std::max(max_child_error, R.clusters[cid].error);
+            }
+            const float accumulated_error = max_child_error + std::max(simplified.error, 1e-4f);
+
             std::vector<uint32_t> parents;
             for (const auto &part : parts) {
                 if (part.empty()) {
                     continue;
                 }
                 const uint32_t pid = makeCluster(
-                    R, coarse, part, simplified.error,
+                    R, coarse, part, accumulated_error,
                     std::numeric_limits<float>::max(), level,
                     /*copy_verts=*/true);
                 parents.push_back(pid);
@@ -631,7 +639,7 @@ BuildResult buildClusterDAG(const std::vector<BuildVertex> &verts,
                         best = pid;
                     }
                 }
-                R.clusters[cid].parentError = R.clusters[best].error;
+                R.clusters[cid].parentError = accumulated_error;
                 R.clusters[best].children.push_back(cid);
             }
         }
