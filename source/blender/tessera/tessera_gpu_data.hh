@@ -33,6 +33,8 @@ struct TesseraGpuClusterData {
     /** Meta: 4 uints per cluster (firstIndex, indexCount, childrenCount,
      * encodedParentIndex; 0xFFFFFFFF for roots). */
     std::vector<uint32_t> meta;
+    /** Material slot index per cluster. */
+    std::vector<uint32_t> materials;
     size_t count = 0;
 };
 
@@ -52,6 +54,8 @@ struct TesseraGpuVertexData {
     std::vector<float> normals;
     /** 2 floats per vertex (u, v); zeros when the source has no UVs. */
     std::vector<float> uvs;
+    /** 4 floats per vertex (tangent xyz, sign w); default (1,0,0,1). */
+    std::vector<float> tangents;
     /** Index buffer (copy of #TesseraData::indices). */
     std::vector<uint32_t> indices;
     size_t vertex_count = 0;

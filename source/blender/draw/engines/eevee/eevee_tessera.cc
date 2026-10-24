@@ -1,0 +1,495 @@
+/* SPDX-FileCopyrightText: 2026 Blender Authors
+ *
+ * SPDX-License-Identifier: GPL-2.0-or-later */
+
+/** \file
+ * \ingroup eevee
+ *
+ * Implementation of Tessera GPU cluster rendering into EEVEE.
+ */
+
+#include "eevee_tessera.hh"
+#include "eevee_instance.hh"
+
+#include "DNA_camera_types.h"
+#include "DNA_ID.h"
+#include "DNA_object_types.h"
+#include "DNA_scene_types.h"
+
+#include "BKE_camera.h"
+#include "BKE_idprop.hh"
+#include "BKE_image.hh"
+#include "BKE_main.hh"
+#include "BKE_material.hh"
+#include "BKE_node.hh"
+#include "BKE_node_legacy_types.hh"
+#include "BLI_listbase.h"
+
+#include "DNA_image_types.h"
+#include "DNA_material_types.h"
+#include "DNA_node_types.h"
+
+#include "BLI_fileops.h"
+#include "BLI_math_matrix.hh"
+#include "BLI_path_utils.hh"
+#include "BLI_string.h"
+
+#include "DEG_depsgraph_query.hh"
+
+#include "GPU_framebuffer.hh"
+
+#include "draw_view.hh"
+
+#include <cctype>
+#include <cmath>
+#include <cstdio>
+#include <map>
+#include <string>
+
+namespace blender::eevee {
+
+TesseraModule::TesseraModule(Instance &inst) : inst_(inst) {}
+
+TesseraModule::~TesseraModule() = default;
+
+void TesseraModule::begin_sync()
+{
+  std::lock_guard lock(this->mutex_);
+  for (auto item : objects_.items()) {
+    item.value->used = false;
+  }
+}
+
+static IDProperty *tessera_property_find(Object *ob, const char *prop_name)
+{
+  if (ob == nullptr) {
+    return nullptr;
+  }
+  IDProperty *group = IDP_GetProperties(&ob->id);
+  if (group != nullptr) {
+    if (IDProperty *prop = IDP_GetPropertyFromGroup(group, prop_name)) {
+      return prop;
+    }
+  }
+  const ID *orig_id = DEG_get_original_id(&ob->id);
+  if (orig_id != nullptr && orig_id != &ob->id) {
+    IDProperty *orig_group = IDP_GetProperties(const_cast<ID *>(orig_id));
+    if (orig_group != nullptr) {
+      if (IDProperty *prop = IDP_GetPropertyFromGroup(orig_group, prop_name)) {
+        return prop;
+      }
+    }
+  }
+  return nullptr;
+}
+
+static bool tessera_path_get(Object *ob, std::string &r_path)
+{
+  const IDProperty *prop = tessera_property_find(ob, "tessera_nc2");
+  if (prop == nullptr || prop->type != IDP_STRING) {
+    return false;
+  }
+  r_path = IDP_string_get(prop);
+  return !r_path.empty();
+}
+
+static int tessera_visualize_get(Object *ob)
+{
+  const IDProperty *prop = tessera_property_find(ob, "tessera_visualize_clusters");
+  if (prop == nullptr) {
+    return 0;
+  }
+  if (prop->type == IDP_INT) {
+    return IDP_int_get(prop);
+  }
+  if (prop->type == IDP_FLOAT) {
+    return int(IDP_float_get(prop));
+  }
+  if (prop->type == IDP_DOUBLE) {
+    return int(IDP_double_get(prop));
+  }
+  return prop->data.val;
+}
+
+static bool tessera_enabled_get(Object *ob)
+{
+  const IDProperty *prop = tessera_property_find(ob, "tessera_enabled");
+  if (prop == nullptr) {
+    return true;
+  }
+  if (prop->type == IDP_INT) {
+    return IDP_int_get(prop) != 0;
+  }
+  return prop->data.val != 0;
+}
+
+static float tessera_pixel_error_get(Object *ob)
+{
+  const IDProperty *prop = tessera_property_find(ob, "tessera_pixel_error");
+  if (prop == nullptr) {
+    return 1.0f;
+  }
+  float value = 1.0f;
+  if (prop->type == IDP_DOUBLE) {
+    value = float(IDP_double_get(prop));
+  }
+  else if (prop->type == IDP_FLOAT) {
+    value = IDP_float_get(prop);
+  }
+  else if (prop->type == IDP_INT) {
+    value = float(IDP_int_get(prop));
+  }
+  return (value > 0.0f) ? value : 1.0f;
+}
+
+static int tessera_view_source_get(Object *ob)
+{
+  const IDProperty *prop = tessera_property_find(ob, "tessera_view_source");
+  if (prop == nullptr) {
+    return 0;
+  }
+  if (prop->type == IDP_INT) {
+    return IDP_int_get(prop);
+  }
+  return prop->data.val;
+}
+
+static bool tessera_camera_persmat(const Scene *scene,
+                                  const DRWContext *draw_ctx,
+                                  const int2 &resolution,
+                                  float4x4 &r_persmat,
+                                  float &r_proj_scale_y)
+{
+  if (scene == nullptr || scene->camera == nullptr || draw_ctx->depsgraph == nullptr) {
+    return false;
+  }
+  const Object *cam_ob = DEG_get_evaluated(draw_ctx->depsgraph, scene->camera);
+  if (cam_ob == nullptr || cam_ob->type != OB_CAMERA || cam_ob->data == nullptr) {
+    return false;
+  }
+  CameraParams params;
+  BKE_camera_params_init(&params);
+  BKE_camera_params_from_object(&params, cam_ob);
+  BKE_camera_params_compute_viewplane(
+      &params, resolution.x, resolution.y, scene->r.xasp, scene->r.yasp);
+  BKE_camera_params_compute_matrix(&params);
+  float4x4 winmat = float4x4::identity();
+  for (int i = 0; i < 4; ++i) {
+    for (int j = 0; j < 4; ++j) {
+      winmat[i][j] = params.winmat[i][j];
+    }
+  }
+  const float4x4 viewmat = math::invert(cam_ob->object_to_world());
+  r_persmat = winmat * viewmat;
+  r_proj_scale_y = std::abs(winmat[1][1]);
+  return true;
+}
+
+static std::vector<tessera::TesseraMaterialTextures> tessera_extract_materials(Object *ob)
+{
+  std::vector<tessera::TesseraMaterialTextures> result;
+  if (ob == nullptr) {
+    return result;
+  }
+  const int totcol = std::max(1, int(ob->totcol));
+  result.resize(totcol);
+
+  for (int i = 0; i < totcol; ++i) {
+    auto *ma = BKE_object_material_get(ob, i + 1);
+    tessera::TesseraMaterialTextures &mat = result[i];
+    if (ma == nullptr) {
+      continue;
+    }
+    mat.base_color = float4(ma->r, ma->g, ma->b, ma->a);
+    mat.roughness_value = ma->roughness;
+    mat.metallic_value = ma->metallic;
+
+    if (!ma->use_nodes || ma->nodetree == nullptr) {
+      continue;
+    }
+
+    for (bNode *node = static_cast<bNode *>(ma->nodetree->nodes.first); node != nullptr;
+         node = node->next)
+    {
+      if (node->type_legacy != SH_NODE_TEX_IMAGE || node->id == nullptr) {
+        continue;
+      }
+      blender::Image *ima = reinterpret_cast<blender::Image *>(node->id);
+      NodeTexImage *storage = static_cast<NodeTexImage *>(node->storage);
+      ImageUser *iuser = storage ? &storage->iuser : nullptr;
+      gpu::Texture *tex = BKE_image_get_gpu_texture(ima, iuser);
+      if (tex == nullptr) {
+        ImageGPUTextures gputex = BKE_image_get_gpu_material_texture(ima, iuser, false);
+        tex = gputex.texture ? *gputex.texture : nullptr;
+      }
+      if (tex == nullptr) {
+        continue;
+      }
+
+      std::string node_name = node->name;
+      std::string ima_name = ima->id.name + 2;
+      for (char &c : node_name) c = std::tolower(c);
+      for (char &c : ima_name) c = std::tolower(c);
+
+      bool is_normal = (node_name.find("normal") != std::string::npos ||
+                        node_name.find("norm") != std::string::npos ||
+                        ima_name.find("normal") != std::string::npos ||
+                        ima_name.find("norm") != std::string::npos);
+
+      bool is_rough = (node_name.find("rough") != std::string::npos ||
+                       node_name.find("rgh") != std::string::npos ||
+                       ima_name.find("rough") != std::string::npos ||
+                       ima_name.find("rgh") != std::string::npos);
+
+      bool is_diff = (node_name.find("diff") != std::string::npos ||
+                      node_name.find("base") != std::string::npos ||
+                      node_name.find("color") != std::string::npos ||
+                      node_name.find("albedo") != std::string::npos ||
+                      ima_name.find("diff") != std::string::npos ||
+                      ima_name.find("base") != std::string::npos ||
+                      ima_name.find("color") != std::string::npos ||
+                      ima_name.find("albedo") != std::string::npos);
+
+      if (is_normal && !mat.has_normal) {
+        mat.normal = tex;
+        mat.has_normal = true;
+      }
+      else if (is_rough && !mat.has_roughness) {
+        mat.roughness = tex;
+        mat.has_roughness = true;
+      }
+      else if (is_diff && !mat.has_diffuse) {
+        mat.diffuse = tex;
+        mat.has_diffuse = true;
+      }
+      else if (!mat.has_diffuse && !is_normal && !is_rough) {
+        mat.diffuse = tex;
+        mat.has_diffuse = true;
+      }
+    }
+  }
+  return result;
+}
+
+bool TesseraModule::record(Object *ob)
+{
+  if (!tessera_enabled_get(ob)) {
+    return false;
+  }
+  std::string idprop_path;
+  if (!tessera_path_get(ob, idprop_path)) {
+    return false;
+  }
+
+  char abs_path[FILE_MAX];
+  BLI_strncpy(abs_path, idprop_path.c_str(), sizeof(abs_path));
+  BLI_path_abs(abs_path, BKE_main_blendfile_path_from_global());
+
+  BLI_stat_t file_info;
+  const bool stat_ok = (BLI_stat(abs_path, &file_info) == 0);
+  const int64_t file_mtime = stat_ok ? int64_t(file_info.st_mtime) : int64_t(-1);
+  const int64_t file_size = stat_ok ? int64_t(file_info.st_size) : int64_t(-1);
+
+  std::lock_guard lock(this->mutex_);
+  std::unique_ptr<ObjectState> &entry = objects_.lookup_or_add_default(
+      std::string(ob->id.name + 2));
+  if (entry == nullptr) {
+    entry = std::make_unique<ObjectState>();
+  }
+  ObjectState &state = *entry;
+
+  state.used = true;
+  state.visualize_clusters = tessera_visualize_get(ob);
+  state.pixel_error = tessera_pixel_error_get(ob);
+  state.view_source = tessera_view_source_get(ob);
+  state.object_mat = ob->object_to_world();
+  state.materials = tessera_extract_materials(ob);
+
+  const bool stale = (state.nc2_path != abs_path) ||
+                     (state.file_mtime != file_mtime) ||
+                     (state.file_size != file_size);
+  if (state.pass == nullptr || stale) {
+    if (stale || state.data.clusters.empty()) {
+      size_t data_size = 0;
+      if (void *file_data = BLI_file_read_binary_as_mem(abs_path, 0, &data_size)) {
+        tessera::TesseraData loaded;
+        if (tessera::deserializeFromMemory(
+                loaded, static_cast<const uint8_t *>(file_data), data_size) &&
+            !loaded.clusters.empty())
+        {
+          state.data = std::move(loaded);
+        }
+        MEM_delete_void(file_data);
+      }
+      state.file_mtime = file_mtime;
+      state.file_size = file_size;
+      state.nc2_path = abs_path;
+      state.pass.reset();
+    }
+  }
+  return !state.data.clusters.empty();
+}
+
+void TesseraModule::draw_prepass(const draw::View &view,
+                                const int2 &resolution,
+                                gpu::FrameBuffer *depth_fb)
+{
+  if (objects_.is_empty()) {
+    return;
+  }
+  std::lock_guard lock(this->mutex_);
+  const float4x4 viewport_persmat = view.persmat();
+  const float viewport_proj_scale_y = std::abs(view.winmat()[1][1]);
+
+  if (depth_fb != nullptr) {
+    GPU_framebuffer_bind(depth_fb);
+  }
+
+  for (auto item : objects_.items()) {
+    ObjectState &state = *item.value;
+    if (!state.used || state.data.clusters.empty()) {
+      continue;
+    }
+    const float4x4 object_persmat = viewport_persmat * state.object_mat;
+
+    float4x4 cam_persmat;
+    float cam_proj_scale_y = viewport_proj_scale_y;
+    bool has_cam_lod = false;
+    if (state.view_source != 0) {
+      if (tessera_camera_persmat(
+              inst_.scene, inst_.draw_ctx, resolution, cam_persmat, cam_proj_scale_y))
+      {
+        has_cam_lod = true;
+      }
+    }
+    const float4x4 lod_object_persmat = has_cam_lod ? (cam_persmat * state.object_mat) :
+                                                      object_persmat;
+    const float lod_proj_scale_y = has_cam_lod ? cam_proj_scale_y : viewport_proj_scale_y;
+
+    if (state.pass == nullptr) {
+      state.pass = std::make_unique<tessera::TesseraDrawPass>(
+          state.data, object_persmat, viewport_proj_scale_y, float(resolution.y));
+      if (!state.pass->init()) {
+        state.pass.reset();
+        continue;
+      }
+    }
+    /* EEVEE uses Reverse-Z depth testing. */
+    state.pass->setReverseZ(true);
+    state.pass->setPixelError(state.pixel_error);
+    state.pass->update(state.data,
+                       object_persmat,
+                       viewport_proj_scale_y,
+                       float(resolution.y),
+                       has_cam_lod ? &lod_object_persmat : nullptr,
+                       has_cam_lod ? &lod_proj_scale_y : nullptr);
+
+    if (state.pass->drawCount() != 0) {
+      state.pass->draw_prepass(resolution.x, resolution.y);
+    }
+  }
+}
+
+void TesseraModule::draw(const draw::View &view,
+                         const int2 &resolution,
+                         gpu::FrameBuffer *target_fb)
+{
+  if (objects_.is_empty()) {
+    return;
+  }
+  std::lock_guard lock(this->mutex_);
+  const float4x4 viewport_persmat = view.persmat();
+  const float viewport_proj_scale_y = std::abs(view.winmat()[1][1]);
+
+  if (target_fb != nullptr) {
+    GPU_framebuffer_bind(target_fb);
+  }
+
+  for (auto item : objects_.items()) {
+    ObjectState &state = *item.value;
+    if (!state.used || state.data.clusters.empty()) {
+      continue;
+    }
+    const float4x4 object_persmat = viewport_persmat * state.object_mat;
+
+    float4x4 cam_persmat;
+    float cam_proj_scale_y = viewport_proj_scale_y;
+    bool has_cam_lod = false;
+    if (state.view_source != 0) {
+      if (tessera_camera_persmat(
+              inst_.scene, inst_.draw_ctx, resolution, cam_persmat, cam_proj_scale_y))
+      {
+        has_cam_lod = true;
+      }
+    }
+    const float4x4 lod_object_persmat = has_cam_lod ? (cam_persmat * state.object_mat) :
+                                                      object_persmat;
+    const float lod_proj_scale_y = has_cam_lod ? cam_proj_scale_y : viewport_proj_scale_y;
+
+    if (state.pass == nullptr) {
+      state.pass = std::make_unique<tessera::TesseraDrawPass>(
+          state.data, object_persmat, viewport_proj_scale_y, float(resolution.y));
+      if (!state.pass->init()) {
+        state.pass.reset();
+        continue;
+      }
+    }
+    /* EEVEE uses Reverse-Z depth testing. */
+    state.pass->setReverseZ(true);
+    state.pass->setPixelError(state.pixel_error);
+    tessera::TesseraShadingMode mode = tessera::TESSERA_SHADING_DIFFUSE;
+    if (state.visualize_clusters == 1) {
+      mode = tessera::TESSERA_SHADING_CLUSTERS;
+    }
+    else if (state.visualize_clusters == 2) {
+      mode = tessera::TESSERA_SHADING_NORMALS;
+    }
+    else if (state.visualize_clusters == 3) {
+      mode = tessera::TESSERA_SHADING_TANGENTS;
+    }
+    else if (state.visualize_clusters == 4) {
+      mode = tessera::TESSERA_SHADING_UVS;
+    }
+    state.pass->setShadingMode(mode);
+    state.pass->update(state.data,
+                       object_persmat,
+                       viewport_proj_scale_y,
+                       float(resolution.y),
+                       has_cam_lod ? &lod_object_persmat : nullptr,
+                       has_cam_lod ? &lod_proj_scale_y : nullptr);
+
+    /* Diagnostic logging matching Workbench. */
+    const float3 cam_pos = view.location();
+    const float3 mesh_pos = state.object_mat.location();
+    const float dist = math::distance(cam_pos, mesh_pos);
+    std::map<uint32_t, uint32_t> level_counts;
+    state.pass->getLevelCounts(state.data,
+                               has_cam_lod ? lod_object_persmat : object_persmat,
+                               lod_proj_scale_y,
+                               float(resolution.y),
+                               level_counts);
+    std::string lod_str;
+    for (const auto &pair : level_counts) {
+      if (!lod_str.empty()) {
+        lod_str += ", ";
+      }
+      lod_str += "LOD" + std::to_string(pair.first) + ": " + std::to_string(pair.second);
+    }
+    printf("[EEVEE Tessera LOD] Cam: (%.2f, %.2f, %.2f) | Mesh: (%.2f, %.2f, %.2f) | Dist: %.2f | ProjScaleY: %.4f | PixelError: %.1f | %zu clusters (%s)\n",
+           cam_pos.x, cam_pos.y, cam_pos.z,
+           mesh_pos.x, mesh_pos.y, mesh_pos.z,
+           dist,
+           lod_proj_scale_y,
+           state.pass->getPixelError(),
+           state.pass->drawCount(),
+           lod_str.empty() ? "none" : lod_str.c_str());
+    fflush(stdout);
+
+    state.pass->set_material_textures(state.materials);
+    if (state.pass->drawCount() != 0) {
+      state.pass->draw(resolution.x, resolution.y);
+    }
+  }
+}
+
+}  // namespace blender::eevee

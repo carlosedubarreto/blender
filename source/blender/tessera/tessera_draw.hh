@@ -71,6 +71,11 @@ public:
 
     void setShadingMode(TesseraShadingMode mode);
 
+    void set_material_textures(const std::vector<TesseraMaterialTextures> &materials)
+    {
+        renderer_.set_material_textures(materials);
+    }
+
     /**
      * Screen-space error threshold in pixels for LOD selection.
      * Higher values select coarser clusters (faster, less detail).
@@ -85,6 +90,16 @@ public:
         return renderer_.getPixelError();
     }
 
+    void setReverseZ(bool enabled)
+    {
+        renderer_.setReverseZ(enabled);
+    }
+
+    bool getReverseZ() const
+    {
+        return renderer_.getReverseZ();
+    }
+
     void getLevelCounts(const TesseraData &data,
                         const float4x4 &lodViewProj,
                         float projScaleY,
@@ -95,8 +110,13 @@ public:
     }
 
     void draw(int viewportWidth, int viewportHeight) const;
+    void draw_prepass(int viewportWidth, int viewportHeight) const;
 
-    size_t drawCount() const;
+    size_t drawCount(uint32_t material_index = 0) const;
+    size_t totalDrawCount() const;
+    size_t materialCommandOffset(uint32_t material_index) const;
+    const std::vector<uint32_t> &materialDrawCounts() const;
+    uint32_t maxCommandsPerMaterial() const;
 
     /** Enable streaming from a paged .nc2 file. */
     bool openStreaming(const std::string &paged_path, const TesseraData &full);

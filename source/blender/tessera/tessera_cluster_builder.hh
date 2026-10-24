@@ -44,10 +44,12 @@ struct BuildVertex {
     float3 position;
     float3 normal;
     float2 uv;
+    float4 tangent = float4(1.0f, 0.0f, 0.0f, 1.0f);
 };
 
 struct BuildTriangle {
     uint32_t v[3];
+    uint32_t material_index = 0;
 };
 
 /** One node of the cluster DAG. */
@@ -67,6 +69,8 @@ struct BuildCluster {
     float parentError = std::numeric_limits<float>::max();
     /** 0 = finest level. */
     uint32_t level = 0;
+    /** Material slot index this cluster strictly belongs to. */
+    uint32_t material_index = 0;
 };
 
 struct BuildResult {
@@ -83,13 +87,16 @@ struct BuildResult {
 /**
  * Build the cluster DAG from a triangle soup.
  *
- * \param verts      input vertices (referenced by \a tri_verts)
- * \param tri_verts  flat triangle vertex index list into \a verts
- * \param params     builder configuration
+ * \param verts          input vertices (referenced by \a tri_verts)
+ * \param tri_verts      flat triangle vertex index list into \a verts
+ * \param params         builder configuration
+ * \param tri_materials  optional per-triangle material index array
  */
 BuildResult buildClusterDAG(const std::vector<BuildVertex> &verts,
                             const std::vector<uint32_t> &tri_verts,
-                            const BuilderParams &params);
+                            const BuilderParams &params,
+                            const std::vector<uint32_t> &tri_materials = {},
+                            TesseraProgressCallback progress_cb = nullptr);
 
 }  // namespace detail
 }  // namespace tessera

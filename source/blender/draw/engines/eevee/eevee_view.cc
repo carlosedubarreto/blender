@@ -144,6 +144,8 @@ void ShadingView::render()
 
   inst_.volume.draw_prepass(main_view_);
 
+  inst_.tessera.draw_prepass(render_view_, extent_, prepass_fb_);
+
   inst_.pipelines.deferred.render(main_view_,
                                   render_view_,
                                   prepass_fb_,
@@ -152,6 +154,8 @@ void ShadingView::render()
                                   extent_,
                                   rt_buffer_opaque_,
                                   rt_buffer_refract_);
+
+  inst_.tessera.draw(render_view_, extent_, combined_fb_);
 
   inst_.pipelines.background.render(render_view_, combined_fb_);
 

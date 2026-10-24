@@ -1,4 +1,4 @@
-﻿/* SPDX-FileCopyrightText: 2006 Blender Authors
+/* SPDX-FileCopyrightText: 2006 Blender Authors
  *
  * SPDX-License-Identifier: GPL-2.0-or-later
  */
@@ -54,11 +54,119 @@
 
 #include "object_intern.hh"
 
+#include "DEG_depsgraph.hh"
+
 namespace blender::ed::object {
 
 /* -------------------------------------------------------------------- */
 /** \name Tessera Build Operator
  * \{ */
+
+struct TesseraBuildJob {
+  Object *ob = nullptr;
+  Mesh *mesh = nullptr;
+  char filepath[FILE_MAX] = "";
+  char stored_path[FILE_MAX] = "";
+  tessera::TesseraData data;
+  std::vector<uint8_t> blob;
+  bool success = false;
+  bool is_nonblocking_job = false;
+  ReportList *reports = nullptr;
+  wmJobWorkerStatus *worker_status = nullptr;
+};
+
+static void tessera_build_start_job(void *customdata, wmJobWorkerStatus *worker_status)
+{
+  TesseraBuildJob *job = static_cast<TesseraBuildJob *>(customdata);
+  job->worker_status = worker_status;
+
+  auto progress_cb = [worker_status](float progress, const char * /*step_name*/) {
+    if (worker_status) {
+      worker_status->progress = progress;
+      worker_status->do_update = true;
+    }
+  };
+
+  if (!tessera::buildFromMesh(*job->mesh, job->data, progress_cb)) {
+    if (worker_status && worker_status->reports) {
+      BKE_report(worker_status->reports, RPT_ERROR, "Tessera: failed to build cluster DAG from mesh");
+    }
+    return;
+  }
+
+  if (worker_status) {
+    worker_status->progress = 0.95f;
+    worker_status->do_update = true;
+  }
+
+  if (!tessera::serializeToMemory(job->data, job->blob)) {
+    if (worker_status && worker_status->reports) {
+      BKE_report(worker_status->reports, RPT_ERROR, "Tessera: failed to serialize cluster data");
+    }
+    return;
+  }
+
+  FILE *file = BLI_fopen(job->filepath, "wb");
+  if (file == nullptr) {
+    if (worker_status && worker_status->reports) {
+      BKE_reportf(
+          worker_status->reports, RPT_ERROR, "Tessera: could not open '%s' for writing", job->filepath);
+    }
+    return;
+  }
+  const size_t written = fwrite(job->blob.data(), 1, job->blob.size(), file);
+  fclose(file);
+  if (written != job->blob.size()) {
+    if (worker_status && worker_status->reports) {
+      BKE_reportf(worker_status->reports, RPT_ERROR, "Tessera: short write to '%s'", job->filepath);
+    }
+    return;
+  }
+
+  job->success = true;
+  if (worker_status) {
+    worker_status->progress = 1.0f;
+    worker_status->do_update = true;
+  }
+}
+
+static void tessera_build_end_job(void *customdata)
+{
+  TesseraBuildJob *job = static_cast<TesseraBuildJob *>(customdata);
+  if (!job->success || job->ob == nullptr) {
+    return;
+  }
+
+  /* Record the .nc2 path on the object so the draw engine can find the
+   * Tessera data without Python involvement (blend-relative when saved). */
+  if (IDProperty *idgroup = IDP_EnsureProperties(&job->ob->id)) {
+    if (IDProperty *prev = IDP_GetPropertyFromGroup(idgroup, "tessera_nc2")) {
+      IDP_FreeFromGroup(idgroup, prev);
+    }
+    IDP_AddToGroup(idgroup, bke::idprop::create("tessera_nc2", job->stored_path).release());
+  }
+
+  /* Tag depsgraph and notify 3D Viewport to auto-refresh immediately. */
+  DEG_id_tag_update(&job->ob->id, ID_RECALC_GEOMETRY | ID_RECALC_SHADING);
+  WM_main_add_notifier(NC_OBJECT | ND_DRAW, job->ob);
+  WM_main_add_notifier(NC_SPACE | ND_SPACE_VIEW3D, nullptr);
+
+  if (job->reports) {
+    BKE_reportf(job->reports,
+                RPT_INFO,
+                "Tessera: built %u clusters, %u levels (%zu bytes) -> %s",
+                uint(job->data.clusters.size()),
+                job->data.header.levelCount,
+                job->blob.size(),
+                job->filepath);
+  }
+}
+
+static void tessera_build_free_job(void *customdata)
+{
+  TesseraBuildJob *job = static_cast<TesseraBuildJob *>(customdata);
+  delete job;
+}
 
 static bool object_tessera_build_poll(bContext *C)
 {
@@ -66,80 +174,74 @@ static bool object_tessera_build_poll(bContext *C)
   return ob != nullptr && ob->type == OB_MESH && ob->data != nullptr;
 }
 
-static wmOperatorStatus object_tessera_build_exec(bContext *C, wmOperator *op)
+static wmOperatorStatus object_tessera_build_custom(bContext *C, wmOperator *op, bool is_invoke)
 {
   Object *ob = CTX_data_active_object(C);
   Mesh *mesh = id_cast<Mesh *>(ob->data);
 
-  tessera::TesseraData data;
-  if (!tessera::buildFromMesh(*mesh, data)) {
-    BKE_report(op->reports, RPT_ERROR, "Tessera: failed to build cluster DAG from mesh");
-    return OPERATOR_CANCELLED;
-  }
+  auto *job = new TesseraBuildJob();
+  job->ob = ob;
+  job->mesh = mesh;
+  job->reports = op->reports;
 
-  char filepath[FILE_MAX];
-  RNA_string_get(op->ptr, "filepath", filepath);
-  if (filepath[0] == '\0') {
+  RNA_string_get(op->ptr, "filepath", job->filepath);
+  if (job->filepath[0] == '\0') {
     const char *blend_path = BKE_main_blendfile_path_from_global();
     if (blend_path[0] != '\0') {
-      /* Saved .blend: use a blend-relative path. */
-      BLI_snprintf(filepath, sizeof(filepath), "//%s.nc2", mesh->id.name + 2);
-      BLI_path_abs(filepath, blend_path);
+      BLI_snprintf(job->filepath, sizeof(job->filepath), "//%s.nc2", mesh->id.name + 2);
+      BLI_path_abs(job->filepath, blend_path);
     }
     else {
-      /* Unsaved .blend: "//" cannot be resolved, so anchor the file to the
-       * current working directory to keep the recorded path valid. */
       char cwd[FILE_MAX];
       BLI_current_working_dir(cwd, sizeof(cwd));
       char nc2_name[FILE_MAX];
       BLI_snprintf(nc2_name, sizeof(nc2_name), "%s.nc2", mesh->id.name + 2);
-      BLI_path_join(filepath, sizeof(filepath), cwd, nc2_name);
+      BLI_path_join(job->filepath, sizeof(job->filepath), cwd, nc2_name);
     }
   }
 
-  std::vector<uint8_t> blob;
-  if (!tessera::serializeToMemory(data, blob)) {
-    BKE_report(op->reports, RPT_ERROR, "Tessera: failed to serialize cluster data");
-    return OPERATOR_CANCELLED;
+  BLI_strncpy(job->stored_path, job->filepath, sizeof(job->stored_path));
+  const char *blend_path = BKE_main_blendfile_path_from_global();
+  if (blend_path[0] != '\0') {
+    BLI_path_rel(job->stored_path, blend_path);
   }
 
-  FILE *file = BLI_fopen(filepath, "wb");
-  if (file == nullptr) {
-    BKE_reportf(
-        op->reports, RPT_ERROR, "Tessera: could not open '%s' for writing", filepath);
-    return OPERATOR_CANCELLED;
-  }
-  const size_t written = fwrite(blob.data(), 1, blob.size(), file);
-  fclose(file);
-  if (written != blob.size()) {
-    BKE_reportf(op->reports, RPT_ERROR, "Tessera: short write to '%s'", filepath);
-    return OPERATOR_CANCELLED;
-  }
+  if (is_invoke) {
+    job->is_nonblocking_job = true;
+    wmJob *wm_job = WM_jobs_get(CTX_wm_manager(C),
+                                CTX_wm_window(C),
+                                CTX_data_scene(C),
+                                "Building Tessera Clusters...",
+                                WM_JOB_PROGRESS,
+                                WM_JOB_TYPE_OBJECT_BAKE);
 
-  /* Record the .nc2 path on the object so the draw engine can find the
-   * Tessera data without Python involvement (blend-relative when the file
-   * has been saved). */
-  if (IDProperty *idgroup = IDP_EnsureProperties(&ob->id)) {
-    char stored_path[FILE_MAX];
-    BLI_strncpy(stored_path, filepath, sizeof(stored_path));
-    const char *blend_path = BKE_main_blendfile_path_from_global();
-    if (blend_path[0] != '\0') {
-      BLI_path_rel(stored_path, blend_path);
-    }
-    if (IDProperty *prev = IDP_GetPropertyFromGroup(idgroup, "tessera_nc2")) {
-      IDP_FreeFromGroup(idgroup, prev);
-    }
-    IDP_AddToGroup(idgroup, bke::idprop::create("tessera_nc2", stored_path).release());
-  }
+    WM_jobs_customdata_set(wm_job, job, tessera_build_free_job);
+    WM_jobs_timer(wm_job, 0.1, NC_OBJECT | ND_DRAW, NC_OBJECT | ND_DRAW);
+    WM_jobs_callbacks(wm_job, tessera_build_start_job, nullptr, nullptr, tessera_build_end_job);
 
-  BKE_reportf(op->reports,
-              RPT_INFO,
-              "Tessera: built %u clusters, %u levels (%zu bytes) -> %s",
-              uint(data.clusters.size()),
-              data.header.levelCount,
-              blob.size(),
-              filepath);
-  return OPERATOR_FINISHED;
+    WM_jobs_start(CTX_wm_manager(C), wm_job);
+    return OPERATOR_RUNNING_MODAL;
+  }
+  else {
+    job->is_nonblocking_job = false;
+    wmJobWorkerStatus worker_status = {};
+    worker_status.reports = op->reports;
+    tessera_build_start_job(job, &worker_status);
+    tessera_build_end_job(job);
+    const bool success = job->success;
+    tessera_build_free_job(job);
+    return success ? OPERATOR_FINISHED : OPERATOR_CANCELLED;
+  }
+}
+
+static wmOperatorStatus object_tessera_build_exec(bContext *C, wmOperator *op)
+{
+  return object_tessera_build_custom(C, op, false);
+}
+
+static wmOperatorStatus object_tessera_build_invoke(bContext *C, wmOperator *op, const wmEvent * /*event*/)
+{
+  return object_tessera_build_custom(C, op, true);
 }
 
 void OBJECT_OT_tessera_build(wmOperatorType *ot)
@@ -149,6 +251,7 @@ void OBJECT_OT_tessera_build(wmOperatorType *ot)
   ot->description = "Build the Tessera cluster DAG (QEM simplification) and save "
                     "it to a .nc2 file";
 
+  ot->invoke = object_tessera_build_invoke;
   ot->exec = object_tessera_build_exec;
   ot->poll = object_tessera_build_poll;
 

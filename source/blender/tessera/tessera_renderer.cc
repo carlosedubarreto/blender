@@ -105,11 +105,16 @@ void TesseraRenderer::terminate()
         GPU_storagebuf_free(mCounterBuf);
         mCounterBuf = nullptr;
     }
+    if (mMaterialsBuf != nullptr) {
+        GPU_storagebuf_free(mMaterialsBuf);
+        mMaterialsBuf = nullptr;
+    }
     mVisibilityPass.terminate();
     mVisibilityInitialized = false;
     mGpuClusters = TesseraGpuClusterData();
     mPendingCommands.clear();
     mCpuCommandStream.clear();
+    mMaterialDrawCounts.clear();
     mDrawCount = 0;
     mGpuTraversalActive = false;
     mGpuPathFailed = false;
@@ -133,6 +138,7 @@ void TesseraRenderer::update(const TesseraData &data,
 {
     if (data.clusters.empty() || mDrawBuffer == nullptr) {
         mPendingCommands.clear();
+        mMaterialDrawCounts.clear();
         mDrawCount = 0;
         return;
     }
@@ -190,6 +196,17 @@ void TesseraRenderer::updateWithGpuTraversal(const TesseraData &data,
 {
     const size_t clusterCount = data.clusters.size();
 
+    uint32_t max_materials = 1;
+    for (const TesseraCluster &c : data.clusters) {
+        max_materials = std::max(max_materials, uint32_t(c.materialIndex + 1));
+    }
+    if (max_materials > kMaxMaterials) {
+        max_materials = uint32_t(kMaxMaterials);
+    }
+    mMaxMaterials = max_materials;
+    mMaxCommandsPerMaterial = uint32_t(kDrawCommandCapacity / max_materials);
+    mMaterialDrawCounts.assign(max_materials, 0);
+
     /* Upload cluster data only when the mesh changed. */
     size_t indexCount = 0;
     float maxParentError = -1.0f;
@@ -212,7 +229,9 @@ void TesseraRenderer::updateWithGpuTraversal(const TesseraData &data,
                               "tessera_cluster_errors") ||
             !ensureStorageBuf(&mMetaBuf, clusterCount * 4 * sizeof(uint32_t),
                               "tessera_cluster_meta") ||
-            !ensureStorageBuf(&mCounterBuf, sizeof(uint32_t), "tessera_draw_counter"))
+            !ensureStorageBuf(&mMaterialsBuf, clusterCount * sizeof(uint32_t),
+                              "tessera_cluster_materials") ||
+            !ensureStorageBuf(&mCounterBuf, kMaxMaterials * sizeof(uint32_t), "tessera_draw_counter"))
         {
             mGpuPathFailed = true;
             return updateWithCpuTraversal(data, viewProj, projScaleY, viewportHeight);
@@ -221,6 +240,7 @@ void TesseraRenderer::updateWithGpuTraversal(const TesseraData &data,
         GPU_storagebuf_update(mParentSphereBuf, mGpuClusters.parent_spheres.data());
         GPU_storagebuf_update(mErrorsBuf, mGpuClusters.errors.data());
         GPU_storagebuf_update(mMetaBuf, mGpuClusters.meta.data());
+        GPU_storagebuf_update(mMaterialsBuf, mGpuClusters.materials.data());
         mUploadedClusterCount = clusterCount;
         mUploadedIndexCount = indexCount;
         mUploadedMaxParentError = maxParentError;
@@ -239,6 +259,7 @@ void TesseraRenderer::updateWithGpuTraversal(const TesseraData &data,
     GPU_storagebuf_bind(mMetaBuf, 3);
     GPU_storagebuf_bind(mDrawBuffer, 4);
     GPU_storagebuf_bind(mCounterBuf, 5);
+    GPU_storagebuf_bind(mMaterialsBuf, 6);
 
     GPU_shader_uniform_3f(mTraverseShader, "camera_pos", view.camPos.x,
                           view.camPos.y, view.camPos.z);
@@ -249,6 +270,8 @@ void TesseraRenderer::updateWithGpuTraversal(const TesseraData &data,
     GPU_shader_uniform_1i(mTraverseShader, "max_clusters", 0);
     GPU_shader_uniform_1i(mTraverseShader, "max_commands",
                           int(kDrawCommandCapacity));
+    GPU_shader_uniform_1i(mTraverseShader, "max_materials", int(max_materials));
+    GPU_shader_uniform_1i(mTraverseShader, "max_commands_per_material", int(mMaxCommandsPerMaterial));
     GPU_shader_uniform_4fv_array(mTraverseShader, "frustum_planes", 6,
                                  view.planes);
 
@@ -256,11 +279,16 @@ void TesseraRenderer::updateWithGpuTraversal(const TesseraData &data,
     const uint32_t groups = uint32_t((clusterCount + group_size - 1) / group_size);
     GPU_compute_dispatch(mTraverseShader, groups, 1, 1);
 
-    /* Read back the number of emitted commands (small, synchronized with the
-     * dispatch). This is the only per-frame CPU<->GPU sync left. */
-    uint32_t emitted = 0;
-    GPU_storagebuf_read(mCounterBuf, &emitted);
-    mDrawCount = size_t(emitted);
+    /* Read back the emitted command counters per material. */
+    std::vector<uint32_t> emitted(max_materials, 0);
+    GPU_storagebuf_read(mCounterBuf, emitted.data());
+    mMaterialDrawCounts = std::move(emitted);
+
+    size_t total = 0;
+    for (uint32_t c : mMaterialDrawCounts) {
+        total += c;
+    }
+    mDrawCount = total;
     mGpuTraversalActive = true;
 }
 
@@ -269,26 +297,82 @@ void TesseraRenderer::updateWithCpuTraversal(const TesseraData &data,
                                             float projScaleY,
                                             float viewportHeight)
 {
-    TesseraLodParams params;
-    params.pixelError = mPixelError;
-    const size_t count = selectClustersFlat(
-        data, viewProj, projScaleY, viewportHeight, params, mPendingCommands);
-    mDrawCount = count;
+    uint32_t max_materials = 1;
+    for (const TesseraCluster &c : data.clusters) {
+        max_materials = std::max(max_materials, uint32_t(c.materialIndex + 1));
+    }
+    if (max_materials > kMaxMaterials) {
+        max_materials = uint32_t(kMaxMaterials);
+    }
+    mMaxMaterials = max_materials;
+    mMaxCommandsPerMaterial = uint32_t(kDrawCommandCapacity / max_materials);
+    mMaterialDrawCounts.assign(max_materials, 0);
+
+    const TesseraViewInfo view = getViewInfo(viewProj, viewportHeight, projScaleY);
+    std::vector<TesseraCluster> selected;
+
+    for (uint32_t ci = 0; ci < uint32_t(data.clusters.size()); ++ci) {
+        const TesseraCluster &cluster = data.clusters[ci];
+        if (cluster.indexCount == 0) {
+            continue;
+        }
+        const float3 center(cluster.sphere[0], cluster.sphere[1], cluster.sphere[2]);
+        const float radius = cluster.sphere[3];
+        if (!sphere_in_frustum(view.planes, center, radius)) {
+            continue;
+        }
+
+        const float err_c = (cluster.error <= 0.0f)
+            ? 0.0f
+            : projectedErrorPx(center, radius, cluster.error,
+                               view.camPos, viewportHeight, view.projScaleY,
+                               view.orthographic);
+
+        const float3 pcenter(cluster.parentSphere[0], cluster.parentSphere[1], cluster.parentSphere[2]);
+        const float pradius = cluster.parentSphere[3];
+        const float err_p = (cluster.parentError >= 1e38f)
+            ? std::numeric_limits<float>::max()
+            : projectedErrorPx(pcenter, pradius, cluster.parentError,
+                               view.camPos, viewportHeight, view.projScaleY,
+                               view.orthographic);
+
+        if (err_c <= mPixelError && err_p > mPixelError) {
+            uint32_t mat = (max_materials > 1) ? cluster.materialIndex : 0;
+            if (mat >= max_materials) {
+                mat = 0;
+            }
+            if (mMaterialDrawCounts[mat] < mMaxCommandsPerMaterial) {
+                mMaterialDrawCounts[mat]++;
+                selected.push_back(cluster);
+            }
+        }
+    }
+
+    size_t total = 0;
+    for (uint32_t c : mMaterialDrawCounts) {
+        total += c;
+    }
+    mDrawCount = total;
     mGpuTraversalActive = false;
 
-    if (count == 0) {
+    if (total == 0) {
         return;
     }
 
-    /* Convert to DrawArraysIndirectCommand stream (16 bytes per command):
-     * the visibility pass uses vertex pulling, so `first` is the cluster's
-     * absolute index-buffer position. */
-    mCpuCommandStream.resize(count * 4);
-    for (size_t i = 0; i < count; ++i) {
-        mCpuCommandStream[i * 4 + 0] = mPendingCommands[i].indexCount;
-        mCpuCommandStream[i * 4 + 1] = 1;
-        mCpuCommandStream[i * 4 + 2] = mPendingCommands[i].firstIndex;
-        mCpuCommandStream[i * 4 + 3] = 0;
+    /* Convert to DrawArraysIndirectCommand stream partitioned per material slot. */
+    mCpuCommandStream.assign(kDrawCommandCapacity * 4, 0);
+    std::vector<uint32_t> slot_offset(max_materials, 0);
+    for (const TesseraCluster &cluster : selected) {
+        uint32_t mat = (max_materials > 1) ? cluster.materialIndex : 0;
+        if (mat >= max_materials) {
+            mat = 0;
+        }
+        uint32_t slot = slot_offset[mat]++;
+        uint32_t base = (mat * mMaxCommandsPerMaterial + slot) * 4;
+        mCpuCommandStream[base + 0] = cluster.indexCount;
+        mCpuCommandStream[base + 1] = 1;
+        mCpuCommandStream[base + 2] = cluster.firstIndex;
+        mCpuCommandStream[base + 3] = 0;
     }
     GPU_storagebuf_update(mDrawBuffer, mCpuCommandStream.data());
 }
@@ -315,7 +399,34 @@ void TesseraRenderer::draw(int viewportWidth, int viewportHeight)
                            view.camPos,
                            viewportWidth,
                            viewportHeight,
-                           int(mShadingMode));
+                           int(mShadingMode),
+                           float4x4::identity(),
+                           mReverseZ,
+                           &mMaterialDrawCounts,
+                           mMaxCommandsPerMaterial);
+}
+
+void TesseraRenderer::draw_prepass(int viewportWidth, int viewportHeight)
+{
+    if (mDrawBuffer == nullptr || mDrawCount == 0) {
+        return;
+    }
+    if (!mVisibilityInitialized) {
+        if (!mVisibilityPass.init()) {
+            return;
+        }
+        mVisibilityInitialized = true;
+    }
+    GPU_storagebuf_sync_as_indirect_buffer(mDrawBuffer);
+    mVisibilityPass.set_data(mLastData == nullptr ? TesseraData() : *mLastData);
+    mVisibilityPass.render_depth_prepass(mDrawBuffer,
+                                         mDrawCount,
+                                         mLastViewProj,
+                                         viewportWidth,
+                                         viewportHeight,
+                                         mReverseZ,
+                                         &mMaterialDrawCounts,
+                                         mMaxCommandsPerMaterial);
 }
 
 void TesseraRenderer::getLevelCounts(const TesseraData &data,

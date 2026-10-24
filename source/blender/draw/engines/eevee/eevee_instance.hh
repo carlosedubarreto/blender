@@ -50,6 +50,7 @@
 #include "eevee_shadow.hh"
 #include "eevee_subsurface.hh"
 #include "eevee_sync.hh"
+#include "eevee_tessera.hh"
 #include "eevee_view.hh"
 #include "eevee_volume.hh"
 #include "eevee_world.hh"
@@ -133,6 +134,7 @@ class Instance : public DrawEngine {
   VolumeProbeModule volume_probes;
   LightProbeModule light_probes;
   VolumeModule volume;
+  TesseraModule tessera;
 
   static CLG_LogRef log;
 
@@ -216,7 +218,8 @@ class Instance : public DrawEngine {
         planar_probes(*this),
         volume_probes(*this),
         light_probes(*this),
-        volume(*this, uniform_data.data.volumes) {};
+        volume(*this, uniform_data.data.volumes),
+        tessera(*this) {};
   ~Instance() override {};
 
   StringRefNull name_get() final

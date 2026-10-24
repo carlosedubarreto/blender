@@ -78,6 +78,7 @@ class Instance : public DrawEngine {
   struct TesseraObjectState {
     std::string nc2_path;
     int64_t file_mtime = 0;
+    int64_t file_size = -1;
     float4x4 object_mat = float4x4::identity();
     bool visualize_clusters = false;
     bool tessera_enabled = true;
@@ -234,9 +235,9 @@ class Instance : public DrawEngine {
     BLI_path_abs(abs_path, BKE_main_blendfile_path_from_global());
 
     BLI_stat_t file_info;
-    const int64_t file_mtime = (BLI_stat(abs_path, &file_info) == 0) ?
-                                   int64_t(file_info.st_mtime) :
-                                   int64_t(-1);
+    const bool stat_ok = (BLI_stat(abs_path, &file_info) == 0);
+    const int64_t file_mtime = stat_ok ? int64_t(file_info.st_mtime) : int64_t(-1);
+    const int64_t file_size = stat_ok ? int64_t(file_info.st_size) : int64_t(-1);
 
     std::lock_guard lock(this->tessera_mutex_);
     std::unique_ptr<TesseraObjectState> &entry = tessera_objects_.lookup_or_add_default(
@@ -252,10 +253,10 @@ class Instance : public DrawEngine {
     state.view_source = tessera_view_source_get(ob);
     state.object_mat = ob->object_to_world();
 
-    /* (Re)load the cluster data when the file path or content changed. The
-     * pass itself is only created in the draw phase (it needs an active GPU
-     * context, which is not guaranteed during the sync phase). */
-    const bool stale = (state.nc2_path != abs_path) || (state.file_mtime != file_mtime);
+    /* (Re)load the cluster data when the file path, mtime, or size changed. */
+    const bool stale = (state.nc2_path != abs_path) ||
+                       (state.file_mtime != file_mtime) ||
+                       (state.file_size != file_size);
     if (state.pass == nullptr || stale) {
       if (stale || state.data.clusters.empty()) {
         size_t data_size = 0;
@@ -271,6 +272,7 @@ class Instance : public DrawEngine {
           MEM_delete_void(file_data);
         }
         state.file_mtime = file_mtime;
+        state.file_size = file_size;
         state.nc2_path = abs_path;
         /* Drop the pass so it is rebuilt with the new data on draw. */
         state.pass.reset();

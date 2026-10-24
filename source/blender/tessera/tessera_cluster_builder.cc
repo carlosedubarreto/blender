@@ -492,6 +492,9 @@ std::vector<std::vector<uint32_t>> groupClusters(const BuildResult &R,
                 break;
             }
             for (const uint32_t nb : adjacency[cur]) {
+                if (R.clusters[nb].material_index != R.clusters[cur].material_index) {
+                    continue;
+                }
                 if (!seen.count(nb) && !grouped.count(nb)) {
                     seen.insert(nb);
                     queue.push_back(nb);
@@ -508,56 +511,89 @@ std::vector<std::vector<uint32_t>> groupClusters(const BuildResult &R,
 
 BuildResult buildClusterDAG(const std::vector<BuildVertex> &verts,
                             const std::vector<uint32_t> &tri_verts,
-                            const BuilderParams &params)
+                            const BuilderParams &params,
+                            const std::vector<uint32_t> &tri_materials,
+                            TesseraProgressCallback progress_cb)
 {
     BuildResult R;
     R.verts = verts;
     R.tris.reserve(tri_verts.size() / 3);
     for (size_t i = 0; i + 2 < tri_verts.size(); i += 3) {
-        R.tris.push_back({{tri_verts[i], tri_verts[i + 1], tri_verts[i + 2]}});
+        const size_t tri_idx = i / 3;
+        const uint32_t mat_id = (tri_idx < tri_materials.size()) ? tri_materials[tri_idx] : 0u;
+        R.tris.push_back({{tri_verts[i], tri_verts[i + 1], tri_verts[i + 2]}, mat_id});
     }
     if (R.tris.empty()) {
         return R;
     }
 
-    /* Level 0: partition the input mesh into fine clusters. */
-    const std::vector<BuildTriangle> tri_array = R.tris;
-    std::vector<uint32_t> all_tris(tri_array.size());
-    for (uint32_t i = 0; i < uint32_t(tri_array.size()); ++i) {
-        all_tris[i] = i;
+    if (progress_cb) {
+        progress_cb(0.05f, "Partitioning Level 0 clusters...");
     }
+
+    /* Level 0: partition the input mesh into fine clusters partitioned per material. */
+    const std::vector<BuildTriangle> tri_array = R.tris;
     std::vector<float3> positions;
     extract_positions(R.verts, positions);
-    const std::vector<std::vector<uint32_t>> level0 = partitionTriangles(
-        tri_array, all_tris, positions, params.maxClusterTris);
+
+    std::unordered_map<uint32_t, std::vector<uint32_t>> mat_tris;
+    for (uint32_t i = 0; i < uint32_t(tri_array.size()); ++i) {
+        mat_tris[tri_array[i].material_index].push_back(i);
+    }
 
     std::vector<uint32_t> frontier;
-    frontier.reserve(level0.size());
     LocalMesh input_local;
     input_local.verts = R.verts;
     input_local.tris = tri_verts;
-    for (const auto &part : level0) {
-        if (part.empty()) {
-            continue;
+
+    size_t mat_count = mat_tris.size();
+    size_t mat_processed = 0;
+    for (const auto &pair : mat_tris) {
+        const uint32_t mat_id = pair.first;
+        const auto &subset = pair.second;
+        const std::vector<std::vector<uint32_t>> level0_for_mat = partitionTriangles(
+            tri_array, subset, positions, params.maxClusterTris);
+
+        for (const auto &part : level0_for_mat) {
+            if (part.empty()) {
+                continue;
+            }
+            /* Level 0 clusters reference the input vertices directly (error 0). */
+            const uint32_t id = makeCluster(
+                R, input_local, part, 0.0f,
+                std::numeric_limits<float>::max(), 0, /*copy_verts=*/false);
+            R.clusters[id].material_index = mat_id;
+            frontier.push_back(id);
         }
-        /* Level 0 clusters reference the input vertices directly (error 0). */
-        const uint32_t id = makeCluster(
-            R, input_local, part, 0.0f,
-            std::numeric_limits<float>::max(), 0, /*copy_verts=*/false);
-        frontier.push_back(id);
+        mat_processed++;
+        if (progress_cb) {
+            float p = 0.05f + 0.25f * (float(mat_processed) / float(mat_count));
+            progress_cb(p, "Partitioning Level 0 clusters...");
+        }
     }
     R.levelCount = 1;
     if (frontier.size() <= 1) {
+        if (progress_cb) {
+            progress_cb(0.85f, "Level 0 complete (single cluster).");
+        }
         return R;  /* small mesh: single root cluster */
     }
 
     /* Hierarchy: merge adjacent clusters, simplify with QEM, re-cluster. */
     for (uint32_t level = 1; level < params.maxLevels; ++level) {
+        if (progress_cb) {
+            float p = 0.30f + 0.55f * std::min(1.0f, float(level) / 8.0f);
+            progress_cb(p, "Simplifying LOD clusters (QEM)...");
+        }
         const auto groups = groupClusters(R, frontier, params.mergeGroupSize);
         std::vector<uint32_t> next_frontier;
         next_frontier.reserve(groups.size());
 
         for (const auto &mg : groups) {
+            if (mg.empty()) {
+                continue;
+            }
+            const uint32_t group_mat = R.clusters[mg.front()].material_index;
             LocalMesh merged;
             mergedLocalFromClusters(R, mg, merged);
             const uint32_t merged_tris = uint32_t(merged.tris.size() / 3);
@@ -584,6 +620,11 @@ BuildResult buildClusterDAG(const std::vector<BuildVertex> &verts,
             coarse.verts.resize(simplified.positions.size());
             for (size_t i = 0; i < simplified.positions.size(); ++i) {
                 coarse.verts[i].position = simplified.positions[i];
+                if (i < merged.verts.size()) {
+                    coarse.verts[i].normal = merged.verts[i].normal;
+                    coarse.verts[i].uv = merged.verts[i].uv;
+                    coarse.verts[i].tangent = merged.verts[i].tangent;
+                }
             }
 
             /* Re-cluster the simplified patch into parent clusters. */
@@ -616,6 +657,10 @@ BuildResult buildClusterDAG(const std::vector<BuildVertex> &verts,
                     R, coarse, part, accumulated_error,
                     std::numeric_limits<float>::max(), level,
                     /*copy_verts=*/true);
+                R.clusters[pid].material_index = group_mat;
+                for (const uint32_t t : R.clusters[pid].tris) {
+                    R.tris[t].material_index = group_mat;
+                }
                 parents.push_back(pid);
                 next_frontier.push_back(pid);
             }

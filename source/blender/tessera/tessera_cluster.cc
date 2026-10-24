@@ -57,15 +57,33 @@ void computeTriangleSphere(const float3 &a, const float3 &b, const float3 &c,
 
 }  // namespace detail
 
-bool buildFromMesh(const Mesh &mesh, TesseraData &out)
+bool buildFromMesh(const Mesh &mesh, TesseraData &out, TesseraProgressCallback progress_cb)
 {
     const Span<float3> vert_positions = mesh.vert_positions();
     const Span<int> corner_verts = mesh.corner_verts();
     const OffsetIndices<int> faces = mesh.faces();
     const Span<float3> vert_normals = mesh.vert_normals();
-    const bke::AttributeReader<float2> uvs_reader = mesh.attributes().lookup<float2>(
-        "uv_map", bke::AttrDomain::Corner);
+
+    /* Look up active UV layer: try active_uv_map_name(), then "UVMap", "uv_map", or any available UV map. */
+    bke::AttributeReader<float2> uvs_reader;
+    std::string uv_name = mesh.active_uv_map_name();
+    if (!uv_name.empty()) {
+        uvs_reader = mesh.attributes().lookup<float2>(uv_name, bke::AttrDomain::Corner);
+    }
+    if (!uvs_reader) {
+        uvs_reader = mesh.attributes().lookup<float2>("UVMap", bke::AttrDomain::Corner);
+    }
+    if (!uvs_reader) {
+        uvs_reader = mesh.attributes().lookup<float2>("uv_map", bke::AttrDomain::Corner);
+    }
+    if (!uvs_reader && !mesh.uv_map_names().is_empty()) {
+        uvs_reader = mesh.attributes().lookup<float2>(mesh.uv_map_names()[0], bke::AttrDomain::Corner);
+    }
     const bool has_uvs = bool(uvs_reader);
+
+    const bke::AttributeReader<int> mat_reader = mesh.attributes().lookup<int>(
+        "material_index", bke::AttrDomain::Face);
+    const bool has_mat = bool(mat_reader);
 
     const int verts_num = vert_positions.size();
     const int faces_num = faces.size();
@@ -73,23 +91,45 @@ bool buildFromMesh(const Mesh &mesh, TesseraData &out)
         return false;
     }
 
+    if (progress_cb) {
+        progress_cb(0.0f, "Preparing mesh vertices and UVs...");
+    }
+
     out.header.magic = kNc2Magic;
     out.header.version = kNc2Version;
     out.header.flags = 0;
-    if (has_uvs) { out.header.flags |= 1; }                   // has UV
-    if (!vert_normals.is_empty()) { out.header.flags |= 2; }  // has normals
+    if (has_uvs) { out.header.flags |= kNc2FlagHasUV; }
+    if (!vert_normals.is_empty()) { out.header.flags |= kNc2FlagHasNormals; }
 
-    /* Input vertex pool with attributes. */
+    /* Input vertex pool with corner UV splitting so UV seams are preserved. */
     std::vector<detail::BuildVertex> input_verts;
-    input_verts.resize(size_t(verts_num));
-    for (const int i : IndexRange(verts_num)) {
-        input_verts[i].position = vert_positions[i];
-        input_verts[i].normal = vert_normals.is_empty() ? float3(0.0f) :
-                                                          vert_normals[i];
-        input_verts[i].uv = has_uvs ? uvs_reader.varray[i] : float2(0.0f);
-    }
+    input_verts.reserve(verts_num);
 
-    /* Input triangles: fan triangulation of every face. */
+    struct UVVertKey {
+        float2 uv;
+        uint32_t new_vert_id;
+    };
+    std::vector<std::vector<UVVertKey>> vert_to_corners(verts_num);
+
+    auto get_or_create_vertex = [&](int orig_vert, int corner_idx) -> uint32_t {
+        float2 uv = has_uvs ? uvs_reader.varray[corner_idx] : float2(0.0f);
+        for (const auto &entry : vert_to_corners[orig_vert]) {
+            if (std::abs(entry.uv.x - uv.x) < 1e-5f && std::abs(entry.uv.y - uv.y) < 1e-5f) {
+                return entry.new_vert_id;
+            }
+        }
+        detail::BuildVertex bv;
+        bv.position = vert_positions[orig_vert];
+        bv.normal = vert_normals.is_empty() ? float3(0.0f) : vert_normals[orig_vert];
+        bv.uv = uv;
+        bv.tangent = float4(1.0f, 0.0f, 0.0f, 1.0f);
+        uint32_t new_id = uint32_t(input_verts.size());
+        input_verts.push_back(bv);
+        vert_to_corners[orig_vert].push_back({uv, new_id});
+        return new_id;
+    };
+
+    /* Input triangles: fan triangulation of every face with material extraction. */
     size_t tri_reserve = 0;
     for (const int i : faces.index_range()) {
         const int face_size = faces[i].size();
@@ -102,26 +142,92 @@ bool buildFromMesh(const Mesh &mesh, TesseraData &out)
     }
     std::vector<uint32_t> tri_verts;
     tri_verts.reserve(tri_reserve * 3);
+    std::vector<uint32_t> tri_materials;
+    tri_materials.reserve(tri_reserve);
+
     for (const int i : faces.index_range()) {
         const IndexRange face = faces[i];
         if (face.size() < 3) {
             continue;
         }
-        const int v0 = corner_verts[face.start()];
+        int mat_idx = has_mat ? mat_reader.varray[i] : 0;
+        if (mat_idx < 0) {
+            mat_idx = 0;
+        }
+        const int c0 = face.start();
+        const uint32_t v0 = get_or_create_vertex(corner_verts[c0], c0);
         for (int k = 1; k + 1 < face.size(); ++k) {
-            tri_verts.push_back(uint32_t(v0));
-            tri_verts.push_back(uint32_t(corner_verts[face.start() + k]));
-            tri_verts.push_back(uint32_t(corner_verts[face.start() + k + 1]));
+            const int c1 = face.start() + k;
+            const int c2 = face.start() + k + 1;
+            tri_verts.push_back(v0);
+            tri_verts.push_back(get_or_create_vertex(corner_verts[c1], c1));
+            tri_verts.push_back(get_or_create_vertex(corner_verts[c2], c2));
+            tri_materials.push_back(uint32_t(mat_idx));
         }
     }
 
+    /* Compute 4D MikkTSpace-compatible tangents if UV coordinates exist. */
+    if (has_uvs) {
+        const int build_verts_num = int(input_verts.size());
+        std::vector<float3> tan_accum(build_verts_num, float3(0.0f));
+        std::vector<float3> bitan_accum(build_verts_num, float3(0.0f));
+        for (size_t t = 0; t + 2 < tri_verts.size(); t += 3) {
+            uint32_t i0 = tri_verts[t];
+            uint32_t i1 = tri_verts[t + 1];
+            uint32_t i2 = tri_verts[t + 2];
+            const float3 &p0 = input_verts[i0].position;
+            const float3 &p1 = input_verts[i1].position;
+            const float3 &p2 = input_verts[i2].position;
+            const float2 &uv0 = input_verts[i0].uv;
+            const float2 &uv1 = input_verts[i1].uv;
+            const float2 &uv2 = input_verts[i2].uv;
+            float3 e1 = p1 - p0;
+            float3 e2 = p2 - p0;
+            float du1 = uv1.x - uv0.x;
+            float dv1 = uv1.y - uv0.y;
+            float du2 = uv2.x - uv0.x;
+            float dv2 = uv2.y - uv0.y;
+            float det = du1 * dv2 - du2 * dv1;
+            if (std::abs(det) > 1e-7f) {
+                float r = 1.0f / det;
+                float3 t_vec = (e1 * dv2 - e2 * dv1) * r;
+                float3 b_vec = (e2 * du1 - e1 * du2) * r;
+                tan_accum[i0] += t_vec;
+                tan_accum[i1] += t_vec;
+                tan_accum[i2] += t_vec;
+                bitan_accum[i0] += b_vec;
+                bitan_accum[i1] += b_vec;
+                bitan_accum[i2] += b_vec;
+            }
+        }
+        for (int i = 0; i < build_verts_num; ++i) {
+            const float3 &n = input_verts[i].normal;
+            const float3 &t_raw = tan_accum[i];
+            const float3 &b_raw = bitan_accum[i];
+            float3 t_ortho = t_raw - n * math::dot(n, t_raw);
+            float len = math::length(t_ortho);
+            if (len > 1e-6f) {
+                t_ortho /= len;
+            } else {
+                t_ortho = float3(1.0f, 0.0f, 0.0f);
+            }
+            float sign = (math::dot(math::cross(n, t_ortho), b_raw) < 0.0f) ? -1.0f : 1.0f;
+            input_verts[i].tangent = float4(t_ortho.x, t_ortho.y, t_ortho.z, sign);
+        }
+        out.header.flags |= kNc2FlagHasTangents;
+    }
+
     /* Build the cluster DAG: region-growing clustering plus hierarchical
-     * merge + QEM simplification. This is the core Tessera front end. */
+     * merge + QEM simplification, partitioned strictly per material. */
     detail::BuilderParams params;
     const detail::BuildResult dag = detail::buildClusterDAG(
-        input_verts, tri_verts, params);
+        input_verts, tri_verts, params, tri_materials, progress_cb);
     if (dag.clusters.empty()) {
         return false;
+    }
+
+    if (progress_cb) {
+        progress_cb(0.90f, "Finalizing Tessera clusters & proxy data...");
     }
 
     /* Per-vertex attribute buffers (all clusters share one vertex pool). */
@@ -129,7 +235,7 @@ bool buildFromMesh(const Mesh &mesh, TesseraData &out)
     for (size_t i = 0; i < dag.verts.size(); ++i) {
         out.positions[i] = dag.verts[i].position;
     }
-    const bool has_normals = (out.header.flags & 2) != 0;
+    const bool has_normals = (out.header.flags & kNc2FlagHasNormals) != 0;
     if (has_normals) {
         out.normals.resize(dag.verts.size());
         for (size_t i = 0; i < dag.verts.size(); ++i) {
@@ -139,7 +245,7 @@ bool buildFromMesh(const Mesh &mesh, TesseraData &out)
     else {
         out.normals.clear();
     }
-    const bool has_uvs_flag = (out.header.flags & 1) != 0;
+    const bool has_uvs_flag = (out.header.flags & kNc2FlagHasUV) != 0;
     if (has_uvs_flag) {
         out.uvs.resize(dag.verts.size());
         for (size_t i = 0; i < dag.verts.size(); ++i) {
@@ -148,6 +254,16 @@ bool buildFromMesh(const Mesh &mesh, TesseraData &out)
     }
     else {
         out.uvs.clear();
+    }
+    const bool has_tangents_flag = (out.header.flags & kNc2FlagHasTangents) != 0;
+    if (has_tangents_flag) {
+        out.tangents.resize(dag.verts.size());
+        for (size_t i = 0; i < dag.verts.size(); ++i) {
+            out.tangents[i] = dag.verts[i].tangent;
+        }
+    }
+    else {
+        out.tangents.clear();
     }
 
     // Clusters: assign contiguous index-buffer ranges and convert DAG nodes.
@@ -181,7 +297,8 @@ bool buildFromMesh(const Mesh &mesh, TesseraData &out)
         nc.parentSphere[1] = c.sphereCenter.y;
         nc.parentSphere[2] = c.sphereCenter.z;
         nc.parentSphere[3] = c.sphereRadius;
-        nc.flags = out.header.flags;
+        nc.flags = uint16_t(out.header.flags);
+        nc.materialIndex = uint16_t(c.material_index);
 
         /* Unique vertices referenced by this cluster. */
         std::unordered_set<uint32_t> unique_verts;

@@ -119,6 +119,7 @@ set(SRC
   engines/eevee/eevee_shadow.cc
   engines/eevee/eevee_subsurface.cc
   engines/eevee/eevee_sync.cc
+  engines/eevee/eevee_tessera.cc
   engines/eevee/eevee_velocity.cc
   engines/eevee/eevee_view.cc
   engines/eevee/eevee_volume.cc
@@ -216,6 +217,7 @@ set(SRC
   engines/eevee/eevee_shadow.hh
   engines/eevee/eevee_subsurface.hh
   engines/eevee/eevee_sync.hh
+  engines/eevee/eevee_tessera.hh
   engines/eevee/eevee_velocity.hh
   engines/eevee/eevee_view.hh
   engines/eevee/eevee_volume.hh

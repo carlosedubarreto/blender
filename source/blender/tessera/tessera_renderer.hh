@@ -76,13 +76,43 @@ public:
     /** Select the material-pass shading mode (diffuse/clusters/normals). */
     void setShadingMode(TesseraShadingMode mode) { mShadingMode = mode; }
 
+    /** Configure reverse-Z for engines that use inverted depth (EEVEE). */
+    void setReverseZ(bool enabled) { mReverseZ = enabled; }
+    bool getReverseZ() const { return mReverseZ; }
+
+    void set_material_textures(const std::vector<TesseraMaterialTextures> &materials)
+    {
+        mVisibilityPass.set_material_textures(materials);
+    }
+
     /**
      * Call once per frame to render the selected clusters into the currently
      * bound framebuffer with the visibility-buffer pipeline.
      */
     void draw(int viewportWidth, int viewportHeight);
 
-    size_t drawCount() const { return mDrawCount; }
+    /**
+     * Depth-only prepass: render clusters into the depth buffer with Reverse-Z.
+     */
+    void draw_prepass(int viewportWidth, int viewportHeight);
+
+    size_t drawCount(uint32_t material_index = 0) const
+    {
+        if (mMaterialDrawCounts.size() > material_index) {
+            return mMaterialDrawCounts[material_index];
+        }
+        return (material_index == 0) ? mDrawCount : 0;
+    }
+
+    size_t totalDrawCount() const { return mDrawCount; }
+
+    size_t materialCommandOffset(uint32_t material_index) const
+    {
+        return size_t(material_index) * mMaxCommandsPerMaterial;
+    }
+
+    const std::vector<uint32_t> &materialDrawCounts() const { return mMaterialDrawCounts; }
+    uint32_t maxCommandsPerMaterial() const { return mMaxCommandsPerMaterial; }
 
     /** Diagnostic helper: count active clusters per LOD level. */
     void getLevelCounts(const TesseraData &data,
@@ -130,6 +160,7 @@ private:
     gpu::StorageBuf *mParentSphereBuf = nullptr;
     gpu::StorageBuf *mErrorsBuf = nullptr;
     gpu::StorageBuf *mMetaBuf = nullptr;
+    gpu::StorageBuf *mMaterialsBuf = nullptr;
     // Shared atomic counter written by the compute shader, read back on CPU.
     gpu::StorageBuf *mCounterBuf = nullptr;
 
@@ -142,6 +173,10 @@ private:
 
     // Number of draw calls written this frame.
     size_t mDrawCount = 0;
+    static constexpr size_t kMaxMaterials = 64;
+    uint32_t mMaxMaterials = 1;
+    uint32_t mMaxCommandsPerMaterial = 2000000;
+    std::vector<uint32_t> mMaterialDrawCounts;
 
     // Data/matrix used by the last update (consumed by the draw step).
     const TesseraData *mLastData = nullptr;
@@ -158,6 +193,9 @@ private:
 
     // Material-pass shading mode.
     TesseraShadingMode mShadingMode = TESSERA_SHADING_DIFFUSE;
+
+    // Inverted depth support (EEVEE Reverse-Z).
+    bool mReverseZ = false;
 
     // Set once the GPU path is proven working; set permanently if the
     // compute shader could not be created.

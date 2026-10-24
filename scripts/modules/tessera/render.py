@@ -97,7 +97,7 @@ class TesseraProperties(bpy.types.PropertyGroup):
     enabled: BoolProperty(
         name="Use Tessera",
         description="Render this object with Tessera virtual geometry "
-                    "(Workbench engine only)",
+                    "(Workbench and EEVEE engines)",
         default=True,
         update=_enabled_update,
     )

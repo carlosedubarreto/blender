@@ -16,13 +16,31 @@
 #include <BLI_math_vector_types.hh>
 #include <BLI_math_matrix_types.hh>
 #include <cstdint>
+#include <functional>
 #include <vector>
 
 // Forward declaration of Blender's Mesh type (defined in BKE_mesh.hh).
 struct Mesh;
 
 namespace blender {
+namespace gpu {
+class Texture;
+}
 namespace tessera {
+
+using TesseraProgressCallback = std::function<void(float progress, const char *step_name)>;
+
+struct TesseraMaterialTextures {
+    gpu::Texture *diffuse = nullptr;
+    gpu::Texture *normal = nullptr;
+    gpu::Texture *roughness = nullptr;
+    float4 base_color = float4(0.8f, 0.8f, 0.8f, 1.0f);
+    float roughness_value = 0.5f;
+    float metallic_value = 0.0f;
+    bool has_diffuse = false;
+    bool has_normal = false;
+    bool has_roughness = false;
+};
 
 // ----------------------------------------------------------------------------
 // Data model (matches Tessera_CUP2 .nc2 binary layout)
@@ -57,10 +75,15 @@ struct TesseraCluster
     int32_t  parentGroup;   // -1 for roots
     uint32_t group;         // own group id
     uint32_t level;         // 0 = finest
-    uint32_t flags;         // bit0: has UV, bit1: has normals
+    uint16_t flags;         // bit0: has UV, bit1: has normals, bit2: has tangents
+    uint16_t materialIndex; // material slot index
 };
 
 static_assert(sizeof(TesseraCluster) == 64, "TesseraCluster must be 64 bytes");
+
+constexpr uint32_t kNc2FlagHasUV = (1u << 0);
+constexpr uint32_t kNc2FlagHasNormals = (1u << 1);
+constexpr uint32_t kNc2FlagHasTangents = (1u << 2);
 
 /** Indirect draw command: matches VkDrawIndexedIndirectCommand. */
 struct TesseraDrawCommand
@@ -87,7 +110,7 @@ struct TesseraHeader
     uint32_t proxyIndexCount;
     uint32_t maxClusterTriangles;
     uint32_t maxClusterVertices;
-    uint32_t flags;  // bit0: has UV, bit1: has normals
+    uint32_t flags;  // bit0: has UV, bit1: has normals, bit2: has tangents
     uint32_t pageCount;  // v2 paged format: number of pages (0 for v1)
     float    boundsMin[3];
     float    boundsMax[3];
@@ -105,6 +128,7 @@ struct TesseraData
     std::vector<float3> positions;
     std::vector<float3> normals;
     std::vector<float2> uvs;
+    std::vector<float4> tangents;
     std::vector<uint32_t> indices;
     std::vector<float3> proxyPositions;
     std::vector<uint32_t> proxyIndices;
@@ -128,7 +152,7 @@ struct TesseraLodParams
  * The mesh is assumed to be in its evaluated/deformed state.
  * \returns true on success.
  */
-bool buildFromMesh(const Mesh &mesh, TesseraData &out);
+bool buildFromMesh(const Mesh &mesh, TesseraData &out, TesseraProgressCallback progress_cb = nullptr);
 
 /**
  * Serialize TesseraData into memory (matches Tessera_CUP2 .nc2 format).

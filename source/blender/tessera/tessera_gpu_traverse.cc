@@ -64,18 +64,27 @@ void main()
   }
 
   /* Budget + overflow guards (read the shared counter before allocating). */
-  if ((max_clusters > 0) && (draw_counter >= uint(max_clusters))) {
+  uint mat = 0u;
+  if (max_materials > 1) {
+    mat = cluster_materials[ci];
+    if (mat >= uint(max_materials)) {
+      mat = 0u;
+    }
+  }
+
+  uint counter_val = draw_counters[mat];
+  if ((max_clusters > 0) && (counter_val >= uint(max_clusters))) {
     return;
   }
-  uint slot = atomicAdd(draw_counter, 1u);
-  if (slot >= uint(max_commands)) {
+  uint slot = atomicAdd(draw_counters[mat], 1u);
+  if (slot >= uint(max_commands_per_material)) {
     return;
   }
 
   /* DrawArraysIndirectCommand layout (4 x uint32): the visibility pass uses
    * vertex pulling, so `first` is the absolute index-buffer position and the
    * triangle id is derived from gl_VertexID directly. */
-  uint base = slot * 4u;
+  uint base = (mat * uint(max_commands_per_material) + slot) * 4u;
   draw_commands[base + 0u] = meta.y;
   draw_commands[base + 1u] = 1u;
   draw_commands[base + 2u] = meta.x;
@@ -103,8 +112,10 @@ void main()
     info.storage_buf(3, gshader::Qualifier::read, "uvec4", "cluster_meta[]");
     /* binding 4: indirect draw commands (4 uints per command). */
     info.storage_buf(4, gshader::Qualifier::write, "uint", "draw_commands[]");
-    /* binding 5: shared atomic draw counter. */
-    info.storage_buf(5, gshader::Qualifier::read_write, "uint", "draw_counter");
+    /* binding 5: shared atomic draw counters per material. */
+    info.storage_buf(5, gshader::Qualifier::read_write, "uint", "draw_counters[]");
+    /* binding 6: material index per cluster. */
+    info.storage_buf(6, gshader::Qualifier::read, "uint", "cluster_materials[]");
 
     info.push_constant(gshader::Type::float3_t, "camera_pos");
     info.push_constant(gshader::Type::float_t, "viewport_height");
@@ -113,6 +124,8 @@ void main()
     info.push_constant(gshader::Type::int_t, "cluster_count");
     info.push_constant(gshader::Type::int_t, "max_clusters");
     info.push_constant(gshader::Type::int_t, "max_commands");
+    info.push_constant(gshader::Type::int_t, "max_materials");
+    info.push_constant(gshader::Type::int_t, "max_commands_per_material");
     info.push_constant(gshader::Type::float4_t, "frustum_planes", 6);
 
     /* Runtime-created shader: register the raw source as "generated" content

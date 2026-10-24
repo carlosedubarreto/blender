@@ -48,6 +48,8 @@ enum TesseraShadingMode {
     TESSERA_SHADING_DIFFUSE = 0,
     TESSERA_SHADING_CLUSTERS = 1,
     TESSERA_SHADING_NORMALS = 2,
+    TESSERA_SHADING_TANGENTS = 3,
+    TESSERA_SHADING_UVS = 4,
 };
 
 /**
@@ -85,7 +87,27 @@ class TesseraVisibilityPass
                 int viewport_width,
                 int viewport_height,
                 int shading_mode,
-                const float4x4 &object_model = float4x4::identity());
+                const float4x4 &object_model = float4x4::identity(),
+                bool reverse_z = false,
+                const std::vector<uint32_t> *material_counts = nullptr,
+                uint32_t max_commands_per_material = 0);
+
+    /**
+     * Render depth-only prepass into the currently bound framebuffer.
+     */
+    void render_depth_prepass(gpu::StorageBuf *command_buf,
+                             size_t draw_count,
+                             const float4x4 &viewProj,
+                             int viewport_width,
+                             int viewport_height,
+                             bool reverse_z = false,
+                             const std::vector<uint32_t> *material_counts = nullptr,
+                             uint32_t max_commands_per_material = 0);
+
+    void set_material_textures(const std::vector<TesseraMaterialTextures> &materials)
+    {
+        mMaterials = materials;
+    }
 
  private:
     bool ensure_targets(int width, int height);
@@ -94,6 +116,7 @@ class TesseraVisibilityPass
     // Shaders (created lazily with an active context).
     gpu::Shader *mVisShader = nullptr;
     gpu::Shader *mMaterialShader = nullptr;
+    gpu::Shader *mDepthPrepassShader = nullptr;
 
     // Visibility targets.
     gpu::Texture *mVisTexture = nullptr;
@@ -117,8 +140,19 @@ class TesseraVisibilityPass
     gpu::StorageBuf *mPositionsBuf = nullptr;
     gpu::StorageBuf *mNormalsBuf = nullptr;
     gpu::StorageBuf *mUvsBuf = nullptr;
+    gpu::StorageBuf *mTangentsBuf = nullptr;
     gpu::StorageBuf *mIndicesBuf = nullptr;
     gpu::StorageBuf *mClusterMetaBuf = nullptr;
+    gpu::StorageBuf *mTriMaterialsBuf = nullptr;
+    gpu::StorageBuf *mMaterialParamsBuf = nullptr;
+
+    // Default fallback textures for unused material slots.
+    gpu::Texture *mDefaultWhiteTex = nullptr;
+    gpu::Texture *mDefaultNormalTex = nullptr;
+    gpu::Texture *mDefaultRoughTex = nullptr;
+
+    std::vector<TesseraMaterialTextures> mMaterials;
+
     TesseraGpuVertexData mVertexData;
     size_t mVertexCount = 0;
     size_t mIndexCount = 0;

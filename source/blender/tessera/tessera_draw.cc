@@ -150,9 +150,34 @@ void TesseraDrawPass::draw(int viewportWidth, int viewportHeight) const
     renderer_.draw(viewportWidth, viewportHeight);
 }
 
-size_t TesseraDrawPass::drawCount() const
+void TesseraDrawPass::draw_prepass(int viewportWidth, int viewportHeight) const
 {
-    return renderer_.drawCount();
+    renderer_.draw_prepass(viewportWidth, viewportHeight);
+}
+
+size_t TesseraDrawPass::drawCount(uint32_t material_index) const
+{
+    return renderer_.drawCount(material_index);
+}
+
+size_t TesseraDrawPass::totalDrawCount() const
+{
+    return renderer_.totalDrawCount();
+}
+
+size_t TesseraDrawPass::materialCommandOffset(uint32_t material_index) const
+{
+    return renderer_.materialCommandOffset(material_index);
+}
+
+const std::vector<uint32_t> &TesseraDrawPass::materialDrawCounts() const
+{
+    return renderer_.materialDrawCounts();
+}
+
+uint32_t TesseraDrawPass::maxCommandsPerMaterial() const
+{
+    return renderer_.maxCommandsPerMaterial();
 }
 
 }  // namespace tessera

@@ -365,6 +365,7 @@ void Instance::begin_sync()
   cryptomatte.begin_sync();
   sphere_probes.begin_sync();
   light_probes.begin_sync();
+  tessera.begin_sync();
 
   depth_of_field.sync();
   raytracing.sync();

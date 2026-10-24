@@ -215,6 +215,11 @@ void SyncModule::sync_mesh(const ObjectRef &ob_ref)
     return;
   }
 
+  if (inst_.tessera.record(ob_ref.object)) {
+    /* Tessera-owned object: rendered by Tessera pipeline in draw. */
+    return;
+  }
+
   ObjectHandle ob_handle = sync_object(ob_ref, inst_.manager->unique_handle(ob_ref));
 
   bool has_motion = inst_.velocity.step_object_sync(ob_handle);
