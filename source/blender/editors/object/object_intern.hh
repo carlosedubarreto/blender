@@ -193,10 +193,10 @@ void OBJECT_OT_light_linking_unlink_from_collection(wmOperatorType *ot);
 
 void OBJECT_OT_camera_custom_update(wmOperatorType *ot);
 
-/* `object_nanite.cc` */
+/* `object_tessera.cc` */
 
-void OBJECT_OT_nanite_build(wmOperatorType *ot);
-void OBJECT_OT_nanite_gpu_test(wmOperatorType *ot);
+void OBJECT_OT_tessera_build(wmOperatorType *ot);
+void OBJECT_OT_tessera_gpu_test(wmOperatorType *ot);
 
 /* `object_modifier.cc` */
 

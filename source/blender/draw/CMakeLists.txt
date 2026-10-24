@@ -311,7 +311,7 @@ set(LIB
   PRIVATE bf::render
   PRIVATE bf::windowmanager
   PRIVATE bf::intern::atomic
-  PRIVATE bf::nanite
+  PRIVATE bf::tessera
   PRIVATE bf::dependencies::optional::opensubdiv
 )
 

@@ -46,8 +46,8 @@
 #include "draw_sculpt.hh"
 #include "draw_view_data.hh"
 
-#include "nanite.h"
-#include "nanite_draw.hh"
+#include "tessera.h"
+#include "tessera_draw.hh"
 
 #include "workbench_private.hh"
 
@@ -68,41 +68,41 @@ using namespace draw;
 class Instance : public DrawEngine {
  private:
   /* -------------------------------------------------------------------- */
-  /** \name Nanite integration (experimental)
+  /** \name Tessera integration (experimental)
    *
-   * Objects owning Nanite cluster data (custom IDProperty `nanite_nc2`)
-   * are rendered through the Nanite visibility-buffer pipeline instead of
+   * Objects owning Tessera cluster data (custom IDProperty `tessera_nc2`)
+   * are rendered through the Tessera visibility-buffer pipeline instead of
    * the regular Workbench mesh passes.
    * \{ */
 
-  struct NaniteObjectState {
+  struct TesseraObjectState {
     std::string nc2_path;
     int64_t file_mtime = 0;
     float4x4 object_mat = float4x4::identity();
     bool visualize_clusters = false;
-    bool nanite_enabled = true;
+    bool tessera_enabled = true;
     float pixel_error = 1.0f;
     /* LOD view source: 0 = viewport view, 1 = the scene's active camera. */
     int view_source = 0;
     bool used = false;
-    nanite::NaniteData data;
-    std::unique_ptr<nanite::NaniteDrawPass> pass;
+    tessera::TesseraData data;
+    std::unique_ptr<tessera::TesseraDrawPass> pass;
   };
 
-  /** Nanite objects found during sync, keyed by object name. */
-  Map<std::string, std::unique_ptr<NaniteObjectState>> nanite_objects_;
-  /** Guards #nanite_objects_ (object_sync may run on extraction threads). */
-  std::mutex nanite_mutex_;
+  /** Tessera objects found during sync, keyed by object name. */
+  Map<std::string, std::unique_ptr<TesseraObjectState>> tessera_objects_;
+  /** Guards #tessera_objects_ (object_sync may run on extraction threads). */
+  std::mutex tessera_mutex_;
 
-  /* Nanite data ownership helpers. */
+  /* Tessera data ownership helpers. */
 
-  static bool nanite_path_get(Object *ob, std::string &r_path)
+  static bool tessera_path_get(Object *ob, std::string &r_path)
   {
     const IDProperty *group = IDP_GetProperties(&ob->id);
     if (group == nullptr) {
       return false;
     }
-    const IDProperty *prop = IDP_GetPropertyTypeFromGroup(group, "nanite_nc2", IDP_STRING);
+    const IDProperty *prop = IDP_GetPropertyTypeFromGroup(group, "tessera_nc2", IDP_STRING);
     if (prop == nullptr || prop->data.pointer == nullptr) {
       return false;
     }
@@ -110,28 +110,28 @@ class Instance : public DrawEngine {
     return !r_path.empty();
   }
 
-  static bool nanite_visualize_get(Object *ob)
+  static bool tessera_visualize_get(Object *ob)
   {
     const IDProperty *group = IDP_GetProperties(&ob->id);
     if (group == nullptr) {
       return false;
     }
-    const IDProperty *prop = IDP_GetPropertyFromGroup(group, "nanite_visualize_clusters");
+    const IDProperty *prop = IDP_GetPropertyFromGroup(group, "tessera_visualize_clusters");
     if (prop == nullptr) {
       return false;
     }
     return prop->data.val != 0;
   }
 
-  /** Master switch: false disables the Nanite path (falls back to the regular
+  /** Master switch: false disables the Tessera path (falls back to the regular
    * mesh draw). Defaults to true when the property is absent. */
-  static bool nanite_enabled_get(Object *ob)
+  static bool tessera_enabled_get(Object *ob)
   {
     IDProperty *group = IDP_GetProperties(&ob->id);
     if (group == nullptr) {
       return true;
     }
-    IDProperty *prop = IDP_GetPropertyFromGroup(group, "nanite_enabled");
+    IDProperty *prop = IDP_GetPropertyFromGroup(group, "tessera_enabled");
     if (prop == nullptr) {
       return true;
     }
@@ -139,13 +139,13 @@ class Instance : public DrawEngine {
   }
 
   /** LOD quality control: tolerated screen-space error in pixels. */
-  static float nanite_pixel_error_get(Object *ob)
+  static float tessera_pixel_error_get(Object *ob)
   {
     IDProperty *group = IDP_GetProperties(&ob->id);
     if (group == nullptr) {
       return 1.0f;
     }
-    IDProperty *prop = IDP_GetPropertyFromGroup(group, "nanite_pixel_error");
+    IDProperty *prop = IDP_GetPropertyFromGroup(group, "tessera_pixel_error");
     if (prop == nullptr) {
       return 1.0f;
     }
@@ -163,13 +163,13 @@ class Instance : public DrawEngine {
   }
 
   /** LOD view source: 0 = viewport view, 1 = the scene's active camera. */
-  static int nanite_view_source_get(Object *ob)
+  static int tessera_view_source_get(Object *ob)
   {
     IDProperty *group = IDP_GetProperties(&ob->id);
     if (group == nullptr) {
       return 0;
     }
-    IDProperty *prop = IDP_GetPropertyFromGroup(group, "nanite_view_source");
+    IDProperty *prop = IDP_GetPropertyFromGroup(group, "tessera_view_source");
     if (prop == nullptr) {
       return 0;
     }
@@ -180,7 +180,7 @@ class Instance : public DrawEngine {
    * Projection*view matrix of the scene's active camera, fitted to the target
    * resolution. Returns false when the scene has no usable camera.
    */
-  static bool nanite_camera_persmat(const Scene *scene,
+  static bool tessera_camera_persmat(const Scene *scene,
                                     const DRWContext *draw_ctx,
                                     const int2 &resolution,
                                     float4x4 &r_persmat,
@@ -214,17 +214,17 @@ class Instance : public DrawEngine {
   }
 
   /**
-   * Record a Nanite-enabled object for rendering in the draw phase.
-   * \return true when the object is owned by the Nanite pipeline (the caller
+   * Record a Tessera-enabled object for rendering in the draw phase.
+   * \return true when the object is owned by the Tessera pipeline (the caller
    * must skip the regular Workbench mesh draw for it).
    */
-  bool nanite_record(Object *ob)
+  bool tessera_record(Object *ob)
   {
-    if (!nanite_enabled_get(ob)) {
+    if (!tessera_enabled_get(ob)) {
       return false;
     }
     std::string idprop_path;
-    if (!nanite_path_get(ob, idprop_path)) {
+    if (!tessera_path_get(ob, idprop_path)) {
       return false;
     }
 
@@ -238,18 +238,18 @@ class Instance : public DrawEngine {
                                    int64_t(file_info.st_mtime) :
                                    int64_t(-1);
 
-    std::lock_guard lock(this->nanite_mutex_);
-    std::unique_ptr<NaniteObjectState> &entry = nanite_objects_.lookup_or_add_default(
+    std::lock_guard lock(this->tessera_mutex_);
+    std::unique_ptr<TesseraObjectState> &entry = tessera_objects_.lookup_or_add_default(
         std::string(ob->id.name + 2));
     if (entry == nullptr) {
-      entry = std::make_unique<NaniteObjectState>();
+      entry = std::make_unique<TesseraObjectState>();
     }
-    NaniteObjectState &state = *entry;
+    TesseraObjectState &state = *entry;
 
     state.used = true;
-    state.visualize_clusters = nanite_visualize_get(ob);
-    state.pixel_error = nanite_pixel_error_get(ob);
-    state.view_source = nanite_view_source_get(ob);
+    state.visualize_clusters = tessera_visualize_get(ob);
+    state.pixel_error = tessera_pixel_error_get(ob);
+    state.view_source = tessera_view_source_get(ob);
     state.object_mat = ob->object_to_world();
 
     /* (Re)load the cluster data when the file path or content changed. The
@@ -260,8 +260,8 @@ class Instance : public DrawEngine {
       if (stale || state.data.clusters.empty()) {
         size_t data_size = 0;
         if (void *file_data = BLI_file_read_binary_as_mem(abs_path, 0, &data_size)) {
-          nanite::NaniteData loaded;
-          if (nanite::deserializeFromMemory(loaded,
+          tessera::TesseraData loaded;
+          if (tessera::deserializeFromMemory(loaded,
                                             static_cast<const uint8_t *>(file_data),
                                             data_size) &&
               !loaded.clusters.empty())
@@ -280,21 +280,21 @@ class Instance : public DrawEngine {
     return !state.data.clusters.empty();
   }
 
-  /** Render all Nanite objects recorded during sync into the target. */
-  void nanite_draw(const int2 &resolution)
+  /** Render all Tessera objects recorded during sync into the target. */
+  void tessera_draw(const int2 &resolution)
   {
-    if (nanite_objects_.is_empty()) {
+    if (tessera_objects_.is_empty()) {
       return;
     }
-    std::lock_guard lock(this->nanite_mutex_);
+    std::lock_guard lock(this->tessera_mutex_);
     const draw::View &default_view = draw::View::default_get();
     const float4x4 viewport_persmat = view_.persmat();
     /* Vertical projection scale from the pure projection matrix (not corrupted
      * by object rotation). For orthographic views winmat[1][1] == 2/height. */
     const float viewport_proj_scale_y = std::abs(default_view.winmat()[1][1]);
 
-    for (auto item : nanite_objects_.items()) {
-      NaniteObjectState &state = *item.value;
+    for (auto item : tessera_objects_.items()) {
+      TesseraObjectState &state = *item.value;
       if (!state.used || state.data.clusters.empty()) {
         continue;
       }
@@ -307,7 +307,7 @@ class Instance : public DrawEngine {
       float cam_proj_scale_y = viewport_proj_scale_y;
       bool has_cam_lod = false;
       if (state.view_source != 0) {
-        if (nanite_camera_persmat(
+        if (tessera_camera_persmat(
                 scene_state_.scene, this->draw_ctx, resolution, cam_persmat, cam_proj_scale_y)) {
           has_cam_lod = true;
         }
@@ -317,7 +317,7 @@ class Instance : public DrawEngine {
       const float lod_proj_scale_y = has_cam_lod ? cam_proj_scale_y : viewport_proj_scale_y;
 
       if (state.pass == nullptr) {
-        state.pass = std::make_unique<blender::nanite::NaniteDrawPass>(
+        state.pass = std::make_unique<blender::tessera::TesseraDrawPass>(
             state.data, object_persmat, viewport_proj_scale_y, float(resolution.y));
         if (!state.pass->init()) {
           state.pass.reset();
@@ -326,8 +326,8 @@ class Instance : public DrawEngine {
       }
       state.pass->setPixelError(state.pixel_error);
       state.pass->setShadingMode(state.visualize_clusters ?
-                                     nanite::NANITE_SHADING_CLUSTERS :
-                                     nanite::NANITE_SHADING_DIFFUSE);
+                                     tessera::TESSERA_SHADING_CLUSTERS :
+                                     tessera::TESSERA_SHADING_DIFFUSE);
       state.pass->update(state.data,
                          object_persmat,
                          viewport_proj_scale_y,
@@ -352,7 +352,7 @@ class Instance : public DrawEngine {
         }
         lod_str += "LOD" + std::to_string(pair.first) + ": " + std::to_string(pair.second);
       }
-      printf("[Nanite LOD] Cam: (%.2f, %.2f, %.2f) | Mesh: (%.2f, %.2f, %.2f) | Dist: %.2f | ProjScaleY: %.4f | PixelError: %.1f | %zu clusters (%s)\n",
+      printf("[Tessera LOD] Cam: (%.2f, %.2f, %.2f) | Mesh: (%.2f, %.2f, %.2f) | Dist: %.2f | ProjScaleY: %.4f | PixelError: %.1f | %zu clusters (%s)\n",
              cam_pos.x, cam_pos.y, cam_pos.z,
              mesh_pos.x, mesh_pos.y, mesh_pos.z,
              dist,
@@ -435,8 +435,8 @@ class Instance : public DrawEngine {
   void begin_sync() final
   {
     {
-      std::lock_guard lock(this->nanite_mutex_);
-      for (auto item : nanite_objects_.items()) {
+      std::lock_guard lock(this->tessera_mutex_);
+      for (auto item : tessera_objects_.items()) {
         item.value->used = false;
       }
     }
@@ -519,8 +519,8 @@ class Instance : public DrawEngine {
     ResourceHandleRange emitter_handle = {};
 
     if (is_object_data_visible) {
-      if (this->nanite_record(ob)) {
-        /* Nanite-owned object: rendered by the Nanite pass in draw(). */
+      if (this->tessera_record(ob)) {
+        /* Tessera-owned object: rendered by the Tessera pass in draw(). */
         return;
       }
       if (object_state.sculpt_pbvh) {
@@ -832,10 +832,10 @@ class Instance : public DrawEngine {
     transparent_ps_.draw(manager, view_, resources_, resolution);
     transparent_depth_ps_.draw(manager, view_, resources_);
 
-    /* Nanite objects (experimental): render through the visibility-buffer
+    /* Tessera objects (experimental): render through the visibility-buffer
      * pipeline, compositing over the scene depth. */
     resources_.clear_fb.bind();
-    this->nanite_draw(resolution);
+    this->tessera_draw(resolution);
 
     volume_ps_.draw(manager, view_, resources_);
     outline_ps_.draw(manager, resources_);
