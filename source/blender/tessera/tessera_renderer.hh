@@ -73,6 +73,10 @@ public:
     void setPixelError(float pixelError) { mPixelError = pixelError; }
     float getPixelError() const { return mPixelError; }
 
+    /** Camera frustum margin in meters / scene units. Extends culling boundaries outward. */
+    void setCullingMargin(float margin) { mCullingMargin = margin; }
+    float getCullingMargin() const { return mCullingMargin; }
+
     /** Select the material-pass shading mode (diffuse/clusters/normals). */
     void setShadingMode(TesseraShadingMode mode) { mShadingMode = mode; }
 
@@ -199,11 +203,15 @@ private:
     float mLastLodProjScaleY = 1.0f;
     float mLastViewportHeight = 0.0f;
     float mLastPixelError = -1.0f;
+    float mLastCullingMargin = -1.0f;
     bool mLastTelemetryEnabled = false;
     bool mMatricesCurrent = false;  // track if matrices have been updated this frame
 
     // LOD pixel error threshold (pixels).
     float mPixelError = 1.0f;
+
+    // Camera frustum culling margin (meters).
+    float mCullingMargin = 0.0f;
 
     // Material-pass shading mode.
     TesseraShadingMode mShadingMode = TESSERA_SHADING_DIFFUSE;

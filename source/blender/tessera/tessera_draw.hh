@@ -90,6 +90,16 @@ public:
         return renderer_.getPixelError();
     }
 
+    void setCullingMargin(float margin)
+    {
+        renderer_.setCullingMargin(margin);
+    }
+
+    float getCullingMargin() const
+    {
+        return renderer_.getCullingMargin();
+    }
+
     void setReverseZ(bool enabled)
     {
         renderer_.setReverseZ(enabled);

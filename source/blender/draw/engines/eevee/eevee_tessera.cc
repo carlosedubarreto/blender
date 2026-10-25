@@ -167,6 +167,25 @@ static float tessera_pixel_error_get(Object *ob)
   return (value > 0.0f) ? value : 1.0f;
 }
 
+static float tessera_culling_margin_get(Object *ob)
+{
+  const IDProperty *prop = tessera_property_find(ob, "tessera_culling_margin");
+  if (prop == nullptr) {
+    return 2.0f;
+  }
+  float value = 2.0f;
+  if (prop->type == IDP_DOUBLE) {
+    value = float(IDP_double_get(prop));
+  }
+  else if (prop->type == IDP_FLOAT) {
+    value = IDP_float_get(prop);
+  }
+  else if (prop->type == IDP_INT) {
+    value = float(IDP_int_get(prop));
+  }
+  return (value >= 0.0f) ? value : 0.0f;
+}
+
 static int tessera_view_source_get(Object *ob)
 {
   const IDProperty *prop = tessera_property_find(ob, "tessera_view_source");
@@ -302,6 +321,7 @@ static void tessera_write_telemetry_to_object(Object *ob, const tessera::Tessera
       idp_float_replace(group, "tessera_stat_distance", telem.cam_distance);
       idp_float_replace(group, "tessera_stat_pixel_error", telem.pixel_error);
       idp_float_replace(group, "tessera_stat_error", telem.pixel_error);
+      idp_float_replace(group, "tessera_stat_culling_margin", telem.culling_margin);
     }
   };
 
@@ -867,6 +887,7 @@ bool TesseraModule::record(Object *ob)
   state.show_fps_hud = tessera_show_fps_hud_get(ob);
   state.visualize_clusters = tessera_visualize_get(ob);
   state.pixel_error = tessera_pixel_error_get(ob);
+  state.culling_margin = tessera_culling_margin_get(ob);
   state.view_source = tessera_view_source_get(ob);
   state.object_mat = ob->object_to_world();
   state.materials = tessera_extract_materials(ob);
@@ -1033,6 +1054,7 @@ void TesseraModule::draw_prepass(const draw::View &view,
     /* EEVEE uses Reverse-Z depth testing. */
     state.pass->setReverseZ(true);
     state.pass->setPixelError(state.pixel_error);
+    state.pass->setCullingMargin(state.culling_margin);
     const bool show_stats = state.show_stats;
     const bool log_console = state.log_console;
     const bool show_fps_panel = state.show_fps_panel;
@@ -1098,6 +1120,7 @@ void TesseraModule::draw(const draw::View &view,
     /* EEVEE uses Reverse-Z depth testing. */
     state.pass->setReverseZ(true);
     state.pass->setPixelError(state.pixel_error);
+    state.pass->setCullingMargin(state.culling_margin);
     tessera::TesseraShadingMode mode = tessera::TESSERA_SHADING_DIFFUSE;
     if (state.visualize_clusters == 1) {
       mode = tessera::TESSERA_SHADING_CLUSTERS;
@@ -1202,6 +1225,7 @@ void TesseraModule::draw_gbuffer(const draw::View &view,
     /* EEVEE uses Reverse-Z depth testing. */
     state.pass->setReverseZ(true);
     state.pass->setPixelError(state.pixel_error);
+    state.pass->setCullingMargin(state.culling_margin);
     const bool show_stats = state.show_stats;
     const bool log_console = state.log_console;
     const bool show_fps_panel = state.show_fps_panel;

@@ -55,6 +55,8 @@ def _tag_tessera_redraw(self, context):
 
 def _enabled_update(self, context):
     self.id_data["tessera_enabled"] = int(self.enabled)
+    if "tessera_culling_margin" not in self.id_data:
+        self.id_data["tessera_culling_margin"] = float(getattr(self, "culling_margin", 2.0))
     if self.enabled:
         import os
         nc2 = self.id_data.get("tessera_nc2")
@@ -73,6 +75,11 @@ def _visualize_clusters_update(self, context):
 
 def _pixel_error_update(self, context):
     self.id_data["tessera_pixel_error"] = float(self.pixel_error)
+    _tag_tessera_redraw(self, context)
+
+
+def _culling_margin_update(self, context):
+    self.id_data["tessera_culling_margin"] = float(self.culling_margin)
     _tag_tessera_redraw(self, context)
 
 
@@ -154,6 +161,18 @@ class TesseraProperties(bpy.types.PropertyGroup):
         soft_max=10.0,
         precision=2,
         update=_pixel_error_update,
+    )
+
+    # Frustum culling margin: distance in meters to keep clusters active beyond camera borders.
+    culling_margin: FloatProperty(
+        name="Camera Margin",
+        description="Distance in meters to keep clusters active beyond camera view borders "
+                    "(prevents edge popping during panning or off-screen shadows)",
+        default=2.0,
+        min=0.0,
+        soft_max=50.0,
+        unit='LENGTH',
+        update=_culling_margin_update,
     )
 
     # LOD view source: which view drives the screen-space error test.

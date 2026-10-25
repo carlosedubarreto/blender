@@ -55,7 +55,7 @@ TesseraViewInfo getViewInfo(const float4x4 &viewProj,
 
 /** Sphere vs. frustum test (Gribb-Hartmann planes, normalized). */
 bool sphere_in_frustum(const float planes[6][4], const float3 &center,
-                       float radius);
+                       float radius, float margin = 0.0f);
 
 /**
  * Project a world-space error value to screen pixels, accounting for the

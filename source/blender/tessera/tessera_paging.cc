@@ -587,7 +587,7 @@ void collectStreamingRequests(const TesseraData &data,
         const float3 center(cluster.sphere[0], cluster.sphere[1],
                             cluster.sphere[2]);
         const float radius = cluster.sphere[3];
-        if (!sphere_in_frustum(view.planes, center, radius)) {
+        if (!sphere_in_frustum(view.planes, center, radius, params.cullingMargin)) {
             continue;
         }
 

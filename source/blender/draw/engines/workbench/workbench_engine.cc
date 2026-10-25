@@ -89,6 +89,7 @@ class Instance : public DrawEngine {
     bool visualize_clusters = false;
     bool tessera_enabled = true;
     float pixel_error = 1.0f;
+    float culling_margin = 2.0f;
     /* LOD view source: 0 = viewport view, 1 = the scene's active camera. */
     int view_source = 0;
     bool used = false;
@@ -195,6 +196,29 @@ class Instance : public DrawEngine {
       value = float(IDP_int_get(prop));
     }
     return (value > 0.0f) ? value : 1.0f;
+  }
+
+  static float tessera_culling_margin_get(Object *ob)
+  {
+    IDProperty *group = IDP_GetProperties(&ob->id);
+    if (group == nullptr) {
+      return 2.0f;
+    }
+    IDProperty *prop = IDP_GetPropertyFromGroup(group, "tessera_culling_margin");
+    if (prop == nullptr) {
+      return 2.0f;
+    }
+    float value = 2.0f;
+    if (prop->type == IDP_DOUBLE) {
+      value = float(IDP_double_get(prop));
+    }
+    else if (prop->type == IDP_FLOAT) {
+      value = IDP_float_get(prop);
+    }
+    else if (prop->type == IDP_INT) {
+      value = float(IDP_int_get(prop));
+    }
+    return (value >= 0.0f) ? value : 0.0f;
   }
 
   /** LOD view source: 0 = viewport view, 1 = the scene's active camera. */
@@ -368,6 +392,7 @@ class Instance : public DrawEngine {
         idp_float_replace(group, "tessera_stat_distance", telem.cam_distance);
         idp_float_replace(group, "tessera_stat_pixel_error", telem.pixel_error);
         idp_float_replace(group, "tessera_stat_error", telem.pixel_error);
+        idp_float_replace(group, "tessera_stat_culling_margin", telem.culling_margin);
       }
     };
 
@@ -456,6 +481,7 @@ class Instance : public DrawEngine {
     state.show_fps_hud = tessera_show_fps_hud_get(ob);
     state.visualize_clusters = tessera_visualize_get(ob);
     state.pixel_error = tessera_pixel_error_get(ob);
+    state.culling_margin = tessera_culling_margin_get(ob);
     state.view_source = tessera_view_source_get(ob);
     state.object_mat = ob->object_to_world();
 
@@ -533,6 +559,7 @@ class Instance : public DrawEngine {
         }
       }
       state.pass->setPixelError(state.pixel_error);
+      state.pass->setCullingMargin(state.culling_margin);
       state.pass->setShadingMode(state.visualize_clusters ?
                                      tessera::TESSERA_SHADING_CLUSTERS :
                                      tessera::TESSERA_SHADING_DIFFUSE);

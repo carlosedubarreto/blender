@@ -156,7 +156,8 @@ void TesseraRenderer::update(const TesseraData &data,
                         (mLastProjScaleY != projScaleY) ||
                         (mLastLodProjScaleY != lod_scale_y) ||
                         (mLastViewportHeight != viewportHeight) ||
-                        (mLastPixelError != mPixelError);
+                        (mLastPixelError != mPixelError) ||
+                        (mLastCullingMargin != mCullingMargin);
 
     if (!data_changed && !view_changed && !telem_changed && (mGpuTraversalActive || !mCpuCommandStream.empty())) {
         // Matrices, parameters, telemetry and data are identical to last frame; retain existing draw commands and count
@@ -172,6 +173,7 @@ void TesseraRenderer::update(const TesseraData &data,
     mLastLodProjScaleY = lod_scale_y;
     mLastViewportHeight = viewportHeight;
     mLastPixelError = mPixelError;
+    mLastCullingMargin = mCullingMargin;
     mLastTelemetryEnabled = mTelemetryEnabled;
 
     /* Try to bring up the compute traversal once. If it cannot be created
@@ -276,6 +278,7 @@ void TesseraRenderer::updateWithGpuTraversal(const TesseraData &data,
     GPU_shader_uniform_1f(mTraverseShader, "viewport_height", viewportHeight);
     GPU_shader_uniform_1f(mTraverseShader, "proj_scale_y", view.projScaleY);
     GPU_shader_uniform_1f(mTraverseShader, "pixel_error", mPixelError);
+    GPU_shader_uniform_1f(mTraverseShader, "culling_margin", mCullingMargin);
     GPU_shader_uniform_1i(mTraverseShader, "cluster_count", int(clusterCount));
     GPU_shader_uniform_1i(mTraverseShader, "max_clusters", 0);
     GPU_shader_uniform_1i(mTraverseShader, "max_commands",
@@ -302,6 +305,7 @@ void TesseraRenderer::updateWithGpuTraversal(const TesseraData &data,
         mTelemetry.total_clusters = uint32_t(data.clusters.size());
         mTelemetry.total_triangles = uint32_t(data.indices.size() / 3);
         mTelemetry.pixel_error = mPixelError;
+        mTelemetry.culling_margin = mCullingMargin;
     }
     else {
         std::vector<uint32_t> emitted(max_materials, 0);
@@ -343,7 +347,7 @@ void TesseraRenderer::updateWithCpuTraversal(const TesseraData &data,
         }
         const float3 center(cluster.sphere[0], cluster.sphere[1], cluster.sphere[2]);
         const float radius = cluster.sphere[3];
-        if (!sphere_in_frustum(view.planes, center, radius)) {
+        if (!sphere_in_frustum(view.planes, center, radius, mCullingMargin)) {
             continue;
         }
 
@@ -385,6 +389,7 @@ void TesseraRenderer::updateWithCpuTraversal(const TesseraData &data,
         mTelemetry.total_clusters = uint32_t(data.clusters.size());
         mTelemetry.total_triangles = uint32_t(data.indices.size() / 3);
         mTelemetry.pixel_error = mPixelError;
+        mTelemetry.culling_margin = mCullingMargin;
         uint32_t tri_count = 0;
         uint32_t min_lod = selected.empty() ? 0 : 999999;
         uint32_t max_lod = 0;
@@ -508,6 +513,7 @@ void TesseraRenderer::getLevelCounts(const TesseraData &data,
     std::vector<TesseraDrawCommand> cmds;
     TesseraLodParams params;
     params.pixelError = mPixelError;
+    params.cullingMargin = mCullingMargin;
     selectClustersFlat(data, lodViewProj, projScaleY, viewportHeight, params, cmds);
     for (const auto &cmd : cmds) {
         for (const auto &c : data.clusters) {

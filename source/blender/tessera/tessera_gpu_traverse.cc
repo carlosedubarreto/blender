@@ -41,7 +41,7 @@ void main()
   /* Frustum culling (Gribb-Hartmann planes, a*x + b*y + c*z + d >= 0 inside). */
   for (int p = 0; p < 6; ++p) {
     float d = dot(frustum_planes[p].xyz, center) + frustum_planes[p].w;
-    if (d < -radius) {
+    if (d < -(radius + culling_margin)) {
       return;
     }
   }
@@ -128,6 +128,7 @@ void main()
     info.push_constant(gshader::Type::float_t, "viewport_height");
     info.push_constant(gshader::Type::float_t, "proj_scale_y");
     info.push_constant(gshader::Type::float_t, "pixel_error");
+    info.push_constant(gshader::Type::float_t, "culling_margin");
     info.push_constant(gshader::Type::int_t, "cluster_count");
     info.push_constant(gshader::Type::int_t, "max_clusters");
     info.push_constant(gshader::Type::int_t, "max_commands");

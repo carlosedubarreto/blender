@@ -78,6 +78,7 @@ struct TraversalContext {
     float viewportHeight = 1.0f;
     float projScaleY = 1.0f;
     float pixelError = 1.0f;
+    float cullingMargin = 0.0f;
     bool orthographic = false;
     std::size_t maxClusters = std::numeric_limits<std::size_t>::max();
     std::vector<TesseraDrawCommand> *out = nullptr;
@@ -91,7 +92,7 @@ void traverseCluster(const TraversalContext &ctx, uint32_t ci)
     /* Whole-subtree frustum culling. */
     const float3 center(cluster.sphere[0], cluster.sphere[1],
                         cluster.sphere[2]);
-    if (!sphere_in_frustum(ctx.planes, center, cluster.sphere[3])) {
+    if (!sphere_in_frustum(ctx.planes, center, cluster.sphere[3], ctx.cullingMargin)) {
         return;
     }
 
@@ -142,18 +143,18 @@ void traverseCluster(const TraversalContext &ctx, uint32_t ci)
 }  // namespace
 
 bool sphere_outside_plane(const float planes[4], const float3 &center,
-                          float radius)
+                          float radius, float margin = 0.0f)
 {
     const float dist = planes[0] * center.x + planes[1] * center.y +
                        planes[2] * center.z + planes[3];
-    return dist < -radius;
+    return dist < -(radius + margin);
 }
 
 bool sphere_in_frustum(const float planes[6][4], const float3 &center,
-                       float radius)
+                       float radius, float margin)
 {
     for (int p = 0; p < 6; ++p) {
-        if (sphere_outside_plane(planes[p], center, radius)) {
+        if (sphere_outside_plane(planes[p], center, radius, margin)) {
             return false;
         }
     }
@@ -326,6 +327,7 @@ std::size_t selectClusters(const TesseraData &data,
     ctx.viewportHeight = viewportHeight;
     ctx.projScaleY = view.projScaleY;
     ctx.pixelError = params.pixelError;
+    ctx.cullingMargin = params.cullingMargin;
     ctx.maxClusters = params.maxClustersPerFrame > 0
                           ? std::size_t(params.maxClustersPerFrame)
                           : std::numeric_limits<std::size_t>::max();
@@ -375,7 +377,7 @@ std::size_t selectClustersFlat(const TesseraData &data,
         }
         const float3 center(cluster.sphere[0], cluster.sphere[1], cluster.sphere[2]);
         const float radius = cluster.sphere[3];
-        if (!sphere_in_frustum(view.planes, center, radius)) {
+        if (!sphere_in_frustum(view.planes, center, radius, params.cullingMargin)) {
             continue;
         }
 

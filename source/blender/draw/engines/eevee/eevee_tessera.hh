@@ -47,6 +47,7 @@ class TesseraModule {
     int visualize_clusters = 0;
     bool tessera_enabled = true;
     float pixel_error = 1.0f;
+    float culling_margin = 2.0f;
     int view_source = 0;
     float4x4 object_mat;
     Object *ob = nullptr;

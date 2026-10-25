@@ -264,6 +264,7 @@ class TESSERA_PT_object(bpy.types.Panel):
                 prop_col.use_property_split = True
                 prop_col.use_property_decorate = False
                 prop_col.prop(tessera_props, "pixel_error", text="Pixel Error")
+                prop_col.prop(tessera_props, "culling_margin", text="Camera Margin")
                 prop_col.prop(tessera_props, "view_source", text="View Source")
                 prop_col.prop(tessera_props, "visualize_clusters")
 
@@ -300,8 +301,10 @@ class TESSERA_PT_object(bpy.types.Panel):
 
                     dist = ob.get('tessera_stat_distance', 0.0)
                     err = ob.get('tessera_stat_pixel_error', ob.get('tessera_stat_error', 1.0))
+                    margin = ob.get('tessera_stat_culling_margin', ob.get('tessera_culling_margin', 2.0))
                     t_col.label(text=f"Camera Distance: {dist:.2f} m", icon='CAMERA_DATA')
                     t_col.label(text=f"Projected Error: {err:.1f} px", icon='DRIVER_DISTANCE')
+                    t_col.label(text=f"Camera Margin: {margin:.1f} m", icon='BORDERMOVE')
 
         # State 3: No Tessera Cache Found
         else:
