@@ -622,10 +622,11 @@ BuildResult buildClusterDAG(const std::vector<BuildVertex> &verts,
             coarse.verts.resize(simplified.positions.size());
             for (size_t i = 0; i < simplified.positions.size(); ++i) {
                 coarse.verts[i].position = simplified.positions[i];
-                if (i < merged.verts.size()) {
-                    coarse.verts[i].normal = merged.verts[i].normal;
-                    coarse.verts[i].uv = merged.verts[i].uv;
-                    coarse.verts[i].tangent = merged.verts[i].tangent;
+                uint32_t orig_idx = (i < simplified.orig_indices.size()) ? simplified.orig_indices[i] : uint32_t(i);
+                if (orig_idx < merged.verts.size()) {
+                    coarse.verts[i].normal = merged.verts[orig_idx].normal;
+                    coarse.verts[i].uv = merged.verts[orig_idx].uv;
+                    coarse.verts[i].tangent = merged.verts[orig_idx].tangent;
                 }
             }
 

@@ -176,11 +176,13 @@ void main()
   vec4 base_col = material_params[mat_idx * 4u + 0u];
   vec4 props = material_params[mat_idx * 4u + 1u];
   vec4 rough_params = material_params[mat_idx * 4u + 2u];
+  vec4 extra_params = material_params[mat_idx * 4u + 3u];
   bool has_d = (props.x > 0.5);
   bool has_n = (props.y > 0.5);
   bool has_r = (props.z > 0.5);
   float spec_level = props.w;
   float metallic = base_col.w;
+  float is_srgb = extra_params.x;
 
   float rough_val = rough_params.x;
   float rough_gamma = rough_params.y;
@@ -219,6 +221,14 @@ void main()
     tex_rough = tex_rough * rough_scale + rough_offset;
   }
 
+  if (has_d && is_srgb > 0.5) {
+    vec3 srgb = max(tex_diff.rgb, vec3(0.0));
+    vec3 linear_c = mix(srgb / 12.92,
+                        pow((srgb + 0.055) / 1.055, vec3(2.4)),
+                        step(vec3(0.04045), srgb));
+    tex_diff.rgb = linear_c;
+  }
+
   vec4 albedo = has_d ? tex_diff : vec4(base_col.rgb, 1.0);
   float roughness = clamp(has_r ? tex_rough : rough_val, 0.001, 1.0);
 
@@ -236,6 +246,15 @@ void main()
 
   vec3 n_mapped = tex_norm * 2.0 - 1.0;
   vec3 shaded_nor = has_n ? normalize(TBN * n_mapped) : N;
+
+  /* Normal derivative anti-aliasing across cluster seams */
+  vec3 dNdx = dFdx(shaded_nor);
+  vec3 dNdy = dFdy(shaded_nor);
+  float dN_len = length(dNdx) + length(dNdy);
+  if (dN_len > 0.35) {
+    vec3 smoothed_nor = normalize(shaded_nor - 0.25 * (dNdx + dNdy));
+    shaded_nor = normalize(mix(shaded_nor, smoothed_nor, clamp((dN_len - 0.35) * 2.0, 0.0, 0.5)));
+  }
 
   /* Headlight / camera lighting with specular highlight */
   vec3 light_dir = normalize(camera_pos - pos);
@@ -343,11 +362,13 @@ void main()
   vec4 base_col = material_params[mat_idx * 4u + 0u];
   vec4 props = material_params[mat_idx * 4u + 1u];
   vec4 rough_params = material_params[mat_idx * 4u + 2u];
+  vec4 extra_params = material_params[mat_idx * 4u + 3u];
   bool has_d = (props.x > 0.5);
   bool has_n = (props.y > 0.5);
   bool has_r = (props.z > 0.5);
   float spec_level = props.w;
   float metallic = base_col.w;
+  float is_srgb = extra_params.x;
 
   float rough_val = rough_params.x;
   float rough_gamma = rough_params.y;
@@ -386,6 +407,14 @@ void main()
     tex_rough = tex_rough * rough_scale + rough_offset;
   }
 
+  if (has_d && is_srgb > 0.5) {
+    vec3 srgb = max(tex_diff.rgb, vec3(0.0));
+    vec3 linear_c = mix(srgb / 12.92,
+                        pow((srgb + 0.055) / 1.055, vec3(2.4)),
+                        step(vec3(0.04045), srgb));
+    tex_diff.rgb = linear_c;
+  }
+
   vec4 albedo = has_d ? tex_diff : vec4(base_col.rgb, 1.0);
   float roughness = clamp(has_r ? tex_rough : rough_val, 0.001, 1.0);
 
@@ -406,6 +435,15 @@ void main()
 
   vec3 n_mapped = tex_norm * 2.0 - 1.0;
   vec3 shaded_nor = has_n ? normalize(TBN * n_mapped) : N;
+
+  /* Normal derivative anti-aliasing across cluster seams */
+  vec3 dNdx = dFdx(shaded_nor);
+  vec3 dNdy = dFdy(shaded_nor);
+  float dN_len = length(dNdx) + length(dNdy);
+  if (dN_len > 0.35) {
+    vec3 smoothed_nor = normalize(shaded_nor - 0.25 * (dNdx + dNdy));
+    shaded_nor = normalize(mix(shaded_nor, smoothed_nor, clamp((dN_len - 0.35) * 2.0, 0.0, 0.5)));
+  }
 
   uint geo_norm_bits = geometry_normal_pack(world_nor, shaded_nor);
   uint header = 0x31u | geo_norm_bits;
@@ -909,7 +947,7 @@ void TesseraVisibilityPass::render(gpu::StorageBuf *command_buf,
             mat_params[s * 16 + 9] = m.roughness_gamma;
             mat_params[s * 16 + 10] = m.roughness_scale;
             mat_params[s * 16 + 11] = m.roughness_offset;
-            mat_params[s * 16 + 12] = 0.0f;
+            mat_params[s * 16 + 12] = m.diffuse_is_srgb ? 1.0f : 0.0f;
             mat_params[s * 16 + 13] = 0.0f;
             mat_params[s * 16 + 14] = 0.0f;
             mat_params[s * 16 + 15] = 0.0f;
@@ -1128,7 +1166,7 @@ void TesseraVisibilityPass::render_gbuffer(gpu::StorageBuf *command_buf,
             mat_params[s * 16 + 9] = m.roughness_gamma;
             mat_params[s * 16 + 10] = m.roughness_scale;
             mat_params[s * 16 + 11] = m.roughness_offset;
-            mat_params[s * 16 + 12] = 0.0f;
+            mat_params[s * 16 + 12] = m.diffuse_is_srgb ? 1.0f : 0.0f;
             mat_params[s * 16 + 13] = 0.0f;
             mat_params[s * 16 + 14] = 0.0f;
             mat_params[s * 16 + 15] = 0.0f;

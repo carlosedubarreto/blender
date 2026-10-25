@@ -56,7 +56,9 @@ def _tag_tessera_redraw(self, context):
 def _enabled_update(self, context):
     self.id_data["tessera_enabled"] = int(self.enabled)
     if "tessera_culling_margin" not in self.id_data:
-        self.id_data["tessera_culling_margin"] = float(getattr(self, "culling_margin", 2.0))
+        self.id_data["tessera_culling_margin"] = float(getattr(self, "culling_margin", 0.02))
+    if "tessera_view_source" not in self.id_data:
+        self.id_data["tessera_view_source"] = int(getattr(self, "use_camera_view", False))
     if self.enabled:
         import os
         nc2 = self.id_data.get("tessera_nc2")
@@ -84,7 +86,19 @@ def _culling_margin_update(self, context):
 
 
 def _view_source_update(self, context):
-    self.id_data["tessera_view_source"] = int(self.view_source == 'CAMERA')
+    val = (self.view_source == 'CAMERA')
+    self.id_data["tessera_view_source"] = int(val)
+    if self.use_camera_view != val:
+        self.use_camera_view = val
+    _tag_tessera_redraw(self, context)
+
+
+def _use_camera_view_update(self, context):
+    val = self.use_camera_view
+    self.id_data["tessera_view_source"] = int(val)
+    target_enum = 'CAMERA' if val else 'VIEWPORT'
+    if self.view_source != target_enum:
+        self.view_source = target_enum
     _tag_tessera_redraw(self, context)
 
 
@@ -163,16 +177,24 @@ class TesseraProperties(bpy.types.PropertyGroup):
         update=_pixel_error_update,
     )
 
-    # Frustum culling margin: distance in meters to keep clusters active beyond camera borders.
+    # Frustum culling margin: distance in units to keep clusters active beyond camera borders.
     culling_margin: FloatProperty(
         name="Camera Margin",
-        description="Distance in meters to keep clusters active beyond camera view borders "
+        description="Distance in units to keep clusters active beyond camera view borders "
                     "(prevents edge popping during panning or off-screen shadows)",
-        default=2.0,
+        default=0.02,
         min=0.0,
-        soft_max=50.0,
+        soft_max=10.0,
         unit='LENGTH',
         update=_culling_margin_update,
+    )
+
+    # Camera LOD toggle: True locks LOD and culling to the active scene camera.
+    use_camera_view: BoolProperty(
+        name="Use Camera View",
+        description="Lock cluster LOD and culling calculation to the active scene camera",
+        default=False,
+        update=_use_camera_view_update,
     )
 
     # LOD view source: which view drives the screen-space error test.

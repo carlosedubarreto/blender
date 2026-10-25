@@ -39,7 +39,7 @@ struct TesseraTelemetry {
     uint32_t total_triangles = 0;
     float cam_distance = 0.0f;
     float pixel_error = 1.0f;
-    float culling_margin = 0.0f;
+    float culling_margin = 0.02f;
 };
 
 struct TesseraMaterialTextures {
@@ -56,6 +56,7 @@ struct TesseraMaterialTextures {
     bool has_diffuse = false;
     bool has_normal = false;
     bool has_roughness = false;
+    bool diffuse_is_srgb = true;
 };
 
 struct TesseraRawVertex {
@@ -176,7 +177,7 @@ struct TesseraLodParams
     /** Maximum number of clusters to draw per frame. 0 = unlimited. */
     uint32_t maxClustersPerFrame = 0;
     /** Camera frustum margin in meters / scene units. Extends culling boundaries outward. */
-    float cullingMargin = 0.0f;
+    float cullingMargin = 0.02f;
 };
 
 /**

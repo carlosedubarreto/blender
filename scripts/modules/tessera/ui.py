@@ -17,6 +17,16 @@ from gpu_extras.batch import batch_for_shader
 _hud_handler = None
 
 
+def is_viewport_in_camera_view(context):
+    """Check whether the active 3D Viewport is currently looking through the camera."""
+    space = getattr(context, "space_data", None)
+    if space and getattr(space, "type", None) == 'VIEW_3D':
+        rv3d = getattr(space, "region_3d", None)
+        if rv3d and getattr(rv3d, "view_perspective", None) == 'CAMERA':
+            return True
+    return False
+
+
 def draw_tessera_hud():
     """Render on-screen viewport HUD overlay for active Tessera object."""
     if bpy.app.background:
@@ -265,8 +275,33 @@ class TESSERA_PT_object(bpy.types.Panel):
                 prop_col.use_property_decorate = False
                 prop_col.prop(tessera_props, "pixel_error", text="Pixel Error")
                 prop_col.prop(tessera_props, "culling_margin", text="Camera Margin")
-                prop_col.prop(tessera_props, "view_source", text="View Source")
                 prop_col.prop(tessera_props, "visualize_clusters")
+
+                # Camera View toggle button with dynamic alert state
+                in_cam_perspective = is_viewport_in_camera_view(context)
+                is_cam_lod_active = (ob.get("tessera_view_source", 0) == 1)
+
+                cam_row = layout.row(align=True)
+                if in_cam_perspective and not is_cam_lod_active:
+                    cam_row.alert = True
+                    cam_row.prop(
+                        tessera_props,
+                        "use_camera_view",
+                        text="Enable Camera LOD (Numpad 0 Active)",
+                        icon='CAMERA_DATA',
+                        toggle=True
+                    )
+                else:
+                    cam_row.alert = False
+                    btn_text = "Camera LOD: Active" if is_cam_lod_active else "Camera LOD: Viewport"
+                    btn_icon = 'CHECKBOX_HLT' if is_cam_lod_active else 'CAMERA_DATA'
+                    cam_row.prop(
+                        tessera_props,
+                        "use_camera_view",
+                        text=btn_text,
+                        icon=btn_icon,
+                        toggle=True
+                    )
 
                 # Realtime Telemetry Sub-Panel
                 t_box = layout.box()

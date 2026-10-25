@@ -57,7 +57,7 @@ bool TesseraRenderer::init()
     // Reserve a large static capacity for indirect draw commands.
     // Each command is a DrawArraysIndirectCommand (4 x uint32).
     const size_t byteSize = sizeof(uint32_t) * 4 * kDrawCommandCapacity;
-    mDrawBuffer = GPU_storagebuf_create(byteSize);
+    mDrawBuffer = GPU_storagebuf_create_ex(byteSize, nullptr, GPU_USAGE_DYNAMIC, "tessera_draw_commands");
     if (mDrawBuffer == nullptr) {
         return false;
     }

@@ -171,9 +171,9 @@ static float tessera_culling_margin_get(Object *ob)
 {
   const IDProperty *prop = tessera_property_find(ob, "tessera_culling_margin");
   if (prop == nullptr) {
-    return 2.0f;
+    return 0.02f;
   }
-  float value = 2.0f;
+  float value = 0.02f;
   if (prop->type == IDP_DOUBLE) {
     value = float(IDP_double_get(prop));
   }
@@ -641,12 +641,18 @@ static RoughnessResult tessera_trace_roughness(const bNodeSocket *start_sock,
   return res;
 }
 
-static gpu::Texture *tessera_trace_texture(const bNodeSocket *start_sock,
-                                           const bNode *start_node,
-                                           const bNodeTree *start_tree,
-                                           const bNode *outer_group,
-                                           const bNodeTree *outer_tree)
+struct TextureTraceResult {
+  gpu::Texture *tex = nullptr;
+  bool is_srgb = true;
+};
+
+static TextureTraceResult tessera_trace_texture(const bNodeSocket *start_sock,
+                                                const bNode *start_node,
+                                                const bNodeTree *start_tree,
+                                                const bNode *outer_group,
+                                                const bNodeTree *outer_tree)
 {
+  TextureTraceResult res;
   const bNodeSocket *curr_sock = start_sock;
   const bNode *curr_node = start_node;
   const bNodeTree *curr_tree = start_tree;
@@ -662,7 +668,21 @@ static gpu::Texture *tessera_trace_texture(const bNodeSocket *start_sock,
     const bNodeSocket *from_sock = link->fromsock;
 
     if (from_node->type_legacy == SH_NODE_TEX_IMAGE) {
-      return tessera_get_gpu_texture(from_node);
+      res.tex = tessera_get_gpu_texture(from_node);
+      if (from_node->id != nullptr) {
+        blender::Image *ima = reinterpret_cast<blender::Image *>(from_node->id);
+        if (ima->colorspace_settings.name[0] != '\0') {
+          const char *cs = ima->colorspace_settings.name;
+          if (BLI_strcaseeq(cs, "Non-Color") ||
+              BLI_strcaseeq(cs, "Linear") ||
+              BLI_strcaseeq(cs, "Linear CIE-XYZ D65") ||
+              BLI_strcaseeq(cs, "Linear Rec.709") ||
+              BLI_strcaseeq(cs, "Raw")) {
+            res.is_srgb = false;
+          }
+        }
+      }
+      return res;
     }
     if (from_node->type_legacy == SH_NODE_BUMP) {
       curr_sock = tessera_find_node_socket(from_node, SOCK_IN, "Normal");
@@ -673,6 +693,18 @@ static gpu::Texture *tessera_trace_texture(const bNodeSocket *start_sock,
       curr_sock = tessera_find_node_socket(from_node, SOCK_IN, "Color");
       curr_node = from_node;
       continue;
+    }
+    if (from_node->type_legacy == SH_NODE_CURVE_RGB ||
+        from_node->type_legacy == SH_NODE_VALTORGB ||
+        from_node->type_legacy == SH_NODE_HUE_SAT) {
+      const bNodeSocket *in_sock = tessera_find_node_socket(from_node, SOCK_IN, "Color");
+      if (in_sock == nullptr) in_sock = tessera_find_node_socket(from_node, SOCK_IN, "Image");
+      if (in_sock == nullptr) in_sock = tessera_find_node_socket(from_node, SOCK_IN, "Fac");
+      if (in_sock != nullptr) {
+        curr_sock = in_sock;
+        curr_node = from_node;
+        continue;
+      }
     }
     if (from_node->type_legacy == SH_NODE_MIX || from_node->type_legacy == SH_NODE_MIX_RGB_LEGACY) {
       const bNodeSocket *a_sock = tessera_find_node_socket(from_node, SOCK_IN, "A");
@@ -702,7 +734,7 @@ static gpu::Texture *tessera_trace_texture(const bNodeSocket *start_sock,
     }
     break;
   }
-  return nullptr;
+  return res;
 }
 
 static std::vector<tessera::TesseraMaterialTextures> tessera_extract_materials(Object *ob)
@@ -757,10 +789,11 @@ static std::vector<tessera::TesseraMaterialTextures> tessera_extract_materials(O
       const bNodeSocket *c_sock = tessera_find_node_socket(pnode, SOCK_IN, "Base Color");
       if (c_sock != nullptr) {
         if (c_sock->flag & SOCK_IS_LINKED) {
-          gpu::Texture *tex = tessera_trace_texture(c_sock, pnode, ntree, ogrp, ontree);
-          if (tex != nullptr) {
-            mat.diffuse = tex;
+          TextureTraceResult tr = tessera_trace_texture(c_sock, pnode, ntree, ogrp, ontree);
+          if (tr.tex != nullptr) {
+            mat.diffuse = tr.tex;
             mat.has_diffuse = true;
+            mat.diffuse_is_srgb = tr.is_srgb;
           }
         }
         else {
@@ -770,9 +803,9 @@ static std::vector<tessera::TesseraMaterialTextures> tessera_extract_materials(O
 
       const bNodeSocket *n_sock = tessera_find_node_socket(pnode, SOCK_IN, "Normal");
       if (n_sock != nullptr && (n_sock->flag & SOCK_IS_LINKED)) {
-        gpu::Texture *tex = tessera_trace_texture(n_sock, pnode, ntree, ogrp, ontree);
-        if (tex != nullptr) {
-          mat.normal = tex;
+        TextureTraceResult tr = tessera_trace_texture(n_sock, pnode, ntree, ogrp, ontree);
+        if (tr.tex != nullptr) {
+          mat.normal = tr.tex;
           mat.has_normal = true;
         }
       }
@@ -832,10 +865,32 @@ static std::vector<tessera::TesseraMaterialTextures> tessera_extract_materials(O
         else if (is_diff && !mat.has_diffuse) {
           mat.diffuse = tex;
           mat.has_diffuse = true;
+          blender::Image *ima = reinterpret_cast<blender::Image *>(node->id);
+          if (ima != nullptr && ima->colorspace_settings.name[0] != '\0') {
+            const char *cs = ima->colorspace_settings.name;
+            if (BLI_strcaseeq(cs, "Non-Color") ||
+                BLI_strcaseeq(cs, "Linear") ||
+                BLI_strcaseeq(cs, "Linear CIE-XYZ D65") ||
+                BLI_strcaseeq(cs, "Linear Rec.709") ||
+                BLI_strcaseeq(cs, "Raw")) {
+              mat.diffuse_is_srgb = false;
+            }
+          }
         }
         else if (!mat.has_diffuse && !is_normal && !is_rough) {
           mat.diffuse = tex;
           mat.has_diffuse = true;
+          blender::Image *ima = reinterpret_cast<blender::Image *>(node->id);
+          if (ima != nullptr && ima->colorspace_settings.name[0] != '\0') {
+            const char *cs = ima->colorspace_settings.name;
+            if (BLI_strcaseeq(cs, "Non-Color") ||
+                BLI_strcaseeq(cs, "Linear") ||
+                BLI_strcaseeq(cs, "Linear CIE-XYZ D65") ||
+                BLI_strcaseeq(cs, "Linear Rec.709") ||
+                BLI_strcaseeq(cs, "Raw")) {
+              mat.diffuse_is_srgb = false;
+            }
+          }
         }
       }
     };

@@ -35,6 +35,8 @@ struct SimplifyResult {
     std::vector<float3> positions;
     /** Simplified triangle list (flat, 3 local vertex indices per triangle). */
     std::vector<uint32_t> tris;
+    /** Original vertex index in the input positions array for each local vertex. */
+    std::vector<uint32_t> orig_indices;
     /**
      * Maximum geometric error (world units) introduced by the collapses
      * performed. Zero when no collapse was possible.

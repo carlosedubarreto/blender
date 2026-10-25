@@ -89,7 +89,7 @@ class Instance : public DrawEngine {
     bool visualize_clusters = false;
     bool tessera_enabled = true;
     float pixel_error = 1.0f;
-    float culling_margin = 2.0f;
+    float culling_margin = 0.02f;
     /* LOD view source: 0 = viewport view, 1 = the scene's active camera. */
     int view_source = 0;
     bool used = false;
@@ -202,13 +202,13 @@ class Instance : public DrawEngine {
   {
     IDProperty *group = IDP_GetProperties(&ob->id);
     if (group == nullptr) {
-      return 2.0f;
+      return 0.02f;
     }
     IDProperty *prop = IDP_GetPropertyFromGroup(group, "tessera_culling_margin");
     if (prop == nullptr) {
-      return 2.0f;
+      return 0.02f;
     }
-    float value = 2.0f;
+    float value = 0.02f;
     if (prop->type == IDP_DOUBLE) {
       value = float(IDP_double_get(prop));
     }

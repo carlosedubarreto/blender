@@ -211,7 +211,7 @@ private:
     float mPixelError = 1.0f;
 
     // Camera frustum culling margin (meters).
-    float mCullingMargin = 0.0f;
+    float mCullingMargin = 0.02f;
 
     // Material-pass shading mode.
     TesseraShadingMode mShadingMode = TESSERA_SHADING_DIFFUSE;

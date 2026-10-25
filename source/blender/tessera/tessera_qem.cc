@@ -152,6 +152,8 @@ SimplifyResult simplifyTriangles(const std::vector<float3> &positions,
     to_local.reserve(tri_verts.size());
     std::vector<float3> verts;
     verts.reserve(tri_verts.size());
+    std::vector<uint32_t> orig_indices;
+    orig_indices.reserve(tri_verts.size());
     std::vector<std::array<uint32_t, 3>> tris(ntris);
     for (uint32_t t = 0; t < ntris; ++t) {
         for (int k = 0; k < 3; ++k) {
@@ -161,6 +163,7 @@ SimplifyResult simplifyTriangles(const std::vector<float3> &positions,
                 const uint32_t local = uint32_t(verts.size());
                 to_local.emplace(g, local);
                 verts.push_back(positions[g]);
+                orig_indices.push_back(g);
             }
             tris[t][k] = to_local[g];
         }
@@ -217,6 +220,33 @@ SimplifyResult simplifyTriangles(const std::vector<float3> &positions,
         Q[tv[2]].add_plane(fnorm[t].x, fnorm[t].y, fnorm[t].z, d, w);
     }
 
+    /* Add boundary plane constraints to boundary vertices to strictly preserve boundary profiles */
+    for (uint32_t t = 0; t < ntris; ++t) {
+        const auto &tv = tris[t];
+        for (int k = 0; k < 3; ++k) {
+            uint32_t u0 = tv[k];
+            uint32_t u1 = tv[(k + 1) % 3];
+            uint64_t e_key = edge_key(u0, u1);
+            if (edge_count[e_key] == 1) {
+                const float3 &p0 = verts[u0];
+                const float3 &p1 = verts[u1];
+                const float3 edge_vec = p1 - p0;
+                float elen = math::length(edge_vec);
+                if (elen > 1e-10f) {
+                    float3 b_norm = math::cross(fnorm[t], edge_vec / elen);
+                    float blen = math::length(b_norm);
+                    if (blen > 1e-10f) {
+                        b_norm /= blen;
+                        double bd = -double(math::dot(b_norm, p0));
+                        double bw = 1e8;
+                        Q[u0].add_plane(b_norm.x, b_norm.y, b_norm.z, bd, bw);
+                        Q[u1].add_plane(b_norm.x, b_norm.y, b_norm.z, bd, bw);
+                    }
+                }
+            }
+        }
+    }
+
     /* Live edge set. */
     std::unordered_set<uint64_t> live;
     live.reserve(edge_count.size());
@@ -225,13 +255,25 @@ SimplifyResult simplifyTriangles(const std::vector<float3> &positions,
     }
 
     auto edge_cost = [&](uint32_t a, uint32_t b) {
+        if (locked[a] && locked[b]) {
+            return 1e30;
+        }
         Quadric Qe = Q[a];
         Qe += Q[b];
         float3 pos;
-        if (!optimal_position(Qe, pos)) {
+        if (locked[a]) {
+            pos = verts[a];
+        }
+        else if (locked[b]) {
+            pos = verts[b];
+        }
+        else if (!optimal_position(Qe, pos)) {
             pos = (verts[a] + verts[b]) * 0.5f;
         }
-        const double cost = std::max(quadric_cost(Qe, pos), 0.0);
+        double cost = std::max(quadric_cost(Qe, pos), 0.0);
+        if (locked[a] || locked[b]) {
+            cost += 1000.0;
+        }
         return std::isfinite(cost) ? cost : 1e30;
     };
 
@@ -360,6 +402,7 @@ SimplifyResult simplifyTriangles(const std::vector<float3> &positions,
          * cluster boundary and break watertightness). */
         if (locked[b]) {
             locked[a] = 1;
+            orig_indices[a] = orig_indices[b];
         }
 
         bool ok = true;
@@ -466,6 +509,7 @@ SimplifyResult simplifyTriangles(const std::vector<float3> &positions,
     /* Collect surviving triangles in local space (positions are returned in
      * #result.positions, triangles reference it directly). */
     result.positions = std::move(verts);
+    result.orig_indices = std::move(orig_indices);
     result.tris.clear();
     result.tris.reserve(size_t(live_tris) * 3);
     for (uint32_t t = 0; t < ntris; ++t) {
