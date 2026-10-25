@@ -99,7 +99,9 @@ std::size_t selectClustersFlat(const TesseraData &data,
                                float projScaleY,
                                float viewportHeight,
                                const TesseraLodParams &params,
-                               std::vector<TesseraDrawCommand> &out);
+                               std::vector<TesseraDrawCommand> &out,
+                               const float4x4 *lodViewProj = nullptr,
+                               const float *lodProjScaleY = nullptr);
 
 /**
  * Approximate the screen-space error of a cluster in pixels.

@@ -79,6 +79,7 @@ void main()
 static const char *VIS_FRAG_SOURCE = R"(
 void main()
 {
+  gl_FragDepth = gl_FragCoord.z;
   imageStore(vis_image, ivec2(gl_FragCoord.xy),
              uvec4(tri_id, packHalf2x16(bary), cluster_id, 0u));
 }
@@ -158,7 +159,8 @@ void main()
     return;
   }
   if (shading_mode == 3u) {
-    vec3 t_norm = normalize(tan_v.xyz);
+    float t_len = length(tan_v.xyz);
+    vec3 t_norm = (t_len > 1e-6) ? (tan_v.xyz / t_len) : vec3(1.0, 0.0, 0.0);
     out_color = vec4(t_norm * 0.5 + 0.5, out_alpha);
     return;
   }
@@ -194,25 +196,39 @@ void main()
   vec3 tex_norm = vec3(0.5, 0.5, 1.0);
   float tex_rough = rough_val;
 
+  vec2 ddx_uv = dFdx(uv);
+  vec2 ddy_uv = dFdy(uv);
+  float d_tri_x = dFdx(float(tri));
+  float d_tri_y = dFdy(float(tri));
+  if (abs(d_tri_x) > 0.5) {
+    ddx_uv = vec2(0.0);
+  }
+  if (abs(d_tri_y) > 0.5) {
+    ddy_uv = vec2(0.0);
+  }
+  const float max_grad = 0.05;
+  ddx_uv = clamp(ddx_uv, vec2(-max_grad), vec2(max_grad));
+  ddy_uv = clamp(ddy_uv, vec2(-max_grad), vec2(max_grad));
+
   if (mat_idx == 0u) {
-    if (has_d) tex_diff = texture(tex_diffuse_0, uv);
-    if (has_n) tex_norm = texture(tex_normal_0, uv).xyz;
-    if (has_r) tex_rough = texture(tex_rough_0, uv).r;
+    if (has_d) tex_diff = textureGrad(tex_diffuse_0, uv, ddx_uv, ddy_uv);
+    if (has_n) tex_norm = textureGrad(tex_normal_0, uv, ddx_uv, ddy_uv).xyz;
+    if (has_r) tex_rough = textureGrad(tex_rough_0, uv, ddx_uv, ddy_uv).r;
   }
   else if (mat_idx == 1u) {
-    if (has_d) tex_diff = texture(tex_diffuse_1, uv);
-    if (has_n) tex_norm = texture(tex_normal_1, uv).xyz;
-    if (has_r) tex_rough = texture(tex_rough_1, uv).r;
+    if (has_d) tex_diff = textureGrad(tex_diffuse_1, uv, ddx_uv, ddy_uv);
+    if (has_n) tex_norm = textureGrad(tex_normal_1, uv, ddx_uv, ddy_uv).xyz;
+    if (has_r) tex_rough = textureGrad(tex_rough_1, uv, ddx_uv, ddy_uv).r;
   }
   else if (mat_idx == 2u) {
-    if (has_d) tex_diff = texture(tex_diffuse_2, uv);
-    if (has_n) tex_norm = texture(tex_normal_2, uv).xyz;
-    if (has_r) tex_rough = texture(tex_rough_2, uv).r;
+    if (has_d) tex_diff = textureGrad(tex_diffuse_2, uv, ddx_uv, ddy_uv);
+    if (has_n) tex_norm = textureGrad(tex_normal_2, uv, ddx_uv, ddy_uv).xyz;
+    if (has_r) tex_rough = textureGrad(tex_rough_2, uv, ddx_uv, ddy_uv).r;
   }
   else {
-    if (has_d) tex_diff = texture(tex_diffuse_3, uv);
-    if (has_n) tex_norm = texture(tex_normal_3, uv).xyz;
-    if (has_r) tex_rough = texture(tex_rough_3, uv).r;
+    if (has_d) tex_diff = textureGrad(tex_diffuse_3, uv, ddx_uv, ddy_uv);
+    if (has_n) tex_norm = textureGrad(tex_normal_3, uv, ddx_uv, ddy_uv).xyz;
+    if (has_r) tex_rough = textureGrad(tex_rough_3, uv, ddx_uv, ddy_uv).r;
   }
 
   if (has_r) {
@@ -225,32 +241,30 @@ void main()
   vec4 albedo = has_d ? (tex_diff * vec4(base_col.rgb, 1.0)) : vec4(base_col.rgb, 1.0);
   float roughness = clamp(has_r ? tex_rough : rough_val, 0.001, 1.0);
 
-  /* MikkTSpace normal perturbation using vertex normal nor and 4D tangent tan_v */
-  vec3 N = normalize(nor);
-  vec3 T = tan_v.xyz - N * dot(N, tan_v.xyz);
+  /* MikkTSpace normal perturbation in world space using vertex normal and 4D tangent */
+  mat3 norm_mat = transpose(inverse(mat3(model_mat)));
+  vec3 world_nor = normalize(norm_mat * nor);
+
+  vec3 m_tan = mat3(model_mat) * tan_v.xyz;
+  float m_tan_len = length(m_tan);
+  vec3 world_tan = (m_tan_len > 1e-6) ? (m_tan / m_tan_len) : vec3(1.0, 0.0, 0.0);
+
+  vec3 N = world_nor;
+  vec3 T = world_tan - N * dot(N, world_tan);
   float t_len = length(T);
-  if (t_len > 1e-6) {
-    T /= t_len;
-  } else {
-    T = vec3(1.0, 0.0, 0.0);
-  }
-  vec3 B = cross(N, T) * tan_v.w;
+  T = (t_len > 1e-6) ? (T / t_len) : vec3(1.0, 0.0, 0.0);
+
+  float handedness = (tan_v.w < 0.0) ? -1.0 : 1.0;
+  float det_sign = (determinant(mat3(model_mat)) < 0.0) ? -1.0 : 1.0;
+  vec3 B = cross(N, T) * (handedness * det_sign);
   mat3 TBN = mat3(T, B, N);
 
   vec3 n_mapped = tex_norm * 2.0 - 1.0;
   vec3 shaded_nor = has_n ? normalize(TBN * n_mapped) : N;
 
-  /* Normal derivative anti-aliasing across cluster seams */
-  vec3 dNdx = dFdx(shaded_nor);
-  vec3 dNdy = dFdy(shaded_nor);
-  float dN_len = length(dNdx) + length(dNdy);
-  if (dN_len > 0.35) {
-    vec3 smoothed_nor = normalize(shaded_nor - 0.25 * (dNdx + dNdy));
-    shaded_nor = normalize(mix(shaded_nor, smoothed_nor, clamp((dN_len - 0.35) * 2.0, 0.0, 0.5)));
-  }
-
   /* Headlight / camera lighting with specular highlight */
-  vec3 light_dir = normalize(camera_pos - pos);
+  vec3 world_pos = (model_mat * vec4(pos, 1.0)).xyz;
+  vec3 light_dir = normalize(camera_pos - world_pos);
   float NdotL = max(dot(shaded_nor, light_dir), 0.0);
 
   vec3 view_dir = light_dir;
@@ -332,6 +346,10 @@ void main()
   uint i1 = tri_indices[tri * 3u + 1u];
   uint i2 = tri_indices[tri * 3u + 2u];
 
+  vec3 p0 = vec3(positions[i0 * 3u], positions[i0 * 3u + 1u], positions[i0 * 3u + 2u]);
+  vec3 p1 = vec3(positions[i1 * 3u], positions[i1 * 3u + 1u], positions[i1 * 3u + 2u]);
+  vec3 p2 = vec3(positions[i2 * 3u], positions[i2 * 3u + 1u], positions[i2 * 3u + 2u]);
+
   vec3 n0 = vec3(normals[i0 * 3u], normals[i0 * 3u + 1u], normals[i0 * 3u + 2u]);
   vec3 n1 = vec3(normals[i1 * 3u], normals[i1 * 3u + 1u], normals[i1 * 3u + 2u]);
   vec3 n2 = vec3(normals[i2 * 3u], normals[i2 * 3u + 1u], normals[i2 * 3u + 2u]);
@@ -376,25 +394,39 @@ void main()
   vec3 tex_norm = vec3(0.5, 0.5, 1.0);
   float tex_rough = rough_val;
 
+  vec2 ddx_uv = dFdx(uv);
+  vec2 ddy_uv = dFdy(uv);
+  float d_tri_x = dFdx(float(tri));
+  float d_tri_y = dFdy(float(tri));
+  if (abs(d_tri_x) > 0.5) {
+    ddx_uv = vec2(0.0);
+  }
+  if (abs(d_tri_y) > 0.5) {
+    ddy_uv = vec2(0.0);
+  }
+  const float max_grad = 0.05;
+  ddx_uv = clamp(ddx_uv, vec2(-max_grad), vec2(max_grad));
+  ddy_uv = clamp(ddy_uv, vec2(-max_grad), vec2(max_grad));
+
   if (mat_idx == 0u) {
-    if (has_d) tex_diff = texture(tex_diffuse_0, uv);
-    if (has_n) tex_norm = texture(tex_normal_0, uv).xyz;
-    if (has_r) tex_rough = texture(tex_rough_0, uv).r;
+    if (has_d) tex_diff = textureGrad(tex_diffuse_0, uv, ddx_uv, ddy_uv);
+    if (has_n) tex_norm = textureGrad(tex_normal_0, uv, ddx_uv, ddy_uv).xyz;
+    if (has_r) tex_rough = textureGrad(tex_rough_0, uv, ddx_uv, ddy_uv).r;
   }
   else if (mat_idx == 1u) {
-    if (has_d) tex_diff = texture(tex_diffuse_1, uv);
-    if (has_n) tex_norm = texture(tex_normal_1, uv).xyz;
-    if (has_r) tex_rough = texture(tex_rough_1, uv).r;
+    if (has_d) tex_diff = textureGrad(tex_diffuse_1, uv, ddx_uv, ddy_uv);
+    if (has_n) tex_norm = textureGrad(tex_normal_1, uv, ddx_uv, ddy_uv).xyz;
+    if (has_r) tex_rough = textureGrad(tex_rough_1, uv, ddx_uv, ddy_uv).r;
   }
   else if (mat_idx == 2u) {
-    if (has_d) tex_diff = texture(tex_diffuse_2, uv);
-    if (has_n) tex_norm = texture(tex_normal_2, uv).xyz;
-    if (has_r) tex_rough = texture(tex_rough_2, uv).r;
+    if (has_d) tex_diff = textureGrad(tex_diffuse_2, uv, ddx_uv, ddy_uv);
+    if (has_n) tex_norm = textureGrad(tex_normal_2, uv, ddx_uv, ddy_uv).xyz;
+    if (has_r) tex_rough = textureGrad(tex_rough_2, uv, ddx_uv, ddy_uv).r;
   }
   else {
-    if (has_d) tex_diff = texture(tex_diffuse_3, uv);
-    if (has_n) tex_norm = texture(tex_normal_3, uv).xyz;
-    if (has_r) tex_rough = texture(tex_rough_3, uv).r;
+    if (has_d) tex_diff = textureGrad(tex_diffuse_3, uv, ddx_uv, ddy_uv);
+    if (has_n) tex_norm = textureGrad(tex_normal_3, uv, ddx_uv, ddy_uv).xyz;
+    if (has_r) tex_rough = textureGrad(tex_rough_3, uv, ddx_uv, ddy_uv).r;
   }
 
   if (has_r) {
@@ -409,32 +441,36 @@ void main()
 
   mat3 norm_mat = transpose(inverse(mat3(model_mat)));
   vec3 world_nor = normalize(norm_mat * nor);
-  vec3 world_tan = normalize(mat3(model_mat) * tan_v.xyz);
+
+  vec3 m_tan = mat3(model_mat) * tan_v.xyz;
+  float m_tan_len = length(m_tan);
+  vec3 world_tan = (m_tan_len > 1e-6) ? (m_tan / m_tan_len) : vec3(1.0, 0.0, 0.0);
 
   vec3 N = world_nor;
   vec3 T = world_tan - N * dot(N, world_tan);
   float t_len = length(T);
-  if (t_len > 1e-6) {
-    T /= t_len;
-  } else {
-    T = vec3(1.0, 0.0, 0.0);
-  }
-  vec3 B = cross(N, T) * tan_v.w;
+  T = (t_len > 1e-6) ? (T / t_len) : vec3(1.0, 0.0, 0.0);
+
+  float handedness = (tan_v.w < 0.0) ? -1.0 : 1.0;
+  float det_sign = (determinant(mat3(model_mat)) < 0.0) ? -1.0 : 1.0;
+  vec3 B = cross(N, T) * (handedness * det_sign);
   mat3 TBN = mat3(T, B, N);
 
   vec3 n_mapped = tex_norm * 2.0 - 1.0;
   vec3 shaded_nor = has_n ? normalize(TBN * n_mapped) : N;
 
-  /* Normal derivative anti-aliasing across cluster seams */
-  vec3 dNdx = dFdx(shaded_nor);
-  vec3 dNdy = dFdy(shaded_nor);
-  float dN_len = length(dNdx) + length(dNdy);
-  if (dN_len > 0.35) {
-    vec3 smoothed_nor = normalize(shaded_nor - 0.25 * (dNdx + dNdy));
-    shaded_nor = normalize(mix(shaded_nor, smoothed_nor, clamp((dN_len - 0.35) * 2.0, 0.0, 0.5)));
+  /* True geometric normal of the triangle in world space for EEVEE shadow/grazing biasing */
+  vec3 world_p0 = (model_mat * vec4(p0, 1.0)).xyz;
+  vec3 world_p1 = (model_mat * vec4(p1, 1.0)).xyz;
+  vec3 world_p2 = (model_mat * vec4(p2, 1.0)).xyz;
+  vec3 world_geo_n = cross(world_p1 - world_p0, world_p2 - world_p0);
+  float geo_len = length(world_geo_n);
+  world_geo_n = (geo_len > 1e-12) ? (world_geo_n / geo_len) : world_nor;
+  if (dot(world_geo_n, world_nor) < 0.0) {
+    world_geo_n = -world_geo_n;
   }
 
-  uint geo_norm_bits = geometry_normal_pack(world_nor, shaded_nor);
+  uint geo_norm_bits = geometry_normal_pack(world_geo_n, shaded_nor);
   uint header = 0x31u | geo_norm_bits;
 
   float f0 = mix(0.08 * spec_level, 1.0, metallic);
@@ -478,8 +514,10 @@ gpu::Shader *createVisShader()
 
     ShaderCreateInfo info("pyGPU_Shader");
     info.builtins_ |= BuiltinBits::NO_BUFFER_TYPE_LINTING;
+    info.builtins_ |= BuiltinBits::CLIP_CONTROL;
 
     info.early_fragment_test(true);
+    info.depth_write(DepthWrite::UNCHANGED);
     info.vertex_source("tessera_vis");
     info.vertex_source_generated = VIS_VERT_SOURCE;
     info.fragment_source("tessera_vis");
@@ -518,6 +556,7 @@ gpu::Shader *createMaterialShader()
 
     ShaderCreateInfo info("pyGPU_Shader");
     info.builtins_ |= BuiltinBits::NO_BUFFER_TYPE_LINTING;
+    info.builtins_ |= BuiltinBits::CLIP_CONTROL;
 
     info.vertex_source("tessera_material");
     info.vertex_source_generated = MATERIAL_VERT_SOURCE;
@@ -554,6 +593,7 @@ gpu::Shader *createMaterialShader()
     info.sampler(12, ImageType::Float2D, "tex_normal_3");
     info.sampler(13, ImageType::Float2D, "tex_rough_3");
 
+    info.push_constant(Type::float4x4_t, "model_mat");
     info.push_constant(Type::float3_t, "camera_pos");
     info.push_constant(Type::int_t, "shading_mode");
     info.push_constant(Type::int_t, "reverse_z");
@@ -569,6 +609,7 @@ gpu::Shader *createDepthPrepassShader()
 
     ShaderCreateInfo info("pyGPU_Shader");
     info.builtins_ |= BuiltinBits::NO_BUFFER_TYPE_LINTING;
+    info.builtins_ |= BuiltinBits::CLIP_CONTROL;
 
     info.vertex_source("tessera_depth_prepass");
     info.vertex_source_generated = DEPTH_VERT_SOURCE;
@@ -593,6 +634,7 @@ gpu::Shader *createGbufferShader()
 
     ShaderCreateInfo info("pyGPU_Shader");
     info.builtins_ |= BuiltinBits::NO_BUFFER_TYPE_LINTING;
+    info.builtins_ |= BuiltinBits::CLIP_CONTROL;
 
     info.vertex_source("tessera_gbuffer");
     info.vertex_source_generated = MATERIAL_VERT_SOURCE;
@@ -866,6 +908,7 @@ void TesseraVisibilityPass::render(gpu::StorageBuf *command_buf,
     /* ---------------- Pass 1: visibility ---------------- */
     GPU_framebuffer_bind(mFrameBuffer);
     GPU_framebuffer_clear_depth(mFrameBuffer, reverse_z ? 0.0f : 1.0f);
+    GPU_clip_control_unit_range(reverse_z);
     GPU_depth_test(reverse_z ? GPU_DEPTH_GREATER_EQUAL : GPU_DEPTH_LESS_EQUAL);
     GPU_depth_mask(true);
     GPU_face_culling(GPU_CULL_NONE);
@@ -906,6 +949,7 @@ void TesseraVisibilityPass::render(gpu::StorageBuf *command_buf,
 
     /* ---------------- Pass 2: material ---------------- */
     GPU_framebuffer_bind(previous_fb != nullptr ? previous_fb : mFrameBuffer);
+    GPU_clip_control_unit_range(reverse_z);
     GPU_depth_test(reverse_z ? GPU_DEPTH_GREATER_EQUAL : GPU_DEPTH_LESS_EQUAL);
     GPU_depth_mask(true);
     GPU_blend(GPU_BLEND_NONE);
@@ -988,6 +1032,7 @@ void TesseraVisibilityPass::render(gpu::StorageBuf *command_buf,
         GPU_texture_bind(tr, 2 + s * 3 + 2);
     }
 
+    GPU_shader_uniform_mat4(mMaterialShader, "model_mat", object_model.ptr());
     GPU_shader_uniform_3f(
         mMaterialShader, "camera_pos", cam_pos.x, cam_pos.y, cam_pos.z);
     GPU_shader_uniform_1i(mMaterialShader, "shading_mode", shading_mode);
@@ -1020,6 +1065,7 @@ void TesseraVisibilityPass::render_depth_prepass(gpu::StorageBuf *command_buf,
         }
     }
 
+    GPU_clip_control_unit_range(reverse_z);
     GPU_depth_test(reverse_z ? GPU_DEPTH_GREATER_EQUAL : GPU_DEPTH_LESS_EQUAL);
     GPU_depth_mask(true);
     GPU_color_mask(false, false, false, false);
@@ -1088,6 +1134,7 @@ void TesseraVisibilityPass::render_gbuffer(gpu::StorageBuf *command_buf,
     /* ---------------- Pass 1: visibility ---------------- */
     GPU_framebuffer_bind(mFrameBuffer);
     GPU_framebuffer_clear_depth(mFrameBuffer, reverse_z ? 0.0f : 1.0f);
+    GPU_clip_control_unit_range(reverse_z);
     GPU_depth_test(reverse_z ? GPU_DEPTH_GREATER_EQUAL : GPU_DEPTH_LESS_EQUAL);
     GPU_depth_mask(true);
     GPU_face_culling(GPU_CULL_NONE);
@@ -1125,6 +1172,7 @@ void TesseraVisibilityPass::render_gbuffer(gpu::StorageBuf *command_buf,
 
     /* ---------------- Pass 2: G-Buffer output ---------------- */
     GPU_framebuffer_bind(target_gbuffer_fb);
+    GPU_clip_control_unit_range(reverse_z);
     GPU_depth_test(reverse_z ? GPU_DEPTH_GREATER_EQUAL : GPU_DEPTH_LESS_EQUAL);
     GPU_depth_mask(true);
     GPU_blend(GPU_BLEND_NONE);

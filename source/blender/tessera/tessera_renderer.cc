@@ -186,18 +186,20 @@ void TesseraRenderer::update(const TesseraData &data,
         }
     }
     if (mTraverseShader != nullptr) {
-        updateWithGpuTraversal(data, lod_vp, lod_scale_y, viewportHeight);
+        updateWithGpuTraversal(data, viewProj, projScaleY, viewportHeight, lodViewProj, lodProjScaleY);
     }
     else {
         mGpuPathFailed = true;
-        updateWithCpuTraversal(data, lod_vp, lod_scale_y, viewportHeight);
+        updateWithCpuTraversal(data, viewProj, projScaleY, viewportHeight, lodViewProj, lodProjScaleY);
     }
 }
 
 void TesseraRenderer::updateWithGpuTraversal(const TesseraData &data,
                                             const float4x4 &viewProj,
                                             float projScaleY,
-                                            float viewportHeight)
+                                            float viewportHeight,
+                                            const float4x4 *lodViewProj,
+                                            const float *lodProjScaleY)
 {
     const size_t clusterCount = data.clusters.size();
 
@@ -262,7 +264,10 @@ void TesseraRenderer::updateWithGpuTraversal(const TesseraData &data,
         GPU_storagebuf_clear_to_zero(mCounterBuf);
     }
 
-    const TesseraViewInfo view = getViewInfo(viewProj, viewportHeight, projScaleY);
+    const TesseraViewInfo draw_view = getViewInfo(viewProj, viewportHeight, projScaleY);
+    const TesseraViewInfo lod_view = (lodViewProj != nullptr) ?
+        getViewInfo(*lodViewProj, viewportHeight, (lodProjScaleY != nullptr) ? *lodProjScaleY : projScaleY) :
+        draw_view;
 
     GPU_shader_bind(mTraverseShader);
     GPU_storagebuf_bind(mSphereBuf, 0);
@@ -273,10 +278,10 @@ void TesseraRenderer::updateWithGpuTraversal(const TesseraData &data,
     GPU_storagebuf_bind(mCounterBuf, 5);
     GPU_storagebuf_bind(mMaterialsBuf, 6);
 
-    GPU_shader_uniform_3f(mTraverseShader, "camera_pos", view.camPos.x,
-                          view.camPos.y, view.camPos.z);
+    GPU_shader_uniform_3f(mTraverseShader, "camera_pos", lod_view.camPos.x,
+                          lod_view.camPos.y, lod_view.camPos.z);
     GPU_shader_uniform_1f(mTraverseShader, "viewport_height", viewportHeight);
-    GPU_shader_uniform_1f(mTraverseShader, "proj_scale_y", view.projScaleY);
+    GPU_shader_uniform_1f(mTraverseShader, "proj_scale_y", lod_view.projScaleY);
     GPU_shader_uniform_1f(mTraverseShader, "pixel_error", mPixelError);
     GPU_shader_uniform_1f(mTraverseShader, "culling_margin", mCullingMargin);
     GPU_shader_uniform_1i(mTraverseShader, "cluster_count", int(clusterCount));
@@ -287,7 +292,7 @@ void TesseraRenderer::updateWithGpuTraversal(const TesseraData &data,
     GPU_shader_uniform_1i(mTraverseShader, "max_commands_per_material", int(mMaxCommandsPerMaterial));
     GPU_shader_uniform_1i(mTraverseShader, "record_telemetry", mTelemetryEnabled ? 1 : 0);
     GPU_shader_uniform_4fv_array(mTraverseShader, "frustum_planes", 6,
-                                 view.planes);
+                                 draw_view.planes);
 
     const uint32_t group_size = 64;
     const uint32_t groups = uint32_t((clusterCount + group_size - 1) / group_size);
@@ -324,7 +329,9 @@ void TesseraRenderer::updateWithGpuTraversal(const TesseraData &data,
 void TesseraRenderer::updateWithCpuTraversal(const TesseraData &data,
                                             const float4x4 &viewProj,
                                             float projScaleY,
-                                            float viewportHeight)
+                                            float viewportHeight,
+                                            const float4x4 *lodViewProj,
+                                            const float *lodProjScaleY)
 {
     uint32_t max_materials = 1;
     for (const TesseraCluster &c : data.clusters) {
@@ -337,7 +344,10 @@ void TesseraRenderer::updateWithCpuTraversal(const TesseraData &data,
     mMaxCommandsPerMaterial = uint32_t(kDrawCommandCapacity / max_materials);
     mMaterialDrawCounts.assign(max_materials, 0);
 
-    const TesseraViewInfo view = getViewInfo(viewProj, viewportHeight, projScaleY);
+    const TesseraViewInfo draw_view = getViewInfo(viewProj, viewportHeight, projScaleY);
+    const TesseraViewInfo lod_view = (lodViewProj != nullptr) ?
+        getViewInfo(*lodViewProj, viewportHeight, (lodProjScaleY != nullptr) ? *lodProjScaleY : projScaleY) :
+        draw_view;
     std::vector<TesseraCluster> selected;
 
     for (uint32_t ci = 0; ci < uint32_t(data.clusters.size()); ++ci) {
@@ -347,23 +357,23 @@ void TesseraRenderer::updateWithCpuTraversal(const TesseraData &data,
         }
         const float3 center(cluster.sphere[0], cluster.sphere[1], cluster.sphere[2]);
         const float radius = cluster.sphere[3];
-        if (!sphere_in_frustum(view.planes, center, radius, mCullingMargin)) {
+        if (!sphere_in_frustum(draw_view.planes, center, radius, mCullingMargin)) {
             continue;
         }
 
         const float err_c = (cluster.error <= 0.0f)
             ? 0.0f
             : projectedErrorPx(center, radius, cluster.error,
-                               view.camPos, viewportHeight, view.projScaleY,
-                               view.orthographic);
+                               lod_view.camPos, viewportHeight, lod_view.projScaleY,
+                               lod_view.orthographic);
 
         const float3 pcenter(cluster.parentSphere[0], cluster.parentSphere[1], cluster.parentSphere[2]);
         const float pradius = cluster.parentSphere[3];
         const float err_p = (cluster.parentError >= 1e38f)
             ? std::numeric_limits<float>::max()
             : projectedErrorPx(pcenter, pradius, cluster.parentError,
-                               view.camPos, viewportHeight, view.projScaleY,
-                               view.orthographic);
+                               lod_view.camPos, viewportHeight, lod_view.projScaleY,
+                               lod_view.orthographic);
 
         if (err_c <= mPixelError && err_p > mPixelError) {
             uint32_t mat = (max_materials > 1) ? cluster.materialIndex : 0;

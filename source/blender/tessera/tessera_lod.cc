@@ -350,7 +350,9 @@ std::size_t selectClustersFlat(const TesseraData &data,
                                float projScaleY,
                                float viewportHeight,
                                const TesseraLodParams &params,
-                               std::vector<TesseraDrawCommand> &out)
+                               std::vector<TesseraDrawCommand> &out,
+                               const float4x4 *lodViewProj,
+                               const float *lodProjScaleY)
 {
     /* Fully parallelizable variant of the traversal rule: a cluster is drawn
      * when it has no children, or when the error of its coarser parent
@@ -362,7 +364,11 @@ std::size_t selectClustersFlat(const TesseraData &data,
         return 0;
     }
 
-    const TesseraViewInfo view = getViewInfo(viewProj, viewportHeight, projScaleY);
+    const TesseraViewInfo draw_view = getViewInfo(viewProj, viewportHeight, projScaleY);
+    const TesseraViewInfo lod_view = (lodViewProj != nullptr) ?
+        getViewInfo(*lodViewProj, viewportHeight, (lodProjScaleY != nullptr) ? *lodProjScaleY : projScaleY) :
+        draw_view;
+
     const std::size_t maxClusters = params.maxClustersPerFrame > 0
                                         ? std::size_t(params.maxClustersPerFrame)
                                         : std::numeric_limits<std::size_t>::max();
@@ -377,7 +383,7 @@ std::size_t selectClustersFlat(const TesseraData &data,
         }
         const float3 center(cluster.sphere[0], cluster.sphere[1], cluster.sphere[2]);
         const float radius = cluster.sphere[3];
-        if (!sphere_in_frustum(view.planes, center, radius, params.cullingMargin)) {
+        if (!sphere_in_frustum(draw_view.planes, center, radius, params.cullingMargin)) {
             continue;
         }
 
@@ -388,16 +394,16 @@ std::size_t selectClustersFlat(const TesseraData &data,
         const float err_c = (cluster.error <= 0.0f)
             ? 0.0f
             : projectedErrorPx(center, radius, cluster.error,
-                               view.camPos, viewportHeight, view.projScaleY,
-                               view.orthographic);
+                               lod_view.camPos, viewportHeight, lod_view.projScaleY,
+                               lod_view.orthographic);
 
         const float3 pcenter(cluster.parentSphere[0], cluster.parentSphere[1], cluster.parentSphere[2]);
         const float pradius = cluster.parentSphere[3];
         const float err_p = (cluster.parentError >= 1e38f)
             ? std::numeric_limits<float>::max()
             : projectedErrorPx(pcenter, pradius, cluster.parentError,
-                               view.camPos, viewportHeight, view.projScaleY,
-                               view.orthographic);
+                               lod_view.camPos, viewportHeight, lod_view.projScaleY,
+                               lod_view.orthographic);
 
         if (err_c <= params.pixelError && err_p > params.pixelError) {
             if (emitted >= maxClusters) {

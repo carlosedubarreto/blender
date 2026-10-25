@@ -146,13 +146,17 @@ private:
     void updateWithCpuTraversal(const TesseraData &data,
                                 const float4x4 &viewProj,
                                 float projScaleY,
-                                float viewportHeight);
+                                float viewportHeight,
+                                const float4x4 *lodViewProj = nullptr,
+                                const float *lodProjScaleY = nullptr);
 
     /** GPU path: upload cluster data (if changed), dispatch, read back count. */
     void updateWithGpuTraversal(const TesseraData &data,
                                 const float4x4 &viewProj,
                                 float projScaleY,
-                                float viewportHeight);
+                                float viewportHeight,
+                                const float4x4 *lodViewProj = nullptr,
+                                const float *lodProjScaleY = nullptr);
 
     /** (Re)create or resize one SSBO to at least \a byteSize. */
     bool ensureStorageBuf(gpu::StorageBuf **buf, size_t byteSize, const char *name);
