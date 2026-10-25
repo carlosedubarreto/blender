@@ -47,7 +47,11 @@ struct TesseraMaterialTextures {
     gpu::Texture *roughness = nullptr;
     float4 base_color = float4(0.8f, 0.8f, 0.8f, 1.0f);
     float roughness_value = 0.5f;
+    float roughness_gamma = 1.0f;
+    float roughness_scale = 1.0f;
+    float roughness_offset = 0.0f;
     float metallic_value = 0.0f;
+    float specular_value = 0.5f;
     bool has_diffuse = false;
     bool has_normal = false;
     bool has_roughness = false;

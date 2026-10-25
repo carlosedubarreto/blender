@@ -343,6 +343,348 @@ static bool tessera_camera_persmat(const Scene *scene,
   return true;
 }
 
+static const bNodeLink *tessera_find_link_to_socket(const bNodeTree *ntree,
+                                                    const bNode *tonode,
+                                                    const bNodeSocket *tosock)
+{
+  if (ntree == nullptr || tonode == nullptr || tosock == nullptr) {
+    return nullptr;
+  }
+  for (const bNodeLink *link = static_cast<const bNodeLink *>(ntree->links.first);
+       link != nullptr;
+       link = link->next)
+  {
+    if (link->tonode == tonode && link->tosock == tosock) {
+      return link;
+    }
+  }
+  return nullptr;
+}
+
+static const bNodeSocket *tessera_find_node_socket(const bNode *node, int in_out, const char *name)
+{
+  if (node == nullptr) {
+    return nullptr;
+  }
+  const ListBase *sockets = (in_out == SOCK_IN) ? &node->inputs : &node->outputs;
+  for (const bNodeSocket *sock = static_cast<const bNodeSocket *>(sockets->first);
+       sock != nullptr;
+       sock = sock->next)
+  {
+    if (STREQ(sock->name, name) || STREQ(sock->identifier, name)) {
+      return sock;
+    }
+  }
+  return nullptr;
+}
+
+static float tessera_get_socket_float(const bNodeSocket *sock, float fallback = 0.0f)
+{
+  if (sock != nullptr && sock->default_value != nullptr) {
+    if (sock->type == SOCK_FLOAT) {
+      const auto *val = static_cast<const bNodeSocketValueFloat *>(sock->default_value);
+      return val->value;
+    }
+  }
+  return fallback;
+}
+
+static float4 tessera_get_socket_rgba(const bNodeSocket *sock, const float4 &fallback)
+{
+  if (sock != nullptr && sock->default_value != nullptr) {
+    if (sock->type == SOCK_RGBA) {
+      const auto *val = static_cast<const bNodeSocketValueRGBA *>(sock->default_value);
+      return float4(val->value[0], val->value[1], val->value[2], val->value[3]);
+    }
+  }
+  return fallback;
+}
+
+static gpu::Texture *tessera_get_gpu_texture(const bNode *node)
+{
+  if (node == nullptr || node->type_legacy != SH_NODE_TEX_IMAGE || node->id == nullptr) {
+    return nullptr;
+  }
+  blender::Image *ima = reinterpret_cast<blender::Image *>(node->id);
+  const NodeTexImage *storage = static_cast<const NodeTexImage *>(node->storage);
+  const ImageUser *iuser = storage ? &storage->iuser : nullptr;
+  gpu::Texture *tex = BKE_image_get_gpu_texture(ima, const_cast<ImageUser *>(iuser));
+  if (tex == nullptr) {
+    ImageGPUTextures gputex = BKE_image_get_gpu_material_texture(
+        ima, const_cast<ImageUser *>(iuser), false);
+    tex = gputex.texture ? *gputex.texture : nullptr;
+  }
+  return tex;
+}
+
+struct PrincipledContext {
+  const bNode *principled = nullptr;
+  const bNodeTree *ntree = nullptr;
+  const bNode *outer_group = nullptr;
+  const bNodeTree *outer_ntree = nullptr;
+};
+
+static PrincipledContext tessera_find_principled(bNodeTree *root_ntree)
+{
+  PrincipledContext ctx;
+  if (root_ntree == nullptr) {
+    return ctx;
+  }
+
+  for (bNode *node = static_cast<bNode *>(root_ntree->nodes.first); node != nullptr;
+       node = node->next)
+  {
+    if (node->type_legacy == SH_NODE_OUTPUT_MATERIAL) {
+      const bNodeSocket *surf_sock = tessera_find_node_socket(node, SOCK_IN, "Surface");
+      const bNodeLink *link = tessera_find_link_to_socket(root_ntree, node, surf_sock);
+      if (link != nullptr && link->fromnode != nullptr) {
+        if (link->fromnode->type_legacy == SH_NODE_BSDF_PRINCIPLED) {
+          ctx.principled = link->fromnode;
+          ctx.ntree = root_ntree;
+          return ctx;
+        }
+        if (link->fromnode->type_legacy == NODE_GROUP && link->fromnode->id != nullptr) {
+          bNodeTree *grp_tree = reinterpret_cast<bNodeTree *>(link->fromnode->id);
+          for (bNode *gnode = static_cast<bNode *>(grp_tree->nodes.first); gnode != nullptr;
+               gnode = gnode->next)
+          {
+            if (gnode->type_legacy == SH_NODE_BSDF_PRINCIPLED) {
+              ctx.principled = gnode;
+              ctx.ntree = grp_tree;
+              ctx.outer_group = link->fromnode;
+              ctx.outer_ntree = root_ntree;
+              return ctx;
+            }
+          }
+        }
+      }
+    }
+  }
+
+  for (bNode *node = static_cast<bNode *>(root_ntree->nodes.first); node != nullptr;
+       node = node->next)
+  {
+    if (node->type_legacy == SH_NODE_BSDF_PRINCIPLED) {
+      ctx.principled = node;
+      ctx.ntree = root_ntree;
+      return ctx;
+    }
+  }
+
+  for (bNode *node = static_cast<bNode *>(root_ntree->nodes.first); node != nullptr;
+       node = node->next)
+  {
+    if (node->type_legacy == NODE_GROUP && node->id != nullptr) {
+      bNodeTree *grp_tree = reinterpret_cast<bNodeTree *>(node->id);
+      for (bNode *gnode = static_cast<bNode *>(grp_tree->nodes.first); gnode != nullptr;
+           gnode = gnode->next)
+      {
+        if (gnode->type_legacy == SH_NODE_BSDF_PRINCIPLED) {
+          ctx.principled = gnode;
+          ctx.ntree = grp_tree;
+          ctx.outer_group = node;
+          ctx.outer_ntree = root_ntree;
+          return ctx;
+        }
+      }
+    }
+  }
+
+  return ctx;
+}
+
+struct RoughnessResult {
+  gpu::Texture *tex = nullptr;
+  float gamma = 1.0f;
+  float scale = 1.0f;
+  float offset = 0.0f;
+};
+
+static RoughnessResult tessera_trace_roughness(const bNodeSocket *start_sock,
+                                               const bNode *start_node,
+                                               const bNodeTree *start_tree,
+                                               const bNode *outer_group,
+                                               const bNodeTree *outer_tree)
+{
+  RoughnessResult res;
+  const bNodeSocket *curr_sock = start_sock;
+  const bNode *curr_node = start_node;
+  const bNodeTree *curr_tree = start_tree;
+  const bNode *curr_outer_group = outer_group;
+  const bNodeTree *curr_outer_tree = outer_tree;
+
+  for (int depth = 0; depth < 10; ++depth) {
+    const bNodeLink *link = tessera_find_link_to_socket(curr_tree, curr_node, curr_sock);
+    if (link == nullptr || link->fromnode == nullptr) {
+      break;
+    }
+    const bNode *from_node = link->fromnode;
+    const bNodeSocket *from_sock = link->fromsock;
+
+    if (from_node->type_legacy == SH_NODE_TEX_IMAGE) {
+      res.tex = tessera_get_gpu_texture(from_node);
+      break;
+    }
+    if (from_node->type_legacy == SH_NODE_GAMMA) {
+      const bNodeSocket *g_sock = tessera_find_node_socket(from_node, SOCK_IN, "Gamma");
+      float g_val = 1.0f;
+      const bNodeLink *g_link = tessera_find_link_to_socket(curr_tree, from_node, g_sock);
+      if (g_link != nullptr && g_link->fromnode != nullptr &&
+          g_link->fromnode->type_legacy == NODE_GROUP_INPUT && curr_outer_group != nullptr)
+      {
+        const bNodeSocket *outer_sock = tessera_find_node_socket(
+            curr_outer_group, SOCK_IN, g_link->fromsock->name);
+        if (outer_sock == nullptr) {
+          outer_sock = tessera_find_node_socket(
+              curr_outer_group, SOCK_IN, g_link->fromsock->identifier);
+        }
+        g_val = tessera_get_socket_float(outer_sock, 1.0f);
+      }
+      else {
+        g_val = tessera_get_socket_float(g_sock, 1.0f);
+      }
+      if (g_val > 0.0f) {
+        res.gamma *= g_val;
+      }
+      curr_sock = tessera_find_node_socket(from_node, SOCK_IN, "Color");
+      curr_node = from_node;
+      continue;
+    }
+    if (from_node->type_legacy == SH_NODE_MATH) {
+      const bNodeSocket *val2_sock = tessera_find_node_socket(from_node, SOCK_IN, "Value_001");
+      if (val2_sock == nullptr) {
+        const bNodeSocket *first_sock = static_cast<const bNodeSocket *>(from_node->inputs.first);
+        if (first_sock != nullptr && first_sock->next != nullptr) {
+          val2_sock = first_sock->next;
+        }
+      }
+      float op_val = tessera_get_socket_float(val2_sock, 1.0f);
+      int op = from_node->custom1;
+      if (op == 1) { // MULTIPLY
+        res.scale *= op_val;
+      }
+      else if (op == 0) { // ADD
+        res.offset += op_val;
+      }
+      else if (op == 7) { // POWER
+        if (op_val > 0.0f) res.gamma *= op_val;
+      }
+      curr_sock = static_cast<const bNodeSocket *>(from_node->inputs.first);
+      curr_node = from_node;
+      continue;
+    }
+    if (from_node->type_legacy == SH_NODE_INVERT) {
+      res.scale *= -1.0f;
+      res.offset += 1.0f;
+      curr_sock = tessera_find_node_socket(from_node, SOCK_IN, "Color");
+      curr_node = from_node;
+      continue;
+    }
+    if (from_node->type_legacy == NODE_GROUP_INPUT && curr_outer_group != nullptr && curr_outer_tree != nullptr) {
+      const bNodeSocket *outer_sock = tessera_find_node_socket(
+          curr_outer_group, SOCK_IN, from_sock->name);
+      if (outer_sock == nullptr) {
+        outer_sock = tessera_find_node_socket(
+            curr_outer_group, SOCK_IN, from_sock->identifier);
+      }
+      if (outer_sock != nullptr) {
+        curr_sock = outer_sock;
+        curr_node = curr_outer_group;
+        curr_tree = curr_outer_tree;
+        curr_outer_group = nullptr;
+        curr_outer_tree = nullptr;
+        continue;
+      }
+      break;
+    }
+    if (from_node->type_legacy == NODE_GROUP && from_node->id != nullptr) {
+      bNodeTree *sub_tree = reinterpret_cast<bNodeTree *>(from_node->id);
+      for (bNode *sub_node = static_cast<bNode *>(sub_tree->nodes.first); sub_node != nullptr;
+           sub_node = sub_node->next)
+      {
+        if (sub_node->type_legacy == NODE_GROUP_OUTPUT) {
+          const bNodeSocket *sub_sock = tessera_find_node_socket(sub_node, SOCK_IN, from_sock->name);
+          if (sub_sock != nullptr) {
+            curr_sock = sub_sock;
+            curr_node = sub_node;
+            curr_outer_group = from_node;
+            curr_outer_tree = curr_tree;
+            curr_tree = sub_tree;
+            break;
+          }
+        }
+      }
+      continue;
+    }
+    break;
+  }
+  return res;
+}
+
+static gpu::Texture *tessera_trace_texture(const bNodeSocket *start_sock,
+                                           const bNode *start_node,
+                                           const bNodeTree *start_tree,
+                                           const bNode *outer_group,
+                                           const bNodeTree *outer_tree)
+{
+  const bNodeSocket *curr_sock = start_sock;
+  const bNode *curr_node = start_node;
+  const bNodeTree *curr_tree = start_tree;
+  const bNode *curr_outer_group = outer_group;
+  const bNodeTree *curr_outer_tree = outer_tree;
+
+  for (int depth = 0; depth < 10; ++depth) {
+    const bNodeLink *link = tessera_find_link_to_socket(curr_tree, curr_node, curr_sock);
+    if (link == nullptr || link->fromnode == nullptr) {
+      break;
+    }
+    const bNode *from_node = link->fromnode;
+    const bNodeSocket *from_sock = link->fromsock;
+
+    if (from_node->type_legacy == SH_NODE_TEX_IMAGE) {
+      return tessera_get_gpu_texture(from_node);
+    }
+    if (from_node->type_legacy == SH_NODE_BUMP) {
+      curr_sock = tessera_find_node_socket(from_node, SOCK_IN, "Normal");
+      curr_node = from_node;
+      continue;
+    }
+    if (from_node->type_legacy == SH_NODE_NORMAL_MAP) {
+      curr_sock = tessera_find_node_socket(from_node, SOCK_IN, "Color");
+      curr_node = from_node;
+      continue;
+    }
+    if (from_node->type_legacy == SH_NODE_MIX || from_node->type_legacy == SH_NODE_MIX_RGB_LEGACY) {
+      const bNodeSocket *a_sock = tessera_find_node_socket(from_node, SOCK_IN, "A");
+      if (a_sock == nullptr) a_sock = tessera_find_node_socket(from_node, SOCK_IN, "Color1");
+      if (a_sock != nullptr) {
+        curr_sock = a_sock;
+        curr_node = from_node;
+        continue;
+      }
+    }
+    if (from_node->type_legacy == NODE_GROUP_INPUT && curr_outer_group != nullptr && curr_outer_tree != nullptr) {
+      const bNodeSocket *outer_sock = tessera_find_node_socket(
+          curr_outer_group, SOCK_IN, from_sock->name);
+      if (outer_sock == nullptr) {
+        outer_sock = tessera_find_node_socket(
+            curr_outer_group, SOCK_IN, from_sock->identifier);
+      }
+      if (outer_sock != nullptr) {
+        curr_sock = outer_sock;
+        curr_node = curr_outer_group;
+        curr_tree = curr_outer_tree;
+        curr_outer_group = nullptr;
+        curr_outer_tree = nullptr;
+        continue;
+      }
+      break;
+    }
+    break;
+  }
+  return nullptr;
+}
+
 static std::vector<tessera::TesseraMaterialTextures> tessera_extract_materials(Object *ob)
 {
   std::vector<tessera::TesseraMaterialTextures> result;
@@ -361,68 +703,129 @@ static std::vector<tessera::TesseraMaterialTextures> tessera_extract_materials(O
     mat.base_color = float4(ma->r, ma->g, ma->b, ma->a);
     mat.roughness_value = ma->roughness;
     mat.metallic_value = ma->metallic;
+    mat.specular_value = ma->spec;
 
     if (!ma->use_nodes || ma->nodetree == nullptr) {
       continue;
     }
 
-    for (bNode *node = static_cast<bNode *>(ma->nodetree->nodes.first); node != nullptr;
-         node = node->next)
-    {
-      if (node->type_legacy != SH_NODE_TEX_IMAGE || node->id == nullptr) {
-        continue;
-      }
-      blender::Image *ima = reinterpret_cast<blender::Image *>(node->id);
-      NodeTexImage *storage = static_cast<NodeTexImage *>(node->storage);
-      ImageUser *iuser = storage ? &storage->iuser : nullptr;
-      gpu::Texture *tex = BKE_image_get_gpu_texture(ima, iuser);
-      if (tex == nullptr) {
-        ImageGPUTextures gputex = BKE_image_get_gpu_material_texture(ima, iuser, false);
-        tex = gputex.texture ? *gputex.texture : nullptr;
-      }
-      if (tex == nullptr) {
-        continue;
+    PrincipledContext pctx = tessera_find_principled(ma->nodetree);
+    if (pctx.principled != nullptr) {
+      const bNode *pnode = pctx.principled;
+      const bNodeTree *ntree = pctx.ntree;
+      const bNode *ogrp = pctx.outer_group;
+      const bNodeTree *ontree = pctx.outer_ntree;
+
+      const bNodeSocket *r_sock = tessera_find_node_socket(pnode, SOCK_IN, "Roughness");
+      if (r_sock != nullptr) {
+        if (r_sock->flag & SOCK_IS_LINKED) {
+          RoughnessResult rr = tessera_trace_roughness(r_sock, pnode, ntree, ogrp, ontree);
+          if (rr.tex != nullptr) {
+            mat.roughness = rr.tex;
+            mat.has_roughness = true;
+            mat.roughness_gamma = rr.gamma;
+            mat.roughness_scale = rr.scale;
+            mat.roughness_offset = rr.offset;
+          }
+        }
+        else {
+          mat.roughness_value = tessera_get_socket_float(r_sock, mat.roughness_value);
+          mat.has_roughness = false;
+        }
       }
 
-      std::string node_name = node->name;
-      std::string ima_name = ima->id.name + 2;
-      for (char &c : node_name) c = std::tolower(c);
-      for (char &c : ima_name) c = std::tolower(c);
-
-      bool is_normal = (node_name.find("normal") != std::string::npos ||
-                        node_name.find("norm") != std::string::npos ||
-                        ima_name.find("normal") != std::string::npos ||
-                        ima_name.find("norm") != std::string::npos);
-
-      bool is_rough = (node_name.find("rough") != std::string::npos ||
-                       node_name.find("rgh") != std::string::npos ||
-                       ima_name.find("rough") != std::string::npos ||
-                       ima_name.find("rgh") != std::string::npos);
-
-      bool is_diff = (node_name.find("diff") != std::string::npos ||
-                      node_name.find("base") != std::string::npos ||
-                      node_name.find("color") != std::string::npos ||
-                      node_name.find("albedo") != std::string::npos ||
-                      ima_name.find("diff") != std::string::npos ||
-                      ima_name.find("base") != std::string::npos ||
-                      ima_name.find("color") != std::string::npos ||
-                      ima_name.find("albedo") != std::string::npos);
-
-      if (is_normal && !mat.has_normal) {
-        mat.normal = tex;
-        mat.has_normal = true;
+      const bNodeSocket *c_sock = tessera_find_node_socket(pnode, SOCK_IN, "Base Color");
+      if (c_sock != nullptr) {
+        if (c_sock->flag & SOCK_IS_LINKED) {
+          gpu::Texture *tex = tessera_trace_texture(c_sock, pnode, ntree, ogrp, ontree);
+          if (tex != nullptr) {
+            mat.diffuse = tex;
+            mat.has_diffuse = true;
+          }
+        }
+        else {
+          mat.base_color = tessera_get_socket_rgba(c_sock, mat.base_color);
+        }
       }
-      else if (is_rough && !mat.has_roughness) {
-        mat.roughness = tex;
-        mat.has_roughness = true;
+
+      const bNodeSocket *n_sock = tessera_find_node_socket(pnode, SOCK_IN, "Normal");
+      if (n_sock != nullptr && (n_sock->flag & SOCK_IS_LINKED)) {
+        gpu::Texture *tex = tessera_trace_texture(n_sock, pnode, ntree, ogrp, ontree);
+        if (tex != nullptr) {
+          mat.normal = tex;
+          mat.has_normal = true;
+        }
       }
-      else if (is_diff && !mat.has_diffuse) {
-        mat.diffuse = tex;
-        mat.has_diffuse = true;
+
+      const bNodeSocket *m_sock = tessera_find_node_socket(pnode, SOCK_IN, "Metallic");
+      if (m_sock != nullptr && !(m_sock->flag & SOCK_IS_LINKED)) {
+        mat.metallic_value = tessera_get_socket_float(m_sock, mat.metallic_value);
       }
-      else if (!mat.has_diffuse && !is_normal && !is_rough) {
-        mat.diffuse = tex;
-        mat.has_diffuse = true;
+
+      const bNodeSocket *s_sock = tessera_find_node_socket(pnode, SOCK_IN, "Specular IOR Level");
+      if (s_sock == nullptr) {
+        s_sock = tessera_find_node_socket(pnode, SOCK_IN, "Specular");
+      }
+      if (s_sock != nullptr && !(s_sock->flag & SOCK_IS_LINKED)) {
+        mat.specular_value = tessera_get_socket_float(s_sock, 0.5f);
+      }
+    }
+
+    auto search_tex_nodes = [&](bNodeTree *tree) {
+      if (tree == nullptr) return;
+      for (bNode *node = static_cast<bNode *>(tree->nodes.first); node != nullptr; node = node->next) {
+        if (node->type_legacy != SH_NODE_TEX_IMAGE || node->id == nullptr) continue;
+        gpu::Texture *tex = tessera_get_gpu_texture(node);
+        if (tex == nullptr) continue;
+        std::string node_name = node->name;
+        std::string ima_name = (reinterpret_cast<blender::Image *>(node->id)->id.name + 2);
+        for (char &c : node_name) c = std::tolower(c);
+        for (char &c : ima_name) c = std::tolower(c);
+
+        bool is_normal = (node_name.find("normal") != std::string::npos ||
+                          node_name.find("norm") != std::string::npos ||
+                          ima_name.find("normal") != std::string::npos ||
+                          ima_name.find("norm") != std::string::npos);
+
+        bool is_rough = (node_name.find("rough") != std::string::npos ||
+                         node_name.find("rgh") != std::string::npos ||
+                         ima_name.find("rough") != std::string::npos ||
+                         ima_name.find("rgh") != std::string::npos);
+
+        bool is_diff = (node_name.find("diff") != std::string::npos ||
+                        node_name.find("base") != std::string::npos ||
+                        node_name.find("color") != std::string::npos ||
+                        node_name.find("albedo") != std::string::npos ||
+                        ima_name.find("diff") != std::string::npos ||
+                        ima_name.find("base") != std::string::npos ||
+                        ima_name.find("color") != std::string::npos ||
+                        ima_name.find("albedo") != std::string::npos);
+
+        if (is_normal && !mat.has_normal) {
+          mat.normal = tex;
+          mat.has_normal = true;
+        }
+        else if (is_rough && !mat.has_roughness) {
+          mat.roughness = tex;
+          mat.has_roughness = true;
+        }
+        else if (is_diff && !mat.has_diffuse) {
+          mat.diffuse = tex;
+          mat.has_diffuse = true;
+        }
+        else if (!mat.has_diffuse && !is_normal && !is_rough) {
+          mat.diffuse = tex;
+          mat.has_diffuse = true;
+        }
+      }
+    };
+
+    if (!mat.has_diffuse || !mat.has_normal || !mat.has_roughness) {
+      search_tex_nodes(ma->nodetree);
+      for (bNode *node = static_cast<bNode *>(ma->nodetree->nodes.first); node != nullptr; node = node->next) {
+        if (node->type_legacy == NODE_GROUP && node->id != nullptr) {
+          search_tex_nodes(reinterpret_cast<bNodeTree *>(node->id));
+        }
       }
     }
   }

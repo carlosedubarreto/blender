@@ -173,12 +173,19 @@ void main()
     mat_idx = 0u;
   }
 
-  vec4 base_col = material_params[mat_idx * 2u + 0u];
-  vec4 props = material_params[mat_idx * 2u + 1u];
+  vec4 base_col = material_params[mat_idx * 4u + 0u];
+  vec4 props = material_params[mat_idx * 4u + 1u];
+  vec4 rough_params = material_params[mat_idx * 4u + 2u];
   bool has_d = (props.x > 0.5);
   bool has_n = (props.y > 0.5);
   bool has_r = (props.z > 0.5);
-  float rough_val = props.w;
+  float spec_level = props.w;
+  float metallic = base_col.w;
+
+  float rough_val = rough_params.x;
+  float rough_gamma = rough_params.y;
+  float rough_scale = rough_params.z;
+  float rough_offset = rough_params.w;
 
   vec4 tex_diff = vec4(1.0);
   vec3 tex_norm = vec3(0.5, 0.5, 1.0);
@@ -205,8 +212,15 @@ void main()
     if (has_r) tex_rough = texture(tex_rough_3, uv).r;
   }
 
-  vec4 albedo = has_d ? tex_diff : base_col;
-  float roughness = has_r ? tex_rough : rough_val;
+  if (has_r) {
+    if (abs(rough_gamma - 1.0) > 1e-4) {
+      tex_rough = pow(max(tex_rough, 0.0), rough_gamma);
+    }
+    tex_rough = tex_rough * rough_scale + rough_offset;
+  }
+
+  vec4 albedo = has_d ? tex_diff : vec4(base_col.rgb, 1.0);
+  float roughness = clamp(has_r ? tex_rough : rough_val, 0.001, 1.0);
 
   /* MikkTSpace normal perturbation using vertex normal nor and 4D tangent tan_v */
   vec3 N = normalize(nor);
@@ -234,7 +248,7 @@ void main()
   float spec = pow(NdotH, max(1.0, spec_power)) * (1.0 - roughness);
 
   vec3 diff_term = albedo.rgb * (0.15 + 0.85 * NdotL);
-  vec3 spec_term = vec3(spec * 0.3);
+  vec3 spec_term = vec3(spec * 0.3 * spec_level);
   vec3 final_rgb = diff_term + spec_term;
 
   out_color = vec4(final_rgb, out_alpha);
@@ -326,12 +340,19 @@ void main()
     mat_idx = 0u;
   }
 
-  vec4 base_col = material_params[mat_idx * 2u + 0u];
-  vec4 props = material_params[mat_idx * 2u + 1u];
+  vec4 base_col = material_params[mat_idx * 4u + 0u];
+  vec4 props = material_params[mat_idx * 4u + 1u];
+  vec4 rough_params = material_params[mat_idx * 4u + 2u];
   bool has_d = (props.x > 0.5);
   bool has_n = (props.y > 0.5);
   bool has_r = (props.z > 0.5);
-  float rough_val = props.w;
+  float spec_level = props.w;
+  float metallic = base_col.w;
+
+  float rough_val = rough_params.x;
+  float rough_gamma = rough_params.y;
+  float rough_scale = rough_params.z;
+  float rough_offset = rough_params.w;
 
   vec4 tex_diff = vec4(1.0);
   vec3 tex_norm = vec3(0.5, 0.5, 1.0);
@@ -358,8 +379,15 @@ void main()
     if (has_r) tex_rough = texture(tex_rough_3, uv).r;
   }
 
-  vec4 albedo = has_d ? tex_diff : base_col;
-  float roughness = clamp(has_r ? tex_rough : rough_val, 0.04, 1.0);
+  if (has_r) {
+    if (abs(rough_gamma - 1.0) > 1e-4) {
+      tex_rough = pow(max(tex_rough, 0.0), rough_gamma);
+    }
+    tex_rough = tex_rough * rough_scale + rough_offset;
+  }
+
+  vec4 albedo = has_d ? tex_diff : vec4(base_col.rgb, 1.0);
+  float roughness = clamp(has_r ? tex_rough : rough_val, 0.001, 1.0);
 
   mat3 norm_mat = transpose(inverse(mat3(model_mat)));
   vec3 world_nor = normalize(norm_mat * nor);
@@ -382,11 +410,13 @@ void main()
   uint geo_norm_bits = geometry_normal_pack(world_nor, shaded_nor);
   uint header = 0x31u | geo_norm_bits;
 
+  float f0 = mix(0.08 * spec_level, 1.0, metallic);
+
   out_radiance = vec4(0.0);
   out_header = header;
   out_normal = normal_pack(shaded_nor);
   out_closure1 = closure_color_pack(albedo.rgb);
-  out_closure2 = vec4(roughness, 0.0, 0.04, 0.0);
+  out_closure2 = vec4(roughness, 0.0, f0, 0.0);
 }
 )";
 
@@ -862,28 +892,44 @@ void TesseraVisibilityPass::render(gpu::StorageBuf *command_buf,
         GPU_storagebuf_bind(mTriMaterialsBuf, 5);
     }
 
-    /* Upload material parameters: 2 vec4 per slot (base_color, props) */
-    float mat_params[4 * 8] = {};
+    /* Upload material parameters: 4 vec4 per slot (base_color, props, rough_params, extra) */
+    float mat_params[4 * 16] = {};
     for (int s = 0; s < 4; ++s) {
         if (s < int(mMaterials.size())) {
             const auto &m = mMaterials[s];
-            mat_params[s * 8 + 0] = m.base_color.x;
-            mat_params[s * 8 + 1] = m.base_color.y;
-            mat_params[s * 8 + 2] = m.base_color.z;
-            mat_params[s * 8 + 3] = m.base_color.w;
-            mat_params[s * 8 + 4] = (m.has_diffuse && m.diffuse != nullptr) ? 1.0f : 0.0f;
-            mat_params[s * 8 + 5] = (m.has_normal && m.normal != nullptr) ? 1.0f : 0.0f;
-            mat_params[s * 8 + 6] = (m.has_roughness && m.roughness != nullptr) ? 1.0f : 0.0f;
-            mat_params[s * 8 + 7] = m.roughness_value;
+            mat_params[s * 16 + 0] = m.base_color.x;
+            mat_params[s * 16 + 1] = m.base_color.y;
+            mat_params[s * 16 + 2] = m.base_color.z;
+            mat_params[s * 16 + 3] = m.metallic_value;
+            mat_params[s * 16 + 4] = (m.has_diffuse && m.diffuse != nullptr) ? 1.0f : 0.0f;
+            mat_params[s * 16 + 5] = (m.has_normal && m.normal != nullptr) ? 1.0f : 0.0f;
+            mat_params[s * 16 + 6] = (m.has_roughness && m.roughness != nullptr) ? 1.0f : 0.0f;
+            mat_params[s * 16 + 7] = m.specular_value;
+            mat_params[s * 16 + 8] = m.roughness_value;
+            mat_params[s * 16 + 9] = m.roughness_gamma;
+            mat_params[s * 16 + 10] = m.roughness_scale;
+            mat_params[s * 16 + 11] = m.roughness_offset;
+            mat_params[s * 16 + 12] = 0.0f;
+            mat_params[s * 16 + 13] = 0.0f;
+            mat_params[s * 16 + 14] = 0.0f;
+            mat_params[s * 16 + 15] = 0.0f;
         } else {
-            mat_params[s * 8 + 0] = 0.8f;
-            mat_params[s * 8 + 1] = 0.8f;
-            mat_params[s * 8 + 2] = 0.8f;
-            mat_params[s * 8 + 3] = 1.0f;
-            mat_params[s * 8 + 4] = 0.0f;
-            mat_params[s * 8 + 5] = 0.0f;
-            mat_params[s * 8 + 6] = 0.0f;
-            mat_params[s * 8 + 7] = 0.5f;
+            mat_params[s * 16 + 0] = 0.8f;
+            mat_params[s * 16 + 1] = 0.8f;
+            mat_params[s * 16 + 2] = 0.8f;
+            mat_params[s * 16 + 3] = 0.0f;
+            mat_params[s * 16 + 4] = 0.0f;
+            mat_params[s * 16 + 5] = 0.0f;
+            mat_params[s * 16 + 6] = 0.0f;
+            mat_params[s * 16 + 7] = 0.5f;
+            mat_params[s * 16 + 8] = 0.5f;
+            mat_params[s * 16 + 9] = 1.0f;
+            mat_params[s * 16 + 10] = 1.0f;
+            mat_params[s * 16 + 11] = 0.0f;
+            mat_params[s * 16 + 12] = 0.0f;
+            mat_params[s * 16 + 13] = 0.0f;
+            mat_params[s * 16 + 14] = 0.0f;
+            mat_params[s * 16 + 15] = 0.0f;
         }
     }
     if (mMaterialParamsBuf == nullptr) {
@@ -1065,28 +1111,44 @@ void TesseraVisibilityPass::render_gbuffer(gpu::StorageBuf *command_buf,
         GPU_storagebuf_bind(mTriMaterialsBuf, 5);
     }
 
-    /* Upload material parameters: 2 vec4 per slot (base_color, props) */
-    float mat_params[4 * 8] = {};
+    /* Upload material parameters: 4 vec4 per slot (base_color, props, rough_params, extra) */
+    float mat_params[4 * 16] = {};
     for (int s = 0; s < 4; ++s) {
         if (s < int(mMaterials.size())) {
             const auto &m = mMaterials[s];
-            mat_params[s * 8 + 0] = m.base_color.x;
-            mat_params[s * 8 + 1] = m.base_color.y;
-            mat_params[s * 8 + 2] = m.base_color.z;
-            mat_params[s * 8 + 3] = m.base_color.w;
-            mat_params[s * 8 + 4] = (m.has_diffuse && m.diffuse != nullptr) ? 1.0f : 0.0f;
-            mat_params[s * 8 + 5] = (m.has_normal && m.normal != nullptr) ? 1.0f : 0.0f;
-            mat_params[s * 8 + 6] = (m.has_roughness && m.roughness != nullptr) ? 1.0f : 0.0f;
-            mat_params[s * 8 + 7] = m.roughness_value;
+            mat_params[s * 16 + 0] = m.base_color.x;
+            mat_params[s * 16 + 1] = m.base_color.y;
+            mat_params[s * 16 + 2] = m.base_color.z;
+            mat_params[s * 16 + 3] = m.metallic_value;
+            mat_params[s * 16 + 4] = (m.has_diffuse && m.diffuse != nullptr) ? 1.0f : 0.0f;
+            mat_params[s * 16 + 5] = (m.has_normal && m.normal != nullptr) ? 1.0f : 0.0f;
+            mat_params[s * 16 + 6] = (m.has_roughness && m.roughness != nullptr) ? 1.0f : 0.0f;
+            mat_params[s * 16 + 7] = m.specular_value;
+            mat_params[s * 16 + 8] = m.roughness_value;
+            mat_params[s * 16 + 9] = m.roughness_gamma;
+            mat_params[s * 16 + 10] = m.roughness_scale;
+            mat_params[s * 16 + 11] = m.roughness_offset;
+            mat_params[s * 16 + 12] = 0.0f;
+            mat_params[s * 16 + 13] = 0.0f;
+            mat_params[s * 16 + 14] = 0.0f;
+            mat_params[s * 16 + 15] = 0.0f;
         } else {
-            mat_params[s * 8 + 0] = 0.8f;
-            mat_params[s * 8 + 1] = 0.8f;
-            mat_params[s * 8 + 2] = 0.8f;
-            mat_params[s * 8 + 3] = 1.0f;
-            mat_params[s * 8 + 4] = 0.0f;
-            mat_params[s * 8 + 5] = 0.0f;
-            mat_params[s * 8 + 6] = 0.0f;
-            mat_params[s * 8 + 7] = 0.5f;
+            mat_params[s * 16 + 0] = 0.8f;
+            mat_params[s * 16 + 1] = 0.8f;
+            mat_params[s * 16 + 2] = 0.8f;
+            mat_params[s * 16 + 3] = 0.0f;
+            mat_params[s * 16 + 4] = 0.0f;
+            mat_params[s * 16 + 5] = 0.0f;
+            mat_params[s * 16 + 6] = 0.0f;
+            mat_params[s * 16 + 7] = 0.5f;
+            mat_params[s * 16 + 8] = 0.5f;
+            mat_params[s * 16 + 9] = 1.0f;
+            mat_params[s * 16 + 10] = 1.0f;
+            mat_params[s * 16 + 11] = 0.0f;
+            mat_params[s * 16 + 12] = 0.0f;
+            mat_params[s * 16 + 13] = 0.0f;
+            mat_params[s * 16 + 14] = 0.0f;
+            mat_params[s * 16 + 15] = 0.0f;
         }
     }
     if (mMaterialParamsBuf == nullptr) {
