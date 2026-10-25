@@ -57,6 +57,7 @@ struct TesseraMaterialTextures {
     bool has_normal = false;
     bool has_roughness = false;
     bool diffuse_is_srgb = true;
+    bool has_specular_tint = false;
 };
 
 struct TesseraRawVertex {
