@@ -1100,6 +1100,7 @@ gpu::Texture *DeferredLayer::render(View &render_view,
 
   inst_.gbuffer.bind(gbuffer_fb);
   inst_.manager->submit(gbuffer_ps_, render_view);
+  inst_.tessera.draw_gbuffer(render_view, extent, gbuffer_fb);
 
   for (int i = 0; i < ARRAY_SIZE(direct_radiance_txs_); i++) {
     direct_radiance_txs_[i].acquire_2d((closure_count_ > i) ? extent : int2(1),
@@ -1168,6 +1169,11 @@ void DeferredPipeline::begin_sync()
 void DeferredPipeline::end_sync()
 {
   Instance &inst = opaque_layer_.inst_;
+
+  if (inst.tessera.has_objects()) {
+    opaque_layer_.closure_bits_ |= (CLOSURE_DIFFUSE | CLOSURE_REFLECTION);
+    opaque_layer_.closure_count_ = max_ii(opaque_layer_.closure_count_, 2);
+  }
 
   opaque_layer_.end_sync(true, refraction_layer_.is_empty(), refraction_layer_.has_transmission());
   refraction_layer_.end_sync(opaque_layer_.is_empty(), true, false);

@@ -126,6 +126,7 @@ public:
 
     void draw(int viewportWidth, int viewportHeight) const;
     void draw_prepass(int viewportWidth, int viewportHeight) const;
+    void draw_gbuffer(int viewportWidth, int viewportHeight, const float4x4 &object_model = float4x4::identity()) const;
 
     size_t drawCount(uint32_t material_index = 0) const;
     size_t totalDrawCount() const;

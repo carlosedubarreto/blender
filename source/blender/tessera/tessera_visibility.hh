@@ -104,6 +104,20 @@ class TesseraVisibilityPass
                              const std::vector<uint32_t> *material_counts = nullptr,
                              uint32_t max_commands_per_material = 0);
 
+    /**
+     * Render G-Buffer pass into the currently bound EEVEE G-Buffer framebuffer.
+     */
+    void render_gbuffer(gpu::StorageBuf *command_buf,
+                        size_t draw_count,
+                        const float4x4 &viewProj,
+                        const float3 &cam_pos,
+                        int viewport_width,
+                        int viewport_height,
+                        const float4x4 &object_model = float4x4::identity(),
+                        bool reverse_z = true,
+                        const std::vector<uint32_t> *material_counts = nullptr,
+                        uint32_t max_commands_per_material = 0);
+
     void set_material_textures(const std::vector<TesseraMaterialTextures> &materials)
     {
         mMaterials = materials;
@@ -117,6 +131,7 @@ class TesseraVisibilityPass
     gpu::Shader *mVisShader = nullptr;
     gpu::Shader *mMaterialShader = nullptr;
     gpu::Shader *mDepthPrepassShader = nullptr;
+    gpu::Shader *mGbufferShader = nullptr;
 
     // Visibility targets.
     gpu::Texture *mVisTexture = nullptr;

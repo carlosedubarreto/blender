@@ -1356,6 +1356,7 @@ void ShadowModule::render(View &view, int2 extent)
                                           reinterpret_cast<int (*)[4]>(multi_viewports_.data()));
 
       inst_.pipelines.shadow.render(shadow_multi_view_);
+      inst_.tessera.draw_shadow(shadow_multi_view_, render_fb_);
 
       if (use_flush) {
         GPU_flush();

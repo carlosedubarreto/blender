@@ -155,7 +155,9 @@ void ShadingView::render()
                                   rt_buffer_opaque_,
                                   rt_buffer_refract_);
 
-  inst_.tessera.draw(render_view_, extent_, combined_fb_);
+  if (inst_.tessera.has_cluster_visualization()) {
+    inst_.tessera.draw(render_view_, extent_, combined_fb_);
+  }
 
   inst_.pipelines.background.render(render_view_, combined_fb_);
 

@@ -241,6 +241,155 @@ void main()
 }
 )";
 
+/* ---------------------------------------------------------------------------
+ * G-Buffer pass: output EEVEE deferred G-Buffer targets:
+ * Attachment 0: combined_tx (radiance / emission)
+ * Attachment 1: header_tx (UInt32 closure type modes and flags)
+ * Attachment 2: normal_tx (UNorm16x2 octahedral packed world normal)
+ * Attachment 3: closure_tx layer 0 (Closure 0 Diffuse color_pack albedo)
+ * Attachment 4: closure_tx layer 1 (Closure 1 ReflectionColorless roughness & specular)
+ * Depth: depth_tx (Reverse-Z depth)
+ * ------------------------------------------------------------------------- */
+
+static const char *GBUFFER_FRAG_SOURCE = R"(
+vec2 normal_pack(vec3 N)
+{
+  N /= (abs(N.x) + abs(N.y) + abs(N.z));
+  vec2 s = sign(N.xy);
+  s.x = (s.x == 0.0) ? 1.0 : s.x;
+  s.y = (s.y == 0.0) ? 1.0 : s.y;
+  N.xy = (N.z >= 0.0) ? N.xy : ((1.0 - abs(N.yx)) * s);
+  return N.xy * 0.5 + 0.5;
+}
+
+vec4 closure_color_pack(vec3 color)
+{
+  float max_comp = max(color.x, max(color.y, color.z));
+  float exponent = (max_comp > 1.0) ? ((max_comp > 2.0) ? ((max_comp > 4.0) ? 3.0 : 2.0) : 1.0) : 0.0;
+  return vec4(color / exp2(exponent), exponent / 3.0);
+}
+
+uint geometry_normal_pack(vec3 Ng, vec3 N)
+{
+  const float quantization_multiplier = 1.360;
+  vec3 Ng_quantize = normalize(round(quantization_multiplier * Ng));
+  if (dot(N, Ng) > dot(Ng, Ng_quantize)) {
+    return 0u;
+  }
+  uint data = 0u;
+  data |= (Ng_quantize.x > 0.0) ? (1u << 0u) : 0u;
+  data |= (Ng_quantize.y > 0.0) ? (1u << 1u) : 0u;
+  data |= (Ng_quantize.z > 0.0) ? (1u << 2u) : 0u;
+  data |= (Ng_quantize.x < 0.0) ? (1u << 3u) : 0u;
+  data |= (Ng_quantize.y < 0.0) ? (1u << 4u) : 0u;
+  data |= (Ng_quantize.z < 0.0) ? (1u << 5u) : 0u;
+  return data << 20u;
+}
+
+void main()
+{
+  ivec2 px = ivec2(gl_FragCoord.xy);
+  uvec4 vis = texelFetch(vis_texture, px, 0);
+  uint tri = vis.x;
+  if (tri == 0xFFFFFFFFu) {
+    discard;
+  }
+  float depth_val = texelFetch(depth_texture, px, 0).r;
+  gl_FragDepth = depth_val;
+  vec2 bary_xy = unpackHalf2x16(vis.y);
+  vec3 bary = vec3(bary_xy.x, bary_xy.y, 1.0 - bary_xy.x - bary_xy.y);
+
+  uint i0 = tri_indices[tri * 3u + 0u];
+  uint i1 = tri_indices[tri * 3u + 1u];
+  uint i2 = tri_indices[tri * 3u + 2u];
+
+  vec3 n0 = vec3(normals[i0 * 3u], normals[i0 * 3u + 1u], normals[i0 * 3u + 2u]);
+  vec3 n1 = vec3(normals[i1 * 3u], normals[i1 * 3u + 1u], normals[i1 * 3u + 2u]);
+  vec3 n2 = vec3(normals[i2 * 3u], normals[i2 * 3u + 1u], normals[i2 * 3u + 2u]);
+
+  vec2 u0 = vec2(uvs[i0 * 2u], uvs[i0 * 2u + 1u]);
+  vec2 u1 = vec2(uvs[i1 * 2u], uvs[i1 * 2u + 1u]);
+  vec2 u2 = vec2(uvs[i2 * 2u], uvs[i2 * 2u + 1u]);
+
+  vec4 t0 = vec4(tangents[i0 * 4u], tangents[i0 * 4u + 1u], tangents[i0 * 4u + 2u], tangents[i0 * 4u + 3u]);
+  vec4 t1 = vec4(tangents[i1 * 4u], tangents[i1 * 4u + 1u], tangents[i1 * 4u + 2u], tangents[i1 * 4u + 3u]);
+  vec4 t2 = vec4(tangents[i2 * 4u], tangents[i2 * 4u + 1u], tangents[i2 * 4u + 2u], tangents[i2 * 4u + 3u]);
+
+  vec3 nor_v = bary.x * n0 + bary.y * n1 + bary.z * n2;
+  float nor_len = length(nor_v);
+  vec3 nor = nor_len > 1e-20 ? nor_v / nor_len : vec3(0.0, 0.0, 1.0);
+  vec2 uv = bary.x * u0 + bary.y * u1 + bary.z * u2;
+  vec4 tan_v = bary.x * t0 + bary.y * t1 + bary.z * t2;
+
+  uint mat_idx = tri_materials[tri];
+  if (mat_idx >= 4u) {
+    mat_idx = 0u;
+  }
+
+  vec4 base_col = material_params[mat_idx * 2u + 0u];
+  vec4 props = material_params[mat_idx * 2u + 1u];
+  bool has_d = (props.x > 0.5);
+  bool has_n = (props.y > 0.5);
+  bool has_r = (props.z > 0.5);
+  float rough_val = props.w;
+
+  vec4 tex_diff = vec4(1.0);
+  vec3 tex_norm = vec3(0.5, 0.5, 1.0);
+  float tex_rough = rough_val;
+
+  if (mat_idx == 0u) {
+    if (has_d) tex_diff = texture(tex_diffuse_0, uv);
+    if (has_n) tex_norm = texture(tex_normal_0, uv).xyz;
+    if (has_r) tex_rough = texture(tex_rough_0, uv).r;
+  }
+  else if (mat_idx == 1u) {
+    if (has_d) tex_diff = texture(tex_diffuse_1, uv);
+    if (has_n) tex_norm = texture(tex_normal_1, uv).xyz;
+    if (has_r) tex_rough = texture(tex_rough_1, uv).r;
+  }
+  else if (mat_idx == 2u) {
+    if (has_d) tex_diff = texture(tex_diffuse_2, uv);
+    if (has_n) tex_norm = texture(tex_normal_2, uv).xyz;
+    if (has_r) tex_rough = texture(tex_rough_2, uv).r;
+  }
+  else {
+    if (has_d) tex_diff = texture(tex_diffuse_3, uv);
+    if (has_n) tex_norm = texture(tex_normal_3, uv).xyz;
+    if (has_r) tex_rough = texture(tex_rough_3, uv).r;
+  }
+
+  vec4 albedo = has_d ? tex_diff : base_col;
+  float roughness = clamp(has_r ? tex_rough : rough_val, 0.04, 1.0);
+
+  mat3 norm_mat = transpose(inverse(mat3(model_mat)));
+  vec3 world_nor = normalize(norm_mat * nor);
+  vec3 world_tan = normalize(mat3(model_mat) * tan_v.xyz);
+
+  vec3 N = world_nor;
+  vec3 T = world_tan - N * dot(N, world_tan);
+  float t_len = length(T);
+  if (t_len > 1e-6) {
+    T /= t_len;
+  } else {
+    T = vec3(1.0, 0.0, 0.0);
+  }
+  vec3 B = cross(N, T) * tan_v.w;
+  mat3 TBN = mat3(T, B, N);
+
+  vec3 n_mapped = tex_norm * 2.0 - 1.0;
+  vec3 shaded_nor = has_n ? normalize(TBN * n_mapped) : N;
+
+  uint geo_norm_bits = geometry_normal_pack(world_nor, shaded_nor);
+  uint header = 0x31u | geo_norm_bits;
+
+  out_radiance = vec4(0.0);
+  out_header = header;
+  out_normal = normal_pack(shaded_nor);
+  out_closure1 = closure_color_pack(albedo.rgb);
+  out_closure2 = vec4(roughness, 0.0, 0.04, 0.0);
+}
+)";
+
 /* Depth-only prepass shaders (vertex pulling). */
 static const char *DEPTH_VERT_SOURCE = R"(
 void main()
@@ -377,6 +526,60 @@ gpu::Shader *createDepthPrepassShader()
     return GPU_shader_create_from_info_python(raw);
 }
 
+/** Create the G-Buffer pass shader (fullscreen MRT output). */
+gpu::Shader *createGbufferShader()
+{
+    using namespace blender::gpu::shader;
+
+    ShaderCreateInfo info("pyGPU_Shader");
+    info.builtins_ |= BuiltinBits::NO_BUFFER_TYPE_LINTING;
+
+    info.vertex_source("tessera_gbuffer");
+    info.vertex_source_generated = MATERIAL_VERT_SOURCE;
+    info.fragment_source("tessera_gbuffer");
+    info.fragment_source_generated = GBUFFER_FRAG_SOURCE;
+
+    info.vertex_in(0, Type::float3_t, "pos");
+    info.fragment_out(0, Type::float4_t, "out_radiance");
+    info.fragment_out(1, Type::uint_t, "out_header");
+    info.fragment_out(2, Type::float2_t, "out_normal");
+    info.fragment_out(3, Type::float4_t, "out_closure1");
+    info.fragment_out(4, Type::float4_t, "out_closure2");
+
+    info.depth_write(DepthWrite::ANY);
+    info.storage_buf(0, Qualifier::read, "float", "positions[]");
+    info.storage_buf(1, Qualifier::read, "float", "normals[]");
+    info.storage_buf(2, Qualifier::read, "float", "uvs[]");
+    info.storage_buf(3, Qualifier::read, "uint", "tri_indices[]");
+    info.storage_buf(4, Qualifier::read, "float", "tangents[]");
+    info.storage_buf(5, Qualifier::read, "uint", "tri_materials[]");
+    info.storage_buf(6, Qualifier::read, "vec4", "material_params[]");
+    info.sampler(0, ImageType::Uint2D, "vis_texture");
+    info.sampler(1, ImageType::Float2D, "depth_texture");
+
+    info.sampler(2, ImageType::Float2D, "tex_diffuse_0");
+    info.sampler(3, ImageType::Float2D, "tex_normal_0");
+    info.sampler(4, ImageType::Float2D, "tex_rough_0");
+
+    info.sampler(5, ImageType::Float2D, "tex_diffuse_1");
+    info.sampler(6, ImageType::Float2D, "tex_normal_1");
+    info.sampler(7, ImageType::Float2D, "tex_rough_1");
+
+    info.sampler(8, ImageType::Float2D, "tex_diffuse_2");
+    info.sampler(9, ImageType::Float2D, "tex_normal_2");
+    info.sampler(10, ImageType::Float2D, "tex_rough_2");
+
+    info.sampler(11, ImageType::Float2D, "tex_diffuse_3");
+    info.sampler(12, ImageType::Float2D, "tex_normal_3");
+    info.sampler(13, ImageType::Float2D, "tex_rough_3");
+
+    info.push_constant(Type::float4x4_t, "model_mat");
+    info.push_constant(Type::int_t, "reverse_z");
+
+    const GPUShaderCreateInfo *raw = reinterpret_cast<const GPUShaderCreateInfo *>(&info);
+    return GPU_shader_create_from_info_python(raw);
+}
+
 }  // namespace
 
 TesseraVisibilityPass::~TesseraVisibilityPass()
@@ -454,6 +657,7 @@ void TesseraVisibilityPass::terminate()
     GPU_SHADER_FREE_SAFE(mVisShader);
     GPU_SHADER_FREE_SAFE(mMaterialShader);
     GPU_SHADER_FREE_SAFE(mDepthPrepassShader);
+    GPU_SHADER_FREE_SAFE(mGbufferShader);
     if (mPositionsBuf != nullptr) { GPU_storagebuf_free(mPositionsBuf); mPositionsBuf = nullptr; }
     if (mNormalsBuf != nullptr) { GPU_storagebuf_free(mNormalsBuf); mNormalsBuf = nullptr; }
     if (mUvsBuf != nullptr) { GPU_storagebuf_free(mUvsBuf); mUvsBuf = nullptr; }
@@ -767,6 +971,154 @@ void TesseraVisibilityPass::render_depth_prepass(gpu::StorageBuf *command_buf,
     }
 
     GPU_color_mask(true, true, true, true);
+}
+
+void TesseraVisibilityPass::render_gbuffer(gpu::StorageBuf *command_buf,
+                                          size_t draw_count,
+                                          const float4x4 &viewProj,
+                                          const float3 &cam_pos,
+                                          int viewport_width,
+                                          int viewport_height,
+                                          const float4x4 &object_model,
+                                          bool reverse_z,
+                                          const std::vector<uint32_t> *material_counts,
+                                          uint32_t max_commands_per_material)
+{
+    if (command_buf == nullptr || draw_count == 0 || mVisShader == nullptr ||
+        mPositionsBuf == nullptr || mMeshBatch == nullptr)
+    {
+        return;
+    }
+    if (viewport_width <= 0 || viewport_height <= 0) {
+        return;
+    }
+    if (!ensure_targets(viewport_width, viewport_height)) {
+        return;
+    }
+    if (mGbufferShader == nullptr) {
+        mGbufferShader = createGbufferShader();
+        if (mGbufferShader == nullptr) {
+            return;
+        }
+    }
+
+    (void)cam_pos;
+    gpu::FrameBuffer *target_gbuffer_fb = GPU_framebuffer_active_get();
+
+    /* Encode "no geometry" as tri_id == 0xFFFFFFFF. */
+    const uint32_t clear_value[4] = {0xFFFFFFFFu, 0u, 0u, 0u};
+    GPU_texture_clear(mVisTexture, GPU_DATA_UINT, static_cast<const void *>(clear_value));
+
+    /* ---------------- Pass 1: visibility ---------------- */
+    GPU_framebuffer_bind(mFrameBuffer);
+    GPU_framebuffer_clear_depth(mFrameBuffer, reverse_z ? 0.0f : 1.0f);
+    GPU_depth_test(reverse_z ? GPU_DEPTH_GREATER_EQUAL : GPU_DEPTH_LESS_EQUAL);
+    GPU_depth_mask(true);
+    GPU_face_culling(GPU_CULL_NONE);
+    GPU_blend(GPU_BLEND_NONE);
+    GPU_color_mask(false, false, false, false);
+
+    GPU_shader_bind(mVisShader);
+    GPU_storagebuf_bind(mIndicesBuf, 0);
+    GPU_storagebuf_bind(mPositionsBuf, 1);
+    if (mClusterMetaBuf != nullptr) {
+        GPU_storagebuf_bind(mClusterMetaBuf, 2);
+    }
+    GPU_texture_image_bind(mVisTexture, 0);
+    GPU_shader_uniform_mat4(mVisShader, "view_proj", viewProj.ptr());
+    GPU_shader_uniform_1i(mVisShader, "debug_clusters", 0);
+    GPU_shader_uniform_1i(mVisShader, "cluster_count", int(mClusterCount));
+    GPU_shader_uniform_1i(mVisShader, "reverse_z", reverse_z ? 1 : 0);
+
+    if (material_counts != nullptr && !material_counts->empty() && max_commands_per_material > 0) {
+        for (size_t mat = 0; mat < material_counts->size(); ++mat) {
+            uint32_t count = (*material_counts)[mat];
+            if (count == 0) continue;
+            intptr_t offset = intptr_t(mat) * max_commands_per_material * sizeof(uint32_t) * 4;
+            GPU_batch_multi_draw_indirect(
+                mMeshBatch, command_buf, int(count), offset, sizeof(uint32_t) * 4);
+        }
+    }
+    else {
+        GPU_batch_multi_draw_indirect(
+            mMeshBatch, command_buf, int(draw_count), 0, sizeof(uint32_t) * 4);
+    }
+
+    GPU_color_mask(true, true, true, true);
+    GPU_memory_barrier(GPU_BARRIER_TEXTURE_FETCH);
+
+    /* ---------------- Pass 2: G-Buffer output ---------------- */
+    GPU_framebuffer_bind(target_gbuffer_fb);
+    GPU_depth_test(reverse_z ? GPU_DEPTH_GREATER_EQUAL : GPU_DEPTH_LESS_EQUAL);
+    GPU_depth_mask(true);
+    GPU_blend(GPU_BLEND_NONE);
+
+    GPU_batch_set_shader(mFullscreenBatch, mGbufferShader);
+    GPU_storagebuf_bind(mPositionsBuf, 0);
+    GPU_storagebuf_bind(mNormalsBuf, 1);
+    GPU_storagebuf_bind(mUvsBuf, 2);
+    GPU_storagebuf_bind(mIndicesBuf, 3);
+    if (mTangentsBuf != nullptr) {
+        GPU_storagebuf_bind(mTangentsBuf, 4);
+    }
+    if (mTriMaterialsBuf != nullptr) {
+        GPU_storagebuf_bind(mTriMaterialsBuf, 5);
+    }
+
+    /* Upload material parameters: 2 vec4 per slot (base_color, props) */
+    float mat_params[4 * 8] = {};
+    for (int s = 0; s < 4; ++s) {
+        if (s < int(mMaterials.size())) {
+            const auto &m = mMaterials[s];
+            mat_params[s * 8 + 0] = m.base_color.x;
+            mat_params[s * 8 + 1] = m.base_color.y;
+            mat_params[s * 8 + 2] = m.base_color.z;
+            mat_params[s * 8 + 3] = m.base_color.w;
+            mat_params[s * 8 + 4] = (m.has_diffuse && m.diffuse != nullptr) ? 1.0f : 0.0f;
+            mat_params[s * 8 + 5] = (m.has_normal && m.normal != nullptr) ? 1.0f : 0.0f;
+            mat_params[s * 8 + 6] = (m.has_roughness && m.roughness != nullptr) ? 1.0f : 0.0f;
+            mat_params[s * 8 + 7] = m.roughness_value;
+        } else {
+            mat_params[s * 8 + 0] = 0.8f;
+            mat_params[s * 8 + 1] = 0.8f;
+            mat_params[s * 8 + 2] = 0.8f;
+            mat_params[s * 8 + 3] = 1.0f;
+            mat_params[s * 8 + 4] = 0.0f;
+            mat_params[s * 8 + 5] = 0.0f;
+            mat_params[s * 8 + 6] = 0.0f;
+            mat_params[s * 8 + 7] = 0.5f;
+        }
+    }
+    if (mMaterialParamsBuf == nullptr) {
+        mMaterialParamsBuf = GPU_storagebuf_create_ex(
+            sizeof(mat_params), mat_params, GPU_USAGE_DYNAMIC, "tessera_mat_params");
+    } else {
+        GPU_storagebuf_update(mMaterialParamsBuf, mat_params);
+    }
+    GPU_storagebuf_bind(mMaterialParamsBuf, 6);
+
+    GPU_texture_bind(mVisTexture, 0);
+    GPU_texture_bind(mDepthTexture, 1);
+
+    for (int s = 0; s < 4; ++s) {
+        gpu::Texture *td = mDefaultWhiteTex;
+        gpu::Texture *tn = mDefaultNormalTex;
+        gpu::Texture *tr = mDefaultRoughTex;
+        if (s < int(mMaterials.size())) {
+            const auto &m = mMaterials[s];
+            if (m.has_diffuse && m.diffuse) td = m.diffuse;
+            if (m.has_normal && m.normal) tn = m.normal;
+            if (m.has_roughness && m.roughness) tr = m.roughness;
+        }
+        GPU_texture_bind(td, 2 + s * 3 + 0);
+        GPU_texture_bind(tn, 2 + s * 3 + 1);
+        GPU_texture_bind(tr, 2 + s * 3 + 2);
+    }
+
+    GPU_shader_uniform_mat4(mGbufferShader, "model_mat", object_model.ptr());
+    GPU_shader_uniform_1i(mGbufferShader, "reverse_z", reverse_z ? 1 : 0);
+
+    GPU_batch_draw(mFullscreenBatch);
 }
 
 

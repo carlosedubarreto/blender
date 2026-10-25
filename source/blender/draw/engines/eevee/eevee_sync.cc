@@ -216,7 +216,24 @@ void SyncModule::sync_mesh(const ObjectRef &ob_ref)
   }
 
   if (inst_.tessera.record(ob_ref.object)) {
-    /* Tessera-owned object: rendered by Tessera pipeline in draw. */
+    /* Tessera-owned object: rendered by Tessera pipeline in G-Buffer pass.
+     * Register with shadow pipeline and bounds so scene lights and shadows detect it! */
+    ObjectHandle ob_handle = sync_object(ob_ref, inst_.manager->unique_handle(ob_ref));
+    inst_.shadows.sync_object(ob_handle, false, false, false);
+
+    MaterialArray &material_array = inst_.materials.material_array_get(ob_handle, false);
+    Span<gpu::Batch *> mat_geom = DRW_cache_object_surface_material_get(
+        ob_handle.object, material_array.gpu_materials);
+    for (auto i : material_array.gpu_materials.index_range()) {
+      gpu::Batch *geom = mat_geom[i];
+      if (geom == nullptr) {
+        continue;
+      }
+      Material &material = material_array.materials[i];
+      if (material.shadow.sub_pass != nullptr) {
+        geometry_call(material.shadow.sub_pass, geom, ob_handle.res_handle);
+      }
+    }
     return;
   }
 

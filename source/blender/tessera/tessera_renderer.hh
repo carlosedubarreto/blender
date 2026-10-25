@@ -96,6 +96,11 @@ public:
      */
     void draw_prepass(int viewportWidth, int viewportHeight);
 
+    /**
+     * G-Buffer deferred pass: render clusters into EEVEE G-Buffer MRT targets.
+     */
+    void draw_gbuffer(int viewportWidth, int viewportHeight, const float4x4 &object_model = float4x4::identity());
+
     size_t drawCount(uint32_t material_index = 0) const
     {
         if (mMaterialDrawCounts.size() > material_index) {

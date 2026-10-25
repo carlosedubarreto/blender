@@ -155,6 +155,11 @@ void TesseraDrawPass::draw_prepass(int viewportWidth, int viewportHeight) const
     renderer_.draw_prepass(viewportWidth, viewportHeight);
 }
 
+void TesseraDrawPass::draw_gbuffer(int viewportWidth, int viewportHeight, const float4x4 &object_model) const
+{
+    renderer_.draw_gbuffer(viewportWidth, viewportHeight, object_model);
+}
+
 size_t TesseraDrawPass::drawCount(uint32_t material_index) const
 {
     return renderer_.drawCount(material_index);

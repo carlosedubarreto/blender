@@ -16,6 +16,7 @@
 #include "BLI_map.hh"
 #include "BLI_math_matrix_types.hh"
 
+#include <chrono>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -51,6 +52,10 @@ class TesseraModule {
     Object *ob = nullptr;
     bool show_stats = true;
     bool log_console = false;
+    bool show_fps_panel = false;
+    bool show_fps_hud = false;
+    std::chrono::steady_clock::time_point last_frame_time{};
+    float smoothed_dt = 0.0f;
     tessera::TesseraData data;
     std::vector<tessera::TesseraMaterialTextures> materials;
     std::unique_ptr<tessera::TesseraDrawPass> pass;
@@ -65,7 +70,11 @@ class TesseraModule {
 
   void begin_sync();
   bool record(Object *ob);
+  bool has_objects() const;
+  bool has_cluster_visualization() const;
   void draw_prepass(const draw::View &view, const int2 &resolution, gpu::FrameBuffer *depth_fb);
+  void draw_gbuffer(const draw::View &view, const int2 &resolution, gpu::FrameBuffer *gbuffer_fb);
+  void draw_shadow(const draw::View &shadow_view, gpu::FrameBuffer *shadow_fb);
   void draw(const draw::View &view, const int2 &resolution, gpu::FrameBuffer *target_fb);
 };
 

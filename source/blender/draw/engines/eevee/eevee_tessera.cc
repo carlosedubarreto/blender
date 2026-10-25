@@ -203,6 +203,30 @@ static bool tessera_log_console_get(Object *ob)
   return prop->data.val != 0;
 }
 
+static bool tessera_show_fps_panel_get(Object *ob)
+{
+  const IDProperty *prop = tessera_property_find(ob, "tessera_show_fps_panel");
+  if (prop == nullptr) {
+    return false;
+  }
+  if (prop->type == IDP_INT) {
+    return IDP_int_get(prop) != 0;
+  }
+  return prop->data.val != 0;
+}
+
+static bool tessera_show_fps_hud_get(Object *ob)
+{
+  const IDProperty *prop = tessera_property_find(ob, "tessera_show_fps_hud");
+  if (prop == nullptr) {
+    return false;
+  }
+  if (prop->type == IDP_INT) {
+    return IDP_int_get(prop) != 0;
+  }
+  return prop->data.val != 0;
+}
+
 static void idp_int_replace(IDProperty *idgroup, const char *name, int value)
 {
   if (idgroup == nullptr) {
@@ -235,6 +259,28 @@ static void idp_float_replace(IDProperty *idgroup, const char *name, float value
     IDP_FreeFromGroup(idgroup, prev);
   }
   IDP_AddToGroup(idgroup, bke::idprop::create(name, value).release());
+}
+
+static void tessera_write_fps_to_object(Object *ob, float fps, float frame_time_ms)
+{
+  if (ob == nullptr) {
+    return;
+  }
+  auto write_props = [&](ID *id) {
+    if (id == nullptr) {
+      return;
+    }
+    if (IDProperty *group = IDP_EnsureProperties(id)) {
+      idp_float_replace(group, "tessera_stat_fps", fps);
+      idp_float_replace(group, "tessera_stat_frametime", frame_time_ms);
+    }
+  };
+
+  write_props(&ob->id);
+  const ID *orig_id = DEG_get_original_id(&ob->id);
+  if (orig_id != nullptr && orig_id != &ob->id) {
+    write_props(const_cast<ID *>(orig_id));
+  }
 }
 
 static void tessera_write_telemetry_to_object(Object *ob, const tessera::TesseraTelemetry &telem)
@@ -414,6 +460,8 @@ bool TesseraModule::record(Object *ob)
   state.ob = ob;
   state.show_stats = tessera_show_stats_get(ob);
   state.log_console = tessera_log_console_get(ob);
+  state.show_fps_panel = tessera_show_fps_panel_get(ob);
+  state.show_fps_hud = tessera_show_fps_hud_get(ob);
   state.visualize_clusters = tessera_visualize_get(ob);
   state.pixel_error = tessera_pixel_error_get(ob);
   state.view_source = tessera_view_source_get(ob);
@@ -568,7 +616,9 @@ void TesseraModule::draw(const draw::View &view,
     state.pass->setShadingMode(mode);
     const bool show_stats = state.show_stats;
     const bool log_console = state.log_console;
-    state.pass->setTelemetryEnabled(show_stats || log_console);
+    const bool show_fps_panel = state.show_fps_panel;
+    const bool show_fps_hud = state.show_fps_hud;
+    state.pass->setTelemetryEnabled(show_stats || log_console || show_fps_hud);
     state.pass->update(state.data,
                        object_persmat,
                        viewport_proj_scale_y,
@@ -576,7 +626,30 @@ void TesseraModule::draw(const draw::View &view,
                        has_cam_lod ? &lod_object_persmat : nullptr,
                        has_cam_lod ? &lod_proj_scale_y : nullptr);
 
-    if (show_stats || log_console) {
+    if (show_fps_panel || show_fps_hud) {
+      auto now = std::chrono::steady_clock::now();
+      if (state.last_frame_time.time_since_epoch().count() == 0) {
+        state.last_frame_time = now;
+      }
+      else {
+        float dt = std::chrono::duration<float>(now - state.last_frame_time).count();
+        state.last_frame_time = now;
+        if (dt > 0.0f && dt < 1.0f) {
+          state.smoothed_dt = (state.smoothed_dt <= 0.0f) ? dt : (0.9f * state.smoothed_dt + 0.1f * dt);
+        }
+      }
+      float fps = (state.smoothed_dt > 1e-5f) ? (1.0f / state.smoothed_dt) : 0.0f;
+      float frame_time_ms = state.smoothed_dt * 1000.0f;
+      if (state.ob != nullptr) {
+        tessera_write_fps_to_object(state.ob, fps, frame_time_ms);
+      }
+    }
+    else {
+      state.last_frame_time = {};
+      state.smoothed_dt = 0.0f;
+    }
+
+    if (show_stats || log_console || show_fps_hud) {
       using namespace std::chrono;
       static auto last_stat_time = steady_clock::now();
       auto now = steady_clock::now();
@@ -598,7 +671,7 @@ void TesseraModule::draw(const draw::View &view,
         telem.cam_distance = cam_distance;
         telem.pixel_error = state.pass->getPixelError();
 
-        if (show_stats && state.ob != nullptr) {
+        if ((show_stats || show_fps_hud) && state.ob != nullptr) {
           tessera_write_telemetry_to_object(state.ob, telem);
           WM_main_add_notifier(NC_OBJECT | ND_DRAW, state.ob);
         }
@@ -624,6 +697,96 @@ void TesseraModule::draw(const draw::View &view,
       state.pass->draw(resolution.x, resolution.y);
     }
   }
+}
+
+bool TesseraModule::has_objects() const
+{
+  std::lock_guard lock(const_cast<std::mutex &>(this->mutex_));
+  for (const auto item : objects_.items()) {
+    if (item.value->used && !item.value->data.clusters.empty()) {
+      return true;
+    }
+  }
+  return false;
+}
+
+bool TesseraModule::has_cluster_visualization() const
+{
+  std::lock_guard lock(const_cast<std::mutex &>(this->mutex_));
+  for (const auto item : objects_.items()) {
+    if (item.value->used && !item.value->data.clusters.empty() && item.value->visualize_clusters > 0) {
+      return true;
+    }
+  }
+  return false;
+}
+
+void TesseraModule::draw_gbuffer(const draw::View &view,
+                                 const int2 &resolution,
+                                 gpu::FrameBuffer *gbuffer_fb)
+{
+  if (objects_.is_empty()) {
+    return;
+  }
+  std::lock_guard lock(this->mutex_);
+  const float4x4 viewport_persmat = view.persmat();
+  const float viewport_proj_scale_y = std::abs(view.winmat()[1][1]);
+
+  if (gbuffer_fb != nullptr) {
+    GPU_framebuffer_bind(gbuffer_fb);
+  }
+
+  for (auto item : objects_.items()) {
+    ObjectState &state = *item.value;
+    if (!state.used || state.data.clusters.empty()) {
+      continue;
+    }
+    const float4x4 object_persmat = viewport_persmat * state.object_mat;
+
+    float4x4 cam_persmat;
+    float cam_proj_scale_y = viewport_proj_scale_y;
+    bool has_cam_lod = false;
+    if (state.view_source != 0) {
+      if (tessera_camera_persmat(
+              inst_.scene, inst_.draw_ctx, resolution, cam_persmat, cam_proj_scale_y))
+      {
+        has_cam_lod = true;
+      }
+    }
+    const float4x4 lod_object_persmat = has_cam_lod ? (cam_persmat * state.object_mat) :
+                                                      object_persmat;
+    const float lod_proj_scale_y = has_cam_lod ? cam_proj_scale_y : viewport_proj_scale_y;
+
+    if (state.pass == nullptr) {
+      state.pass = std::make_unique<tessera::TesseraDrawPass>(
+          state.data, object_persmat, viewport_proj_scale_y, float(resolution.y));
+      if (!state.pass->init()) {
+        state.pass.reset();
+        continue;
+      }
+    }
+    /* EEVEE uses Reverse-Z depth testing. */
+    state.pass->setReverseZ(true);
+    state.pass->setPixelError(state.pixel_error);
+    state.pass->update(state.data,
+                       object_persmat,
+                       viewport_proj_scale_y,
+                       float(resolution.y),
+                       has_cam_lod ? &lod_object_persmat : nullptr,
+                       has_cam_lod ? &lod_proj_scale_y : nullptr);
+
+    state.pass->set_material_textures(state.materials);
+    if (state.pass->drawCount() != 0) {
+      state.pass->draw_gbuffer(resolution.x, resolution.y, state.object_mat);
+    }
+  }
+}
+
+void TesseraModule::draw_shadow(const draw::View &shadow_view,
+                                gpu::FrameBuffer *shadow_fb)
+{
+  (void)shadow_view;
+  (void)shadow_fb;
 }
 
 }  // namespace blender::eevee

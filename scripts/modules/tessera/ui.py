@@ -9,8 +9,107 @@ The panel is automatically registered together with the rest of the
 """
 
 import os
-
+import blf
 import bpy
+import gpu
+from gpu_extras.batch import batch_for_shader
+
+_hud_handler = None
+
+
+def draw_tessera_hud():
+    """Render on-screen viewport HUD overlay for active Tessera object."""
+    if bpy.app.background:
+        return
+
+    context = bpy.context
+    ob = getattr(context, "active_object", None)
+    if not ob or not ob.get("tessera_enabled", False):
+        return
+
+    props = getattr(ob, "tessera", None)
+    if not props or not getattr(props, "show_fps_hud", False):
+        return
+
+    fps = float(ob.get("tessera_stat_fps", 0.0))
+    ft_ms = float(ob.get("tessera_stat_frametime", 0.0))
+    clusters = int(ob.get("tessera_stat_clusters", 0))
+    tris = int(ob.get("tessera_stat_triangles", 0))
+
+    # Position in top-left margin (offset from header/gizmos)
+    font_id = 0
+    x_offset = 20
+    region_h = context.region.height if context.region else 600
+    y_offset = region_h - 60
+
+    text = f"Tessera: {fps:.1f} FPS ({ft_ms:.2f} ms) | {clusters:,} clusters | {tris:,} tris"
+
+    try:
+        # Optional subtle background pill/box
+        blf.size(font_id, 14)
+        text_w, text_h = blf.dimensions(font_id, text)
+        pad_x = 8
+        pad_y = 5
+        x0 = float(x_offset - pad_x)
+        x1 = float(x_offset + text_w + pad_x)
+        y0 = float(y_offset - pad_y)
+        y1 = float(y_offset + text_h + pad_y)
+
+        shader = gpu.shader.from_builtin('UNIFORM_COLOR')
+        batch = batch_for_shader(
+            shader, 'TRI_FAN',
+            {"pos": [(x0, y0), (x1, y0), (x1, y1), (x0, y1)]}
+        )
+        gpu.state.blend_set('ALPHA')
+        shader.bind()
+        shader.uniform_float("color", (0.05, 0.05, 0.08, 0.75))
+        batch.draw(shader)
+        gpu.state.blend_set('NONE')
+
+        blf.size(font_id, 14)
+        blf.color(font_id, 0.2, 0.9, 0.4, 1.0)  # Green accent
+        blf.position(font_id, x_offset, y_offset, 0)
+        blf.draw(font_id, text)
+    except Exception:
+        pass
+
+
+def register_hud_handler():
+    """Register the viewport HUD draw handler."""
+    global _hud_handler
+    if _hud_handler is None:
+        _hud_handler = bpy.types.SpaceView3D.draw_handler_add(
+            draw_tessera_hud, (), 'WINDOW', 'POST_PIXEL'
+        )
+
+
+def unregister_hud_handler():
+    """Unregister the viewport HUD draw handler."""
+    global _hud_handler
+    if _hud_handler is not None:
+        try:
+            bpy.types.SpaceView3D.draw_handler_remove(_hud_handler, 'WINDOW')
+        except Exception:
+            pass
+        _hud_handler = None
+
+
+def update_hud_state():
+    """Ensure HUD draw handler is registered only when at least one object has HUD enabled."""
+    has_hud = False
+    try:
+        for ob in bpy.data.objects:
+            props = getattr(ob, "tessera", None)
+            if props and getattr(props, "show_fps_hud", False):
+                has_hud = True
+                break
+    except Exception:
+        pass
+
+    if has_hud:
+        register_hud_handler()
+    else:
+        unregister_hud_handler()
 
 
 def _tessera_sidebar_refresh_timer():
@@ -25,10 +124,15 @@ def _tessera_sidebar_refresh_timer():
         pass
 
     needs_stats = False
+    needs_hud = False
     if ob and bool(ob.get("tessera_enabled", False)):
         props = getattr(ob, "tessera", None)
-        if props and getattr(props, "show_stats", False):
-            needs_stats = True
+        if props:
+            if getattr(props, "show_stats", False) or getattr(props, "show_fps_panel", False):
+                needs_stats = True
+            if getattr(props, "show_fps_hud", False):
+                needs_hud = True
+                needs_stats = True
 
     # If building or live stats are active, explicitly redraw the sidebar UI region
     if is_building or needs_stats:
@@ -41,6 +145,8 @@ def _tessera_sidebar_refresh_timer():
                         if area.type == 'VIEW_3D':
                             for region in area.regions:
                                 if region.type == 'UI':
+                                    region.tag_redraw()
+                                elif region.type == 'WINDOW' and needs_hud:
                                     region.tag_redraw()
         return 0.08  # ~12 FPS refresh rate for UI readouts (very lightweight)
 
@@ -168,6 +274,16 @@ class TESSERA_PT_object(bpy.types.Panel):
                 t_row.prop(tessera_props, "show_stats", text="Live Stats", icon='INFO')
                 t_row.prop(tessera_props, "log_console", text="Console Log", icon='CONSOLE')
 
+                fps_row = t_box.row(align=True)
+                fps_row.prop(tessera_props, "show_fps_panel", text="Panel FPS", icon='TIME')
+                fps_row.prop(tessera_props, "show_fps_hud", text="Viewport HUD", icon='RESTRICT_VIEW_OFF')
+
+                if tessera_props.show_fps_panel:
+                    fps_col = t_box.column(align=True)
+                    fps = float(ob.get("tessera_stat_fps", 0.0))
+                    ms = float(ob.get("tessera_stat_frametime", 0.0))
+                    fps_col.label(text=f"Performance: {fps:.1f} FPS ({ms:.2f} ms)", icon='PREFERENCES')
+
                 if tessera_props.show_stats:
                     t_col = t_box.column(align=True)
                     lod_min = ob.get('tessera_stat_lod_min', 0)
@@ -204,9 +320,11 @@ def register():
     for cls in classes:
         register_class(cls)
     register_refresh_timer()
+    register_hud_handler()
 
 
 def unregister():
+    unregister_hud_handler()
     unregister_refresh_timer()
     from bpy.utils import unregister_class
     for cls in reversed(classes):

@@ -91,6 +91,21 @@ def _log_console_update(self, context):
     _tag_tessera_redraw(self, context)
 
 
+def _show_fps_panel_update(self, context):
+    self.id_data["tessera_show_fps_panel"] = int(self.show_fps_panel)
+    _tag_tessera_redraw(self, context)
+
+
+def _show_fps_hud_update(self, context):
+    self.id_data["tessera_show_fps_hud"] = int(self.show_fps_hud)
+    try:
+        from tessera.ui import update_hud_state
+        update_hud_state()
+    except Exception:
+        pass
+    _tag_tessera_redraw(self, context)
+
+
 
 def draw_tessera(data, view_proj, viewport_height, batch, renderer):
     """Draw the loaded Tessera data for the current frame.
@@ -186,6 +201,20 @@ class TesseraProperties(bpy.types.PropertyGroup):
         description="Print real-time draw metrics to the system console",
         default=False,
         update=_log_console_update,
+    )
+
+    show_fps_panel: BoolProperty(
+        name="Show FPS in Panel",
+        description="Display frame rate and frame time in the sidebar panel",
+        default=False,
+        update=_show_fps_panel_update,
+    )
+
+    show_fps_hud: BoolProperty(
+        name="Viewport HUD",
+        description="Render a live FPS and frame time overlay directly in the 3D Viewport",
+        default=False,
+        update=_show_fps_hud_update,
     )
 
 

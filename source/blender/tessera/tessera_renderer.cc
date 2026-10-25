@@ -469,6 +469,32 @@ void TesseraRenderer::draw_prepass(int viewportWidth, int viewportHeight)
                                          mMaxCommandsPerMaterial);
 }
 
+void TesseraRenderer::draw_gbuffer(int viewportWidth, int viewportHeight, const float4x4 &object_model)
+{
+    if (mDrawBuffer == nullptr || mDrawCount == 0) {
+        return;
+    }
+    if (!mVisibilityInitialized) {
+        if (!mVisibilityPass.init()) {
+            return;
+        }
+        mVisibilityInitialized = true;
+    }
+    GPU_storagebuf_sync_as_indirect_buffer(mDrawBuffer);
+    mVisibilityPass.set_data(mLastData == nullptr ? TesseraData() : *mLastData);
+    const TesseraViewInfo view = getViewInfo(mLastViewProj, 0.0f, mLastProjScaleY);
+    mVisibilityPass.render_gbuffer(mDrawBuffer,
+                                  mDrawCount,
+                                  mLastViewProj,
+                                  view.camPos,
+                                  viewportWidth,
+                                  viewportHeight,
+                                  object_model,
+                                  mReverseZ,
+                                  &mMaterialDrawCounts,
+                                  mMaxCommandsPerMaterial);
+}
+
 void TesseraRenderer::getLevelCounts(const TesseraData &data,
                                     const float4x4 &lodViewProj,
                                     float projScaleY,
