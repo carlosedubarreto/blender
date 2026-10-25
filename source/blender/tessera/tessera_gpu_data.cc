@@ -59,7 +59,7 @@ void flattenClustersForGpu(const TesseraData &data, TesseraGpuClusterData &out)
 
         out.meta.push_back(c.firstIndex);
         out.meta.push_back(c.indexCount);
-        out.meta.push_back(children_count[i]);
+        out.meta.push_back(c.level);
         /* Encoded parent index (0xFFFFFFFF for roots). */
         out.meta.push_back(c.parentGroup >= 0 ? uint32_t(c.parentGroup) :
                                                 0xFFFFFFFFu);

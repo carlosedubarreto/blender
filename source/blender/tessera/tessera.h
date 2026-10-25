@@ -30,6 +30,17 @@ namespace tessera {
 
 using TesseraProgressCallback = std::function<void(float progress, const char *step_name)>;
 
+struct TesseraTelemetry {
+    uint32_t active_clusters = 0;
+    uint32_t active_triangles = 0;
+    uint32_t active_lod_min = 0;
+    uint32_t active_lod_max = 0;
+    uint32_t total_clusters = 0;
+    uint32_t total_triangles = 0;
+    float cam_distance = 0.0f;
+    float pixel_error = 1.0f;
+};
+
 struct TesseraMaterialTextures {
     gpu::Texture *diffuse = nullptr;
     gpu::Texture *normal = nullptr;

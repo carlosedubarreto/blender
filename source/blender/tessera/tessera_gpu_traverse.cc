@@ -81,6 +81,13 @@ void main()
     return;
   }
 
+  if (record_telemetry != 0) {
+    atomicAdd(draw_counters[64], 1u);
+    atomicAdd(draw_counters[65], index_count / 3u);
+    atomicMin(draw_counters[66], meta.z);
+    atomicMax(draw_counters[67], meta.z);
+  }
+
   /* DrawArraysIndirectCommand layout (4 x uint32): the visibility pass uses
    * vertex pulling, so `first` is the absolute index-buffer position and the
    * triangle id is derived from gl_VertexID directly. */
@@ -107,7 +114,7 @@ void main()
     info.storage_buf(1, gshader::Qualifier::read, "vec4", "cluster_parent_sphere[]");
     /* binding 2: cluster error (x) and parent error (y). */
     info.storage_buf(2, gshader::Qualifier::read, "vec2", "cluster_errors[]");
-    /* binding 3: x = firstIndex, y = indexCount, z = childrenCount,
+    /* binding 3: x = firstIndex, y = indexCount, z = cluster LOD level,
      * w = encoded parent index (0xFFFFFFFF for roots). */
     info.storage_buf(3, gshader::Qualifier::read, "uvec4", "cluster_meta[]");
     /* binding 4: indirect draw commands (4 uints per command). */
@@ -126,6 +133,7 @@ void main()
     info.push_constant(gshader::Type::int_t, "max_commands");
     info.push_constant(gshader::Type::int_t, "max_materials");
     info.push_constant(gshader::Type::int_t, "max_commands_per_material");
+    info.push_constant(gshader::Type::int_t, "record_telemetry");
     info.push_constant(gshader::Type::float4_t, "frustum_planes", 6);
 
     /* Runtime-created shader: register the raw source as "generated" content

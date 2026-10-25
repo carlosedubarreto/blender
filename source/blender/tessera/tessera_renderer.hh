@@ -121,10 +121,18 @@ public:
                         float viewportHeight,
                         std::map<uint32_t, uint32_t> &out_counts) const;
 
+    /** Realtime Viewport Telemetry */
+    void setTelemetryEnabled(bool enabled) { mTelemetryEnabled = enabled; }
+    bool isTelemetryEnabled() const { return mTelemetryEnabled; }
+    const TesseraTelemetry &getTelemetry() const { return mTelemetry; }
+
     /** True when the GPU compute traversal is in use. */
     bool usesGpuTraversal() const { return mGpuTraversalActive; }
 
 private:
+    bool mTelemetryEnabled = true;
+    TesseraTelemetry mTelemetry;
+
     /** CPU fallback: run the flat traversal and upload the commands. */
     void updateWithCpuTraversal(const TesseraData &data,
                                 const float4x4 &viewProj,

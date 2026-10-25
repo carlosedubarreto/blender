@@ -48,6 +48,9 @@ class TesseraModule {
     float pixel_error = 1.0f;
     int view_source = 0;
     float4x4 object_mat;
+    Object *ob = nullptr;
+    bool show_stats = true;
+    bool log_console = false;
     tessera::TesseraData data;
     std::vector<tessera::TesseraMaterialTextures> materials;
     std::unique_ptr<tessera::TesseraDrawPass> pass;

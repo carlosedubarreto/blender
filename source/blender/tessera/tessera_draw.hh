@@ -100,6 +100,21 @@ public:
         return renderer_.getReverseZ();
     }
 
+    void setTelemetryEnabled(bool enabled)
+    {
+        renderer_.setTelemetryEnabled(enabled);
+    }
+
+    bool isTelemetryEnabled() const
+    {
+        return renderer_.isTelemetryEnabled();
+    }
+
+    const TesseraTelemetry &getTelemetry() const
+    {
+        return renderer_.getTelemetry();
+    }
+
     void getLevelCounts(const TesseraData &data,
                         const float4x4 &lodViewProj,
                         float projScaleY,

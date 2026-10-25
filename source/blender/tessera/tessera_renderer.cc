@@ -231,7 +231,7 @@ void TesseraRenderer::updateWithGpuTraversal(const TesseraData &data,
                               "tessera_cluster_meta") ||
             !ensureStorageBuf(&mMaterialsBuf, clusterCount * sizeof(uint32_t),
                               "tessera_cluster_materials") ||
-            !ensureStorageBuf(&mCounterBuf, kMaxMaterials * sizeof(uint32_t), "tessera_draw_counter"))
+            !ensureStorageBuf(&mCounterBuf, 128 * sizeof(uint32_t), "tessera_draw_counter"))
         {
             mGpuPathFailed = true;
             return updateWithCpuTraversal(data, viewProj, projScaleY, viewportHeight);
@@ -248,7 +248,14 @@ void TesseraRenderer::updateWithGpuTraversal(const TesseraData &data,
 
     /* Reset the shared counter, bind resources and dispatch one thread per
      * cluster. */
-    GPU_storagebuf_clear_to_zero(mCounterBuf);
+    if (mTelemetryEnabled) {
+        uint32_t init_counters[128] = {0};
+        init_counters[66] = 0x0000FFFF; /* For atomicMin on min LOD */
+        GPU_storagebuf_update(mCounterBuf, init_counters);
+    }
+    else {
+        GPU_storagebuf_clear_to_zero(mCounterBuf);
+    }
 
     const TesseraViewInfo view = getViewInfo(viewProj, viewportHeight, projScaleY);
 
@@ -272,6 +279,7 @@ void TesseraRenderer::updateWithGpuTraversal(const TesseraData &data,
                           int(kDrawCommandCapacity));
     GPU_shader_uniform_1i(mTraverseShader, "max_materials", int(max_materials));
     GPU_shader_uniform_1i(mTraverseShader, "max_commands_per_material", int(mMaxCommandsPerMaterial));
+    GPU_shader_uniform_1i(mTraverseShader, "record_telemetry", mTelemetryEnabled ? 1 : 0);
     GPU_shader_uniform_4fv_array(mTraverseShader, "frustum_planes", 6,
                                  view.planes);
 
@@ -279,10 +287,24 @@ void TesseraRenderer::updateWithGpuTraversal(const TesseraData &data,
     const uint32_t groups = uint32_t((clusterCount + group_size - 1) / group_size);
     GPU_compute_dispatch(mTraverseShader, groups, 1, 1);
 
-    /* Read back the emitted command counters per material. */
-    std::vector<uint32_t> emitted(max_materials, 0);
-    GPU_storagebuf_read(mCounterBuf, emitted.data());
-    mMaterialDrawCounts = std::move(emitted);
+    /* Read back the emitted command counters per material and optional telemetry. */
+    if (mTelemetryEnabled) {
+        std::vector<uint32_t> counters(128, 0);
+        GPU_storagebuf_read(mCounterBuf, counters.data());
+        mMaterialDrawCounts.assign(counters.begin(), counters.begin() + max_materials);
+        mTelemetry.active_clusters = counters[64];
+        mTelemetry.active_triangles = counters[65];
+        mTelemetry.active_lod_min = (counters[64] > 0 && counters[66] != 0x0000FFFF) ? counters[66] : 0;
+        mTelemetry.active_lod_max = (counters[64] > 0) ? counters[67] : 0;
+        mTelemetry.total_clusters = uint32_t(data.clusters.size());
+        mTelemetry.total_triangles = uint32_t(data.indices.size() / 3);
+        mTelemetry.pixel_error = mPixelError;
+    }
+    else {
+        std::vector<uint32_t> emitted(max_materials, 0);
+        GPU_storagebuf_read(mCounterBuf, emitted.data());
+        mMaterialDrawCounts = std::move(emitted);
+    }
 
     size_t total = 0;
     for (uint32_t c : mMaterialDrawCounts) {
@@ -354,6 +376,24 @@ void TesseraRenderer::updateWithCpuTraversal(const TesseraData &data,
     }
     mDrawCount = total;
     mGpuTraversalActive = false;
+
+    if (mTelemetryEnabled) {
+        mTelemetry.active_clusters = uint32_t(selected.size());
+        mTelemetry.total_clusters = uint32_t(data.clusters.size());
+        mTelemetry.total_triangles = uint32_t(data.indices.size() / 3);
+        mTelemetry.pixel_error = mPixelError;
+        uint32_t tri_count = 0;
+        uint32_t min_lod = selected.empty() ? 0 : 999999;
+        uint32_t max_lod = 0;
+        for (const TesseraCluster &c : selected) {
+            tri_count += c.indexCount / 3;
+            min_lod = std::min(min_lod, c.level);
+            max_lod = std::max(max_lod, c.level);
+        }
+        mTelemetry.active_triangles = tri_count;
+        mTelemetry.active_lod_min = selected.empty() ? 0 : min_lod;
+        mTelemetry.active_lod_max = selected.empty() ? 0 : max_lod;
+    }
 
     if (total == 0) {
         return;

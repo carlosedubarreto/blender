@@ -55,7 +55,15 @@ def _tag_tessera_redraw(self, context):
 
 def _enabled_update(self, context):
     self.id_data["tessera_enabled"] = int(self.enabled)
+    if self.enabled:
+        import os
+        nc2 = self.id_data.get("tessera_nc2")
+        from tessera.ui import get_existing_nc2_path
+        existing = get_existing_nc2_path(self.id_data)
+        if existing and (not nc2 or not os.path.isfile(bpy.path.abspath(nc2))):
+            self.id_data["tessera_nc2"] = existing
     _tag_tessera_redraw(self, context)
+
 
 
 def _visualize_clusters_update(self, context):
@@ -71,6 +79,17 @@ def _pixel_error_update(self, context):
 def _view_source_update(self, context):
     self.id_data["tessera_view_source"] = int(self.view_source == 'CAMERA')
     _tag_tessera_redraw(self, context)
+
+
+def _show_stats_update(self, context):
+    self.id_data["tessera_show_stats"] = int(self.show_stats)
+    _tag_tessera_redraw(self, context)
+
+
+def _log_console_update(self, context):
+    self.id_data["tessera_log_console"] = int(self.log_console)
+    _tag_tessera_redraw(self, context)
+
 
 
 def draw_tessera(data, view_proj, viewport_height, batch, renderer):
@@ -153,6 +172,22 @@ class TesseraProperties(bpy.types.PropertyGroup):
         max=100.0,
         default=0.0,
     )
+
+    # Real-time telemetry toggles
+    show_stats: BoolProperty(
+        name="Show Live Stats",
+        description="Display real-time cluster, triangle, and LOD telemetry in the panel",
+        default=True,
+        update=_show_stats_update,
+    )
+
+    log_console: BoolProperty(
+        name="Log Stats to Console",
+        description="Print real-time draw metrics to the system console",
+        default=False,
+        update=_log_console_update,
+    )
+
 
 
 def register():

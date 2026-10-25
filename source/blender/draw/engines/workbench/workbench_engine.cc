@@ -53,6 +53,12 @@
 
 #include "workbench_engine.h" /* Own include. */
 
+#include "BKE_idprop.hh"
+#include "BKE_main.hh"
+#include "WM_api.hh"
+#include "WM_types.hh"
+
+#include <chrono>
 #include <cstdio>
 #include <map>
 #include <memory>
@@ -86,6 +92,9 @@ class Instance : public DrawEngine {
     /* LOD view source: 0 = viewport view, 1 = the scene's active camera. */
     int view_source = 0;
     bool used = false;
+    Object *ob = nullptr;
+    bool show_stats = true;
+    bool log_console = false;
     tessera::TesseraData data;
     std::unique_ptr<tessera::TesseraDrawPass> pass;
   };
@@ -100,15 +109,36 @@ class Instance : public DrawEngine {
   static bool tessera_path_get(Object *ob, std::string &r_path)
   {
     const IDProperty *group = IDP_GetProperties(&ob->id);
-    if (group == nullptr) {
-      return false;
+    if (group != nullptr) {
+      const IDProperty *prop = IDP_GetPropertyTypeFromGroup(group, "tessera_nc2", IDP_STRING);
+      if (prop != nullptr && prop->data.pointer != nullptr) {
+        r_path = static_cast<const char *>(prop->data.pointer);
+        if (!r_path.empty()) {
+          return true;
+        }
+      }
     }
-    const IDProperty *prop = IDP_GetPropertyTypeFromGroup(group, "tessera_nc2", IDP_STRING);
-    if (prop == nullptr || prop->data.pointer == nullptr) {
-      return false;
+
+    const char *blend_path = BKE_main_blendfile_path_from_global();
+    if (blend_path != nullptr && blend_path[0] != '\0') {
+      char test_path[FILE_MAX];
+      BLI_snprintf(test_path, sizeof(test_path), "//%s.nc2", ob->id.name + 2);
+      BLI_path_abs(test_path, blend_path);
+      if (BLI_exists(test_path)) {
+        r_path = test_path;
+        return true;
+      }
+      if (ob->data != nullptr) {
+        const ID *mesh_id = static_cast<const ID *>(ob->data);
+        BLI_snprintf(test_path, sizeof(test_path), "//%s.nc2", mesh_id->name + 2);
+        BLI_path_abs(test_path, blend_path);
+        if (BLI_exists(test_path)) {
+          r_path = test_path;
+          return true;
+        }
+      }
     }
-    r_path = static_cast<const char *>(prop->data.pointer);
-    return !r_path.empty();
+    return false;
   }
 
   static bool tessera_visualize_get(Object *ob)
@@ -175,6 +205,101 @@ class Instance : public DrawEngine {
       return 0;
     }
     return prop->data.val;
+  }
+
+  static bool tessera_show_stats_get(Object *ob)
+  {
+    IDProperty *group = IDP_GetProperties(&ob->id);
+    if (group == nullptr) {
+      return true;
+    }
+    IDProperty *prop = IDP_GetPropertyFromGroup(group, "tessera_show_stats");
+    if (prop == nullptr) {
+      return true;
+    }
+    if (prop->type == IDP_INT) {
+      return IDP_int_get(prop) != 0;
+    }
+    return prop->data.val != 0;
+  }
+
+  static bool tessera_log_console_get(Object *ob)
+  {
+    IDProperty *group = IDP_GetProperties(&ob->id);
+    if (group == nullptr) {
+      return false;
+    }
+    IDProperty *prop = IDP_GetPropertyFromGroup(group, "tessera_log_console");
+    if (prop == nullptr) {
+      return false;
+    }
+    if (prop->type == IDP_INT) {
+      return IDP_int_get(prop) != 0;
+    }
+    return prop->data.val != 0;
+  }
+
+  static void idp_int_replace(IDProperty *idgroup, const char *name, int value)
+  {
+    if (idgroup == nullptr) {
+      return;
+    }
+    if (IDProperty *prev = IDP_GetPropertyFromGroup(idgroup, name)) {
+      if (ELEM(prev->type, IDP_INT, IDP_BOOLEAN)) {
+        IDP_int_or_bool_set(prev, value);
+        return;
+      }
+      IDP_FreeFromGroup(idgroup, prev);
+    }
+    IDP_AddToGroup(idgroup, bke::idprop::create(name, value).release());
+  }
+
+  static void idp_float_replace(IDProperty *idgroup, const char *name, float value)
+  {
+    if (idgroup == nullptr) {
+      return;
+    }
+    if (IDProperty *prev = IDP_GetPropertyFromGroup(idgroup, name)) {
+      if (prev->type == IDP_FLOAT) {
+        IDP_float_set(prev, value);
+        return;
+      }
+      if (prev->type == IDP_DOUBLE) {
+        IDP_double_set(prev, double(value));
+        return;
+      }
+      IDP_FreeFromGroup(idgroup, prev);
+    }
+    IDP_AddToGroup(idgroup, bke::idprop::create(name, value).release());
+  }
+
+  static void tessera_write_telemetry_to_object(Object *ob, const tessera::TesseraTelemetry &telem)
+  {
+    if (ob == nullptr) {
+      return;
+    }
+    auto write_props = [&](ID *id) {
+      if (id == nullptr) {
+        return;
+      }
+      if (IDProperty *group = IDP_EnsureProperties(id)) {
+        idp_int_replace(group, "tessera_stat_clusters", int(telem.active_clusters));
+        idp_int_replace(group, "tessera_stat_triangles", int(telem.active_triangles));
+        idp_int_replace(group, "tessera_stat_lod_min", int(telem.active_lod_min));
+        idp_int_replace(group, "tessera_stat_lod_max", int(telem.active_lod_max));
+        idp_int_replace(group, "tessera_total_clusters", int(telem.total_clusters));
+        idp_int_replace(group, "tessera_total_triangles", int(telem.total_triangles));
+        idp_float_replace(group, "tessera_stat_distance", telem.cam_distance);
+        idp_float_replace(group, "tessera_stat_pixel_error", telem.pixel_error);
+        idp_float_replace(group, "tessera_stat_error", telem.pixel_error);
+      }
+    };
+
+    write_props(&ob->id);
+    const ID *orig_id = DEG_get_original_id(&ob->id);
+    if (orig_id != nullptr && orig_id != &ob->id) {
+      write_props(const_cast<ID *>(orig_id));
+    }
   }
 
   /**
@@ -248,6 +373,9 @@ class Instance : public DrawEngine {
     TesseraObjectState &state = *entry;
 
     state.used = true;
+    state.ob = ob;
+    state.show_stats = tessera_show_stats_get(ob);
+    state.log_console = tessera_log_console_get(ob);
     state.visualize_clusters = tessera_visualize_get(ob);
     state.pixel_error = tessera_pixel_error_get(ob);
     state.view_source = tessera_view_source_get(ob);
@@ -330,6 +458,9 @@ class Instance : public DrawEngine {
       state.pass->setShadingMode(state.visualize_clusters ?
                                      tessera::TESSERA_SHADING_CLUSTERS :
                                      tessera::TESSERA_SHADING_DIFFUSE);
+      const bool show_stats = state.show_stats;
+      const bool log_console = state.log_console;
+      state.pass->setTelemetryEnabled(show_stats || log_console);
       state.pass->update(state.data,
                          object_persmat,
                          viewport_proj_scale_y,
@@ -337,32 +468,48 @@ class Instance : public DrawEngine {
                          has_cam_lod ? &lod_object_persmat : nullptr,
                          has_cam_lod ? &lod_proj_scale_y : nullptr);
 
-      /* Diagnostic logging: frame camera vs mesh distance, projScaleY, pixel error, and active LOD cluster counts. */
-      const float3 cam_pos = default_view.location();
-      const float3 mesh_pos = state.object_mat.location();
-      const float dist = math::distance(cam_pos, mesh_pos);
-      std::map<uint32_t, uint32_t> level_counts;
-      state.pass->getLevelCounts(state.data,
-                                 has_cam_lod ? lod_object_persmat : object_persmat,
-                                 lod_proj_scale_y,
-                                 float(resolution.y),
-                                 level_counts);
-      std::string lod_str;
-      for (const auto &pair : level_counts) {
-        if (!lod_str.empty()) {
-          lod_str += ", ";
+      if (show_stats || log_console) {
+        using namespace std::chrono;
+        static auto last_stat_time = steady_clock::now();
+        auto now = steady_clock::now();
+        auto elapsed_ms = duration_cast<milliseconds>(now - last_stat_time).count();
+        if (elapsed_ms >= 60) {
+          last_stat_time = now;
+          const float3 cam_pos = default_view.location();
+          const float3 bounds_min(state.data.header.boundsMin[0],
+                                  state.data.header.boundsMin[1],
+                                  state.data.header.boundsMin[2]);
+          const float3 bounds_max(state.data.header.boundsMax[0],
+                                  state.data.header.boundsMax[1],
+                                  state.data.header.boundsMax[2]);
+          const float3 local_center = 0.5f * (bounds_min + bounds_max);
+          const float3 world_center = (state.object_mat * float4(local_center, 1.0f)).xyz();
+          const float cam_distance = math::distance(cam_pos, world_center);
+
+          tessera::TesseraTelemetry telem = state.pass->getTelemetry();
+          telem.cam_distance = cam_distance;
+          telem.pixel_error = state.pass->getPixelError();
+
+          if (show_stats && state.ob != nullptr) {
+            tessera_write_telemetry_to_object(state.ob, telem);
+            WM_main_add_notifier(NC_OBJECT | ND_DRAW, state.ob);
+          }
+
+          if (log_console) {
+            printf("[Tessera Stats] %s | Dist: %.2fm | LOD: %u-%u | Clusters: %u/%u | Tris: %u/%u | Error: %.1fpx\n",
+                   state.ob ? (state.ob->id.name + 2) : "Object",
+                   telem.cam_distance,
+                   telem.active_lod_min,
+                   telem.active_lod_max,
+                   telem.active_clusters,
+                   telem.total_clusters,
+                   telem.active_triangles,
+                   telem.total_triangles,
+                   telem.pixel_error);
+            fflush(stdout);
+          }
         }
-        lod_str += "LOD" + std::to_string(pair.first) + ": " + std::to_string(pair.second);
       }
-      printf("[Tessera LOD] Cam: (%.2f, %.2f, %.2f) | Mesh: (%.2f, %.2f, %.2f) | Dist: %.2f | ProjScaleY: %.4f | PixelError: %.1f | %zu clusters (%s)\n",
-             cam_pos.x, cam_pos.y, cam_pos.z,
-             mesh_pos.x, mesh_pos.y, mesh_pos.z,
-             dist,
-             lod_proj_scale_y,
-             state.pass->getPixelError(),
-             state.pass->drawCount(),
-             lod_str.empty() ? "none" : lod_str.c_str());
-      fflush(stdout);
 
       if (state.pass->drawCount() != 0) {
         state.pass->draw(resolution.x, resolution.y);

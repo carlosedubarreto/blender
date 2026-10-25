@@ -36,10 +36,15 @@
 #include "BKE_context.hh"
 #include "BKE_global.hh"
 #include "BKE_idprop.hh"
+#include "BKE_lib_id.hh"
 #include "BKE_main.hh"
 #include "BKE_report.hh"
+#include "BKE_workspace.hh"
 
+#include "DNA_screen_types.h"
+#include "DNA_workspace_types.h"
 #include "ED_object.hh"
+#include "ED_screen.hh"
 
 #include "RNA_access.hh"
 #include "RNA_define.hh"
@@ -222,8 +227,16 @@ static Object *tessera_find_job_object(Main *bmain, const std::string &ob_name)
   if (bmain == nullptr || ob_name.empty()) {
     return nullptr;
   }
-  return static_cast<Object *>(
-      BLI_findstring(&bmain->objects, ob_name.c_str(), offsetof(ID, name) + 2));
+
+  /* Safe C++ range-based traversal over blender::Main::objects */
+  for (Object &ob : bmain->objects) {
+    /* Compare against both "OB<name>" and raw "<name>" */
+    if (ob.id.name + 2 == ob_name || std::string(ob.id.name) == ob_name) {
+      return &ob;
+    }
+  }
+
+  return nullptr;
 }
 
 static void tessera_build_end_job(void *customdata)
@@ -233,7 +246,8 @@ static void tessera_build_end_job(void *customdata)
     return;
   }
 
-  Object *ob = tessera_find_job_object(job->bmain, job->ob_name);
+  Main *bmain = job->bmain != nullptr ? job->bmain : G_MAIN;
+  Object *ob = tessera_find_job_object(bmain, job->ob_name);
   if (ob != nullptr) {
     if (IDProperty *idgroup = IDP_EnsureProperties(&ob->id)) {
       idp_int_replace(idgroup, "tessera_building", 0);
@@ -271,9 +285,12 @@ static void tessera_build_free_job(void *customdata)
 {
   TesseraBuildJob *job = static_cast<TesseraBuildJob *>(customdata);
   if (job != nullptr) {
-    Object *ob = tessera_find_job_object(job->bmain, job->ob_name);
-    if (ob != nullptr && ob->id.properties != nullptr) {
-      idp_int_replace(ob->id.properties, "tessera_building", 0);
+    Main *bmain = job->bmain != nullptr ? job->bmain : G_MAIN;
+    Object *ob = tessera_find_job_object(bmain, job->ob_name);
+    if (ob != nullptr) {
+      if (IDProperty *idgroup = IDP_EnsureProperties(&ob->id)) {
+        idp_int_replace(idgroup, "tessera_building", 0);
+      }
       WM_main_add_notifier(NC_OBJECT | ND_DRAW, ob);
     }
     WM_main_add_notifier(NC_SPACE | ND_SPACE_VIEW3D, nullptr);
@@ -298,52 +315,109 @@ static bool object_tessera_build_poll(bContext *C)
   return true;
 }
 
+static void tessera_tag_sidebar_redraw(bContext *C)
+{
+  wmWindowManager *wm = CTX_wm_manager(C);
+  if (wm == nullptr) {
+    return;
+  }
+
+  for (wmWindow *win = static_cast<wmWindow *>(wm->windows.first); win != nullptr;
+       win = win->next)
+  {
+    WM_window_status_area_tag_redraw(win);
+    bScreen *screen = BKE_workspace_active_screen_get(win->workspace_hook);
+    if (screen == nullptr) {
+      continue;
+    }
+
+    for (ScrArea *area = static_cast<ScrArea *>(screen->areabase.first); area != nullptr;
+         area = area->next)
+    {
+      if (area->spacetype == SPACE_VIEW3D) {
+        for (ARegion *region = static_cast<ARegion *>(area->regionbase.first); region != nullptr;
+             region = region->next)
+        {
+          if (region->regiontype == RGN_TYPE_UI) {
+            ED_region_tag_redraw(region);
+          }
+        }
+      }
+    }
+  }
+}
+
+static void tessera_tag_redraw_all(bContext *C, Object *ob)
+{
+  tessera_tag_sidebar_redraw(C);
+  if (ob != nullptr) {
+    WM_main_add_notifier(NC_OBJECT | ND_DRAW, ob);
+  }
+  WM_main_add_notifier(NC_SPACE | ND_SPACE_VIEW3D, nullptr);
+  WM_main_add_notifier(NC_WINDOW, nullptr);
+}
+
 static wmOperatorStatus object_tessera_build_modal(bContext *C,
                                                   wmOperator *op,
                                                   const wmEvent *event)
 {
-  Scene *scene = CTX_data_scene(C);
-  wmWindowManager *wm = CTX_wm_manager(C);
-  Main *bmain = CTX_data_main(C);
   TesseraBuildJob *job = static_cast<TesseraBuildJob *>(op->customdata);
-
   if (job == nullptr) {
     return OPERATOR_FINISHED;
   }
 
-  Object *ob = tessera_find_job_object(bmain, job->ob_name);
+  Main *bmain = CTX_data_main(C);
+  if (bmain == nullptr) {
+    return OPERATOR_PASS_THROUGH;
+  }
 
-  if (ob != nullptr && ob->id.properties != nullptr) {
+  Object *ob = tessera_find_job_object(bmain, job->ob_name);
+  if (ob == nullptr) {
+    /* Also check if the active object in context matches the job's target */
+    Object *active_ob = CTX_data_active_object(C);
+    if (active_ob != nullptr &&
+        (active_ob->id.name + 2 == job->ob_name || std::string(active_ob->id.name) == job->ob_name))
+    {
+      ob = active_ob;
+    }
+  }
+
+  if (ob == nullptr) {
+    /* Object no longer exists in scene; cleanly abort */
+    return OPERATOR_CANCELLED;
+  }
+
+  if (IDProperty *idgroup = IDP_EnsureProperties(&ob->id)) {
     const float prog = job->progress.load(std::memory_order_relaxed);
     std::string status;
     {
       std::lock_guard lock(job->status_mutex);
       status = job->status_name;
     }
-    idp_float_replace(ob->id.properties, "tessera_build_progress", prog);
+    idp_float_replace(idgroup, "tessera_build_progress", prog);
     if (!status.empty()) {
-      idp_string_replace(ob->id.properties, "tessera_build_status", status.c_str());
+      idp_string_replace(idgroup, "tessera_build_status", status.c_str());
     }
-    WM_main_add_notifier(NC_OBJECT | ND_DRAW, ob);
-    WM_main_add_notifier(NC_SPACE | ND_SPACE_VIEW3D, nullptr);
+    tessera_tag_redraw_all(C, ob);
   }
 
+  Scene *scene = CTX_data_scene(C);
+  wmWindowManager *wm = CTX_wm_manager(C);
+
   if (!WM_jobs_test(wm, scene, WM_JOB_TYPE_OBJECT_BAKE)) {
-    if (ob != nullptr && ob->id.properties != nullptr) {
-      idp_int_replace(ob->id.properties, "tessera_building", 0);
-      WM_main_add_notifier(NC_OBJECT | ND_DRAW, ob);
+    if (IDProperty *idgroup = IDP_EnsureProperties(&ob->id)) {
+      idp_int_replace(idgroup, "tessera_building", 0);
     }
-    WM_main_add_notifier(NC_SPACE | ND_SPACE_VIEW3D, nullptr);
+    tessera_tag_redraw_all(C, ob);
     return OPERATOR_FINISHED | OPERATOR_PASS_THROUGH;
   }
   if (event->type == EVT_ESCKEY && event->val == KM_PRESS) {
     WM_jobs_kill_type(wm, scene, WM_JOB_TYPE_OBJECT_BAKE);
-    if (ob != nullptr && ob->id.properties != nullptr) {
-      idp_int_replace(ob->id.properties, "tessera_building", 0);
-      idp_string_replace(ob->id.properties, "tessera_build_status", "Cancelled");
-      WM_main_add_notifier(NC_OBJECT | ND_DRAW, ob);
+    if (IDProperty *idgroup = IDP_EnsureProperties(&ob->id)) {
+      idp_int_replace(idgroup, "tessera_building", 0);
+      idp_string_replace(idgroup, "tessera_build_status", "Cancelled");
     }
-    WM_main_add_notifier(NC_SPACE | ND_SPACE_VIEW3D, nullptr);
+    tessera_tag_redraw_all(C, ob);
     return OPERATOR_CANCELLED;
   }
   return OPERATOR_PASS_THROUGH;
