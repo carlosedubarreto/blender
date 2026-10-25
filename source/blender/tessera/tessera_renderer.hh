@@ -199,6 +199,7 @@ private:
     float mLastLodProjScaleY = 1.0f;
     float mLastViewportHeight = 0.0f;
     float mLastPixelError = -1.0f;
+    bool mLastTelemetryEnabled = false;
     bool mMatricesCurrent = false;  // track if matrices have been updated this frame
 
     // LOD pixel error threshold (pixels).

@@ -127,6 +127,7 @@ void TesseraRenderer::terminate()
     mLastLodViewProj = float4x4::identity();
     mLastProjScaleY = 1.0f;
     mLastLodProjScaleY = 1.0f;
+    mLastTelemetryEnabled = false;
 }
 
 void TesseraRenderer::update(const TesseraData &data,
@@ -146,8 +147,9 @@ void TesseraRenderer::update(const TesseraData &data,
     const float4x4 &lod_vp = (lodViewProj != nullptr) ? *lodViewProj : viewProj;
     const float lod_scale_y = (lodProjScaleY != nullptr) ? *lodProjScaleY : projScaleY;
 
-    /* Freshness check — only re-traverse if matrices, data or view parameters changed */
+    /* Freshness check — only re-traverse if matrices, data, telemetry or view parameters changed */
     bool data_changed = (mLastData == nullptr) || (&data != mLastData);
+    bool telem_changed = (mLastTelemetryEnabled != mTelemetryEnabled);
     bool view_changed = !mMatricesCurrent ||
                         (mLastViewProj != viewProj) ||
                         (mLastLodViewProj != lod_vp) ||
@@ -156,8 +158,8 @@ void TesseraRenderer::update(const TesseraData &data,
                         (mLastViewportHeight != viewportHeight) ||
                         (mLastPixelError != mPixelError);
 
-    if (!data_changed && !view_changed && (mGpuTraversalActive || !mCpuCommandStream.empty())) {
-        // Matrices, parameters and data are identical to last frame; retain existing draw commands and count
+    if (!data_changed && !view_changed && !telem_changed && (mGpuTraversalActive || !mCpuCommandStream.empty())) {
+        // Matrices, parameters, telemetry and data are identical to last frame; retain existing draw commands and count
         return;
     }
     mMatricesCurrent = true;
@@ -170,6 +172,7 @@ void TesseraRenderer::update(const TesseraData &data,
     mLastLodProjScaleY = lod_scale_y;
     mLastViewportHeight = viewportHeight;
     mLastPixelError = mPixelError;
+    mLastTelemetryEnabled = mTelemetryEnabled;
 
     /* Try to bring up the compute traversal once. If it cannot be created
      * (no context, unsupported backend, compile error) fall back to the CPU

@@ -55,6 +55,7 @@ class TesseraModule {
     bool show_fps_panel = false;
     bool show_fps_hud = false;
     std::chrono::steady_clock::time_point last_frame_time{};
+    std::chrono::steady_clock::time_point last_stat_time{};
     float smoothed_dt = 0.0f;
     tessera::TesseraData data;
     std::vector<tessera::TesseraMaterialTextures> materials;
@@ -63,6 +64,8 @@ class TesseraModule {
 
   std::mutex mutex_;
   Map<std::string, std::unique_ptr<ObjectState>> objects_;
+
+  void update_telemetry(ObjectState &state, const float3 &cam_pos);
 
  public:
   TesseraModule(Instance &inst);

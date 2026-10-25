@@ -493,6 +493,96 @@ bool TesseraModule::record(Object *ob)
   return !state.data.clusters.empty();
 }
 
+void TesseraModule::update_telemetry(ObjectState &state, const float3 &cam_pos)
+{
+  const bool show_stats = state.show_stats;
+  const bool log_console = state.log_console;
+  const bool show_fps_panel = state.show_fps_panel;
+  const bool show_fps_hud = state.show_fps_hud;
+
+  if (!show_stats && !log_console && !show_fps_panel && !show_fps_hud) {
+    state.last_frame_time = {};
+    state.smoothed_dt = 0.0f;
+    return;
+  }
+
+  /* Compute FPS / frame time metrics if requested. */
+  if (show_fps_panel || show_fps_hud) {
+    auto now = std::chrono::steady_clock::now();
+    if (state.last_frame_time.time_since_epoch().count() == 0) {
+      state.last_frame_time = now;
+    }
+    else {
+      float dt = std::chrono::duration<float>(now - state.last_frame_time).count();
+      if (dt > 0.001f && dt < 1.0f) {
+        state.last_frame_time = now;
+        state.smoothed_dt = (state.smoothed_dt <= 0.0f) ? dt :
+                                                          (0.9f * state.smoothed_dt + 0.1f * dt);
+      }
+      else if (dt >= 1.0f) {
+        state.last_frame_time = now;
+      }
+    }
+    float fps = (state.smoothed_dt > 1e-5f) ? (1.0f / state.smoothed_dt) : 0.0f;
+    float frame_time_ms = state.smoothed_dt * 1000.0f;
+    if (state.ob != nullptr) {
+      tessera_write_fps_to_object(state.ob, fps, frame_time_ms);
+      if (show_fps_panel) {
+        WM_main_add_notifier(NC_OBJECT | ND_DRAW, state.ob);
+      }
+    }
+  }
+  else {
+    state.last_frame_time = {};
+    state.smoothed_dt = 0.0f;
+  }
+
+  /* Extract telemetry counters and update object properties. */
+  if (show_stats || log_console || show_fps_hud) {
+    using namespace std::chrono;
+    auto now = steady_clock::now();
+    auto elapsed_ms = (state.last_stat_time.time_since_epoch().count() == 0) ?
+                          60 :
+                          duration_cast<milliseconds>(now - state.last_stat_time).count();
+    if (elapsed_ms >= 60) {
+      state.last_stat_time = now;
+      const float3 bounds_min(state.data.header.boundsMin[0],
+                              state.data.header.boundsMin[1],
+                              state.data.header.boundsMin[2]);
+      const float3 bounds_max(state.data.header.boundsMax[0],
+                              state.data.header.boundsMax[1],
+                              state.data.header.boundsMax[2]);
+      const float3 local_center = 0.5f * (bounds_min + bounds_max);
+      const float3 world_center = (state.object_mat * float4(local_center, 1.0f)).xyz();
+      const float cam_distance = math::distance(cam_pos, world_center);
+
+      tessera::TesseraTelemetry telem = state.pass ? state.pass->getTelemetry() :
+                                                     tessera::TesseraTelemetry{};
+      telem.cam_distance = cam_distance;
+      telem.pixel_error = state.pass ? state.pass->getPixelError() : state.pixel_error;
+
+      if ((show_stats || show_fps_hud) && state.ob != nullptr) {
+        tessera_write_telemetry_to_object(state.ob, telem);
+        WM_main_add_notifier(NC_OBJECT | ND_DRAW, state.ob);
+      }
+
+      if (log_console) {
+        printf("[Tessera Stats] %s | Dist: %.2fm | LOD: %u-%u | Clusters: %u/%u | Tris: %u/%u | Error: %.1fpx\n",
+               state.ob ? (state.ob->id.name + 2) : "Object",
+               telem.cam_distance,
+               telem.active_lod_min,
+               telem.active_lod_max,
+               telem.active_clusters,
+               telem.total_clusters,
+               telem.active_triangles,
+               telem.total_triangles,
+               telem.pixel_error);
+        fflush(stdout);
+      }
+    }
+  }
+}
+
 void TesseraModule::draw_prepass(const draw::View &view,
                                 const int2 &resolution,
                                 gpu::FrameBuffer *depth_fb)
@@ -540,6 +630,11 @@ void TesseraModule::draw_prepass(const draw::View &view,
     /* EEVEE uses Reverse-Z depth testing. */
     state.pass->setReverseZ(true);
     state.pass->setPixelError(state.pixel_error);
+    const bool show_stats = state.show_stats;
+    const bool log_console = state.log_console;
+    const bool show_fps_panel = state.show_fps_panel;
+    const bool show_fps_hud = state.show_fps_hud;
+    state.pass->setTelemetryEnabled(show_stats || log_console || show_fps_panel || show_fps_hud);
     state.pass->update(state.data,
                        object_persmat,
                        viewport_proj_scale_y,
@@ -618,7 +713,7 @@ void TesseraModule::draw(const draw::View &view,
     const bool log_console = state.log_console;
     const bool show_fps_panel = state.show_fps_panel;
     const bool show_fps_hud = state.show_fps_hud;
-    state.pass->setTelemetryEnabled(show_stats || log_console || show_fps_hud);
+    state.pass->setTelemetryEnabled(show_stats || log_console || show_fps_panel || show_fps_hud);
     state.pass->update(state.data,
                        object_persmat,
                        viewport_proj_scale_y,
@@ -626,71 +721,7 @@ void TesseraModule::draw(const draw::View &view,
                        has_cam_lod ? &lod_object_persmat : nullptr,
                        has_cam_lod ? &lod_proj_scale_y : nullptr);
 
-    if (show_fps_panel || show_fps_hud) {
-      auto now = std::chrono::steady_clock::now();
-      if (state.last_frame_time.time_since_epoch().count() == 0) {
-        state.last_frame_time = now;
-      }
-      else {
-        float dt = std::chrono::duration<float>(now - state.last_frame_time).count();
-        state.last_frame_time = now;
-        if (dt > 0.0f && dt < 1.0f) {
-          state.smoothed_dt = (state.smoothed_dt <= 0.0f) ? dt : (0.9f * state.smoothed_dt + 0.1f * dt);
-        }
-      }
-      float fps = (state.smoothed_dt > 1e-5f) ? (1.0f / state.smoothed_dt) : 0.0f;
-      float frame_time_ms = state.smoothed_dt * 1000.0f;
-      if (state.ob != nullptr) {
-        tessera_write_fps_to_object(state.ob, fps, frame_time_ms);
-      }
-    }
-    else {
-      state.last_frame_time = {};
-      state.smoothed_dt = 0.0f;
-    }
-
-    if (show_stats || log_console || show_fps_hud) {
-      using namespace std::chrono;
-      static auto last_stat_time = steady_clock::now();
-      auto now = steady_clock::now();
-      auto elapsed_ms = duration_cast<milliseconds>(now - last_stat_time).count();
-      if (elapsed_ms >= 60) {
-        last_stat_time = now;
-        const float3 cam_pos = view.location();
-        const float3 bounds_min(state.data.header.boundsMin[0],
-                                state.data.header.boundsMin[1],
-                                state.data.header.boundsMin[2]);
-        const float3 bounds_max(state.data.header.boundsMax[0],
-                                state.data.header.boundsMax[1],
-                                state.data.header.boundsMax[2]);
-        const float3 local_center = 0.5f * (bounds_min + bounds_max);
-        const float3 world_center = (state.object_mat * float4(local_center, 1.0f)).xyz();
-        const float cam_distance = math::distance(cam_pos, world_center);
-
-        tessera::TesseraTelemetry telem = state.pass->getTelemetry();
-        telem.cam_distance = cam_distance;
-        telem.pixel_error = state.pass->getPixelError();
-
-        if ((show_stats || show_fps_hud) && state.ob != nullptr) {
-          tessera_write_telemetry_to_object(state.ob, telem);
-          WM_main_add_notifier(NC_OBJECT | ND_DRAW, state.ob);
-        }
-
-        if (log_console) {
-          printf("[Tessera Stats] %s | Dist: %.2fm | LOD: %u-%u | Clusters: %u/%u | Tris: %u/%u | Error: %.1fpx\n",
-                 state.ob ? (state.ob->id.name + 2) : "Object",
-                 telem.cam_distance,
-                 telem.active_lod_min,
-                 telem.active_lod_max,
-                 telem.active_clusters,
-                 telem.total_clusters,
-                 telem.active_triangles,
-                 telem.total_triangles,
-                 telem.pixel_error);
-          fflush(stdout);
-        }
-      }
-    }
+    update_telemetry(state, view.location());
 
     state.pass->set_material_textures(state.materials);
     if (state.pass->drawCount() != 0) {
@@ -768,12 +799,19 @@ void TesseraModule::draw_gbuffer(const draw::View &view,
     /* EEVEE uses Reverse-Z depth testing. */
     state.pass->setReverseZ(true);
     state.pass->setPixelError(state.pixel_error);
+    const bool show_stats = state.show_stats;
+    const bool log_console = state.log_console;
+    const bool show_fps_panel = state.show_fps_panel;
+    const bool show_fps_hud = state.show_fps_hud;
+    state.pass->setTelemetryEnabled(show_stats || log_console || show_fps_panel || show_fps_hud);
     state.pass->update(state.data,
                        object_persmat,
                        viewport_proj_scale_y,
                        float(resolution.y),
                        has_cam_lod ? &lod_object_persmat : nullptr,
                        has_cam_lod ? &lod_proj_scale_y : nullptr);
+
+    update_telemetry(state, view.location());
 
     state.pass->set_material_textures(state.materials);
     if (state.pass->drawCount() != 0) {
