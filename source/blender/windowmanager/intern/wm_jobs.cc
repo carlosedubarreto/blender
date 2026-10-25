@@ -292,6 +292,14 @@ float WM_jobs_progress(const wmWindowManager *wm, const void *owner)
   return 0.0;
 }
 
+void WM_jobs_progress(wmJob *wm_job, float progress)
+{
+  if (wm_job) {
+    wm_job->worker_status.progress = progress;
+    wm_job->worker_status.do_update = true;
+  }
+}
+
 static void wm_jobs_update_progress_bars(wmWindowManager *wm)
 {
   float total_progress = 0.0f;
@@ -342,6 +350,14 @@ const char *WM_jobs_name(const wmWindowManager *wm, const void *owner)
   }
 
   return nullptr;
+}
+
+void WM_jobs_status_name(wmJob *wm_job, const char *name)
+{
+  if (wm_job && name && name[0] != '\0') {
+    STRNCPY(wm_job->name, name);
+    wm_job->worker_status.do_update = true;
+  }
 }
 
 void *WM_jobs_customdata_from_type(wmWindowManager *wm, const void *owner, int job_type)

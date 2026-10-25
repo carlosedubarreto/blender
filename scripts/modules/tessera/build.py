@@ -174,6 +174,13 @@ class TesseraBuild(bpy.types.Operator):
         maxlen=1024,
     )
 
+    def invoke(self, context, event):
+        obj = context.active_object
+        if obj is None or obj.type != "MESH":
+            self.report({"ERROR"}, "Active object is not a mesh")
+            return {"CANCELLED"}
+        return bpy.ops.object.tessera_build('INVOKE_DEFAULT', filepath=self.path)
+
     def execute(self, context):
         obj = context.active_object
         if obj is None or obj.type != "MESH":

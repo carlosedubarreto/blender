@@ -40,12 +40,7 @@ struct BuilderParams {
 };
 
 /** Vertex with all attributes needed for the per-cluster private copy. */
-struct BuildVertex {
-    float3 position;
-    float3 normal;
-    float2 uv;
-    float4 tangent = float4(1.0f, 0.0f, 0.0f, 1.0f);
-};
+using BuildVertex = TesseraRawVertex;
 
 struct BuildTriangle {
     uint32_t v[3];

@@ -582,8 +582,10 @@ BuildResult buildClusterDAG(const std::vector<BuildVertex> &verts,
     /* Hierarchy: merge adjacent clusters, simplify with QEM, re-cluster. */
     for (uint32_t level = 1; level < params.maxLevels; ++level) {
         if (progress_cb) {
-            float p = 0.30f + 0.55f * std::min(1.0f, float(level) / 8.0f);
-            progress_cb(p, "Simplifying LOD clusters (QEM)...");
+            float p = 0.30f + 0.55f * std::min(1.0f, float(level) / 16.0f);
+            char step_msg[64];
+            snprintf(step_msg, sizeof(step_msg), "Simplifying DAG Level %u...", level);
+            progress_cb(p, step_msg);
         }
         const auto groups = groupClusters(R, frontier, params.mergeGroupSize);
         std::vector<uint32_t> next_frontier;

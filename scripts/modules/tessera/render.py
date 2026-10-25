@@ -144,6 +144,16 @@ class TesseraProperties(bpy.types.PropertyGroup):
         update=_visualize_clusters_update,
     )
 
+    # Cluster build progress (0.0 to 100.0)
+    build_progress: FloatProperty(
+        name="Progress",
+        description="Cluster generation progress",
+        subtype='PERCENTAGE',
+        min=0.0,
+        max=100.0,
+        default=0.0,
+    )
+
 
 def register():
     bpy.utils.register_class(TesseraProperties)

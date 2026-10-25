@@ -56,6 +56,9 @@ void main()
   vec3 pos = vec3(positions[idx * 3u], positions[idx * 3u + 1u],
                   positions[idx * 3u + 2u]);
   gl_Position = view_proj * vec4(pos, 1.0);
+  if (reverse_z != 0) {
+    gl_Position.z = -gl_Position.z;
+  }
 
   bary = vec2(corner == 0u ? 1.0 : 0.0, corner == 1u ? 1.0 : 0.0);
   tri_id = global_idx / 3u;
@@ -247,6 +250,9 @@ void main()
   vec3 pos = vec3(positions[idx * 3u], positions[idx * 3u + 1u],
                   positions[idx * 3u + 2u]);
   gl_Position = view_proj * vec4(pos, 1.0);
+  if (reverse_z != 0) {
+    gl_Position.z = -gl_Position.z;
+  }
 }
 )";
 
@@ -276,7 +282,7 @@ gpu::Shader *createVisShader()
     info.storage_buf(1, Qualifier::read, "float", "positions[]");
     info.storage_buf(2, Qualifier::read, "uvec4", "cluster_meta[]");
     info.image(0,
-               gpu::TextureFormat::UINT_32,
+               gpu::TextureFormat::UINT_32_32_32_32,
                Qualifier::write,
                ImageReadWriteType::Uint2D,
                "vis_image");
@@ -284,6 +290,7 @@ gpu::Shader *createVisShader()
     info.push_constant(Type::float4x4_t, "view_proj");
     info.push_constant(Type::int_t, "debug_clusters");
     info.push_constant(Type::int_t, "cluster_count");
+    info.push_constant(Type::int_t, "reverse_z");
 
     StageInterfaceInfo iface("tessera_vis_iface", "");
     iface.flat(Type::uint_t, "tri_id");
@@ -364,6 +371,7 @@ gpu::Shader *createDepthPrepassShader()
     info.storage_buf(1, Qualifier::read, "float", "positions[]");
 
     info.push_constant(Type::float4x4_t, "view_proj");
+    info.push_constant(Type::int_t, "reverse_z");
 
     const GPUShaderCreateInfo *raw = reinterpret_cast<const GPUShaderCreateInfo *>(&info);
     return GPU_shader_create_from_info_python(raw);
@@ -613,6 +621,7 @@ void TesseraVisibilityPass::render(gpu::StorageBuf *command_buf,
         "debug_clusters",
         shading_mode == TESSERA_SHADING_CLUSTERS ? 1 : 0);
     GPU_shader_uniform_1i(mVisShader, "cluster_count", int(mClusterCount));
+    GPU_shader_uniform_1i(mVisShader, "reverse_z", reverse_z ? 1 : 0);
 
     if (material_counts != nullptr && !material_counts->empty() && max_commands_per_material > 0) {
         for (size_t mat = 0; mat < material_counts->size(); ++mat) {
@@ -741,6 +750,7 @@ void TesseraVisibilityPass::render_depth_prepass(gpu::StorageBuf *command_buf,
     GPU_storagebuf_bind(mIndicesBuf, 0);
     GPU_storagebuf_bind(mPositionsBuf, 1);
     GPU_shader_uniform_mat4(mDepthPrepassShader, "view_proj", viewProj.ptr());
+    GPU_shader_uniform_1i(mDepthPrepassShader, "reverse_z", reverse_z ? 1 : 0);
 
     if (material_counts != nullptr && !material_counts->empty() && max_commands_per_material > 0) {
         for (size_t mat = 0; mat < material_counts->size(); ++mat) {

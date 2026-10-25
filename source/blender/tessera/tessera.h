@@ -42,6 +42,20 @@ struct TesseraMaterialTextures {
     bool has_roughness = false;
 };
 
+struct TesseraRawVertex {
+    float3 position;
+    float3 normal;
+    float2 uv;
+    float4 tangent = float4(1.0f, 0.0f, 0.0f, 1.0f);
+};
+
+struct TesseraRawMesh {
+    std::vector<TesseraRawVertex> verts;
+    std::vector<uint32_t> tri_verts;
+    std::vector<uint32_t> tri_materials;
+    uint32_t header_flags = 0;
+};
+
 // ----------------------------------------------------------------------------
 // Data model (matches Tessera_CUP2 .nc2 binary layout)
 // ----------------------------------------------------------------------------
@@ -146,6 +160,18 @@ struct TesseraLodParams
     /** Maximum number of clusters to draw per frame. 0 = unlimited. */
     uint32_t maxClustersPerFrame = 0;
 };
+
+/**
+ * Extract raw geometry arrays from a Blender Mesh (must run on main thread).
+ * \returns true on success.
+ */
+bool extractMeshGeometry(const Mesh &mesh, TesseraRawMesh &out_raw);
+
+/**
+ * Build Tessera cluster DAG from extracted raw geometry arrays (thread-safe, zero BKE dependencies).
+ * \returns true on success.
+ */
+bool buildFromRawMesh(const TesseraRawMesh &raw, TesseraData &out, TesseraProgressCallback progress_cb = nullptr);
 
 /**
  * Build Tessera cluster data from a Blender Mesh (drawn read-only).

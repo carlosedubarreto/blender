@@ -1933,7 +1933,9 @@ wmJob *WM_jobs_get(wmWindowManager *wm,
  */
 bool WM_jobs_test(const wmWindowManager *wm, const void *owner, int job_type);
 float WM_jobs_progress(const wmWindowManager *wm, const void *owner);
+void WM_jobs_progress(wmJob *wm_job, float progress);
 const char *WM_jobs_name(const wmWindowManager *wm, const void *owner);
+void WM_jobs_status_name(wmJob *wm_job, const char *name);
 /**
  * Time that job started.
  */

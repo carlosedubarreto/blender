@@ -14,7 +14,10 @@
  */
 
 #include <cstdio>
+#include <atomic>
 #include <chrono>
+#include <mutex>
+#include <string>
 #include <thread>
 #include <vector>
 
@@ -24,6 +27,7 @@
 #include "DNA_mesh_types.h"
 #include "DNA_object_types.h"
 
+#include "BLI_listbase.h"
 #include "BLI_path_utils.hh"
 #include "BLI_fileops.hh"
 #include "BLI_string.h"
@@ -42,6 +46,7 @@
 
 #include "WM_api.hh"
 #include "WM_types.hh"
+#include "wm_event_types.hh"
 
 #include "tessera.h"
 #include "tessera_draw.hh"
@@ -63,8 +68,11 @@ namespace blender::ed::object {
  * \{ */
 
 struct TesseraBuildJob {
+  Main *bmain = nullptr;
+  std::string ob_name;
   Object *ob = nullptr;
-  Mesh *mesh = nullptr;
+  Scene *scene = nullptr;
+  tessera::TesseraRawMesh raw;
   char filepath[FILE_MAX] = "";
   char stored_path[FILE_MAX] = "";
   tessera::TesseraData data;
@@ -72,7 +80,12 @@ struct TesseraBuildJob {
   bool success = false;
   bool is_nonblocking_job = false;
   ReportList *reports = nullptr;
+  wmJob *wm_job = nullptr;
   wmJobWorkerStatus *worker_status = nullptr;
+
+  std::atomic<float> progress{0.0f};
+  std::mutex status_mutex;
+  std::string status_name;
 };
 
 static void tessera_build_start_job(void *customdata, wmJobWorkerStatus *worker_status)
@@ -80,23 +93,43 @@ static void tessera_build_start_job(void *customdata, wmJobWorkerStatus *worker_
   TesseraBuildJob *job = static_cast<TesseraBuildJob *>(customdata);
   job->worker_status = worker_status;
 
-  auto progress_cb = [worker_status](float progress, const char * /*step_name*/) {
+  auto progress_cb = [job, worker_status](float progress, const char *step_name) {
+    job->progress.store(progress, std::memory_order_relaxed);
+    if (step_name && step_name[0] != '\0') {
+      std::lock_guard lock(job->status_mutex);
+      job->status_name = step_name;
+    }
     if (worker_status) {
       worker_status->progress = progress;
       worker_status->do_update = true;
     }
+    if (job->wm_job) {
+      WM_jobs_progress(job->wm_job, progress);
+      if (step_name && step_name[0] != '\0') {
+        WM_jobs_status_name(job->wm_job, step_name);
+      }
+    }
   };
 
-  if (!tessera::buildFromMesh(*job->mesh, job->data, progress_cb)) {
+  if (!tessera::buildFromRawMesh(job->raw, job->data, progress_cb)) {
     if (worker_status && worker_status->reports) {
       BKE_report(worker_status->reports, RPT_ERROR, "Tessera: failed to build cluster DAG from mesh");
     }
     return;
   }
 
+  job->progress.store(0.95f, std::memory_order_relaxed);
+  {
+    std::lock_guard lock(job->status_mutex);
+    job->status_name = "Saving Tessera .nc2 file...";
+  }
   if (worker_status) {
     worker_status->progress = 0.95f;
     worker_status->do_update = true;
+  }
+  if (job->wm_job) {
+    WM_jobs_progress(job->wm_job, 0.95f);
+    WM_jobs_status_name(job->wm_job, "Saving Tessera .nc2 file...");
   }
 
   if (!tessera::serializeToMemory(job->data, job->blob)) {
@@ -124,31 +157,103 @@ static void tessera_build_start_job(void *customdata, wmJobWorkerStatus *worker_
   }
 
   job->success = true;
+  job->progress.store(1.0f, std::memory_order_relaxed);
+  {
+    std::lock_guard lock(job->status_mutex);
+    job->status_name = "Tessera clusters built!";
+  }
   if (worker_status) {
     worker_status->progress = 1.0f;
     worker_status->do_update = true;
   }
+  if (job->wm_job) {
+    WM_jobs_progress(job->wm_job, 1.0f);
+    WM_jobs_status_name(job->wm_job, "Tessera clusters built!");
+  }
+}
+
+static void idp_string_replace(IDProperty *idgroup, const char *name, const char *value)
+{
+  if (idgroup == nullptr) {
+    return;
+  }
+  if (IDProperty *prev = IDP_GetPropertyFromGroup(idgroup, name)) {
+    IDP_FreeFromGroup(idgroup, prev);
+  }
+  IDP_AddToGroup(idgroup, bke::idprop::create(name, value).release());
+}
+
+static void idp_float_replace(IDProperty *idgroup, const char *name, float value)
+{
+  if (idgroup == nullptr) {
+    return;
+  }
+  if (IDProperty *prev = IDP_GetPropertyFromGroup(idgroup, name)) {
+    if (prev->type == IDP_FLOAT) {
+      IDP_float_set(prev, value);
+      return;
+    }
+    if (prev->type == IDP_DOUBLE) {
+      IDP_double_set(prev, double(value));
+      return;
+    }
+    IDP_FreeFromGroup(idgroup, prev);
+  }
+  IDP_AddToGroup(idgroup, bke::idprop::create(name, value).release());
+}
+
+static void idp_int_replace(IDProperty *idgroup, const char *name, int value)
+{
+  if (idgroup == nullptr) {
+    return;
+  }
+  if (IDProperty *prev = IDP_GetPropertyFromGroup(idgroup, name)) {
+    if (ELEM(prev->type, IDP_INT, IDP_BOOLEAN)) {
+      IDP_int_or_bool_set(prev, value);
+      return;
+    }
+    IDP_FreeFromGroup(idgroup, prev);
+  }
+  IDP_AddToGroup(idgroup, bke::idprop::create(name, value).release());
+}
+
+static Object *tessera_find_job_object(Main *bmain, const std::string &ob_name)
+{
+  if (bmain == nullptr || ob_name.empty()) {
+    return nullptr;
+  }
+  return static_cast<Object *>(
+      BLI_findstring(&bmain->objects, ob_name.c_str(), offsetof(ID, name) + 2));
 }
 
 static void tessera_build_end_job(void *customdata)
 {
   TesseraBuildJob *job = static_cast<TesseraBuildJob *>(customdata);
-  if (!job->success || job->ob == nullptr) {
+  if (job == nullptr) {
     return;
   }
 
-  /* Record the .nc2 path on the object so the draw engine can find the
-   * Tessera data without Python involvement (blend-relative when saved). */
-  if (IDProperty *idgroup = IDP_EnsureProperties(&job->ob->id)) {
-    if (IDProperty *prev = IDP_GetPropertyFromGroup(idgroup, "tessera_nc2")) {
-      IDP_FreeFromGroup(idgroup, prev);
+  Object *ob = tessera_find_job_object(job->bmain, job->ob_name);
+  if (ob != nullptr) {
+    if (IDProperty *idgroup = IDP_EnsureProperties(&ob->id)) {
+      idp_int_replace(idgroup, "tessera_building", 0);
+      idp_float_replace(idgroup, "tessera_build_progress", 1.0f);
+      idp_string_replace(idgroup,
+                         "tessera_build_status",
+                         job->success ? "Tessera clusters built!" : "Build failed");
+      if (job->success) {
+        idp_string_replace(idgroup, "tessera_nc2", job->stored_path);
+      }
     }
-    IDP_AddToGroup(idgroup, bke::idprop::create("tessera_nc2", job->stored_path).release());
+  }
+
+  if (!job->success || ob == nullptr) {
+    return;
   }
 
   /* Tag depsgraph and notify 3D Viewport to auto-refresh immediately. */
-  DEG_id_tag_update(&job->ob->id, ID_RECALC_GEOMETRY | ID_RECALC_SHADING);
-  WM_main_add_notifier(NC_OBJECT | ND_DRAW, job->ob);
+  DEG_id_tag_update(&ob->id, ID_RECALC_GEOMETRY | ID_RECALC_SHADING);
+  WM_main_add_notifier(NC_OBJECT | ND_DRAW, ob);
   WM_main_add_notifier(NC_SPACE | ND_SPACE_VIEW3D, nullptr);
 
   if (job->reports) {
@@ -165,24 +270,105 @@ static void tessera_build_end_job(void *customdata)
 static void tessera_build_free_job(void *customdata)
 {
   TesseraBuildJob *job = static_cast<TesseraBuildJob *>(customdata);
-  delete job;
+  if (job != nullptr) {
+    Object *ob = tessera_find_job_object(job->bmain, job->ob_name);
+    if (ob != nullptr && ob->id.properties != nullptr) {
+      idp_int_replace(ob->id.properties, "tessera_building", 0);
+      WM_main_add_notifier(NC_OBJECT | ND_DRAW, ob);
+    }
+    WM_main_add_notifier(NC_SPACE | ND_SPACE_VIEW3D, nullptr);
+    delete job;
+  }
 }
 
 static bool object_tessera_build_poll(bContext *C)
 {
   Object *ob = CTX_data_active_object(C);
-  return ob != nullptr && ob->type == OB_MESH && ob->data != nullptr;
+  if (ob == nullptr || ob->type != OB_MESH || ob->data == nullptr) {
+    return false;
+  }
+  IDProperty *idgroup = IDP_GetProperties(&ob->id);
+  if (idgroup != nullptr) {
+    if (IDProperty *prop = IDP_GetPropertyFromGroup(idgroup, "tessera_building")) {
+      if (IDP_int_get(prop) != 0) {
+        return false;
+      }
+    }
+  }
+  return true;
+}
+
+static wmOperatorStatus object_tessera_build_modal(bContext *C,
+                                                  wmOperator *op,
+                                                  const wmEvent *event)
+{
+  Scene *scene = CTX_data_scene(C);
+  wmWindowManager *wm = CTX_wm_manager(C);
+  Main *bmain = CTX_data_main(C);
+  TesseraBuildJob *job = static_cast<TesseraBuildJob *>(op->customdata);
+
+  if (job == nullptr) {
+    return OPERATOR_FINISHED;
+  }
+
+  Object *ob = tessera_find_job_object(bmain, job->ob_name);
+
+  if (ob != nullptr && ob->id.properties != nullptr) {
+    const float prog = job->progress.load(std::memory_order_relaxed);
+    std::string status;
+    {
+      std::lock_guard lock(job->status_mutex);
+      status = job->status_name;
+    }
+    idp_float_replace(ob->id.properties, "tessera_build_progress", prog);
+    if (!status.empty()) {
+      idp_string_replace(ob->id.properties, "tessera_build_status", status.c_str());
+    }
+    WM_main_add_notifier(NC_OBJECT | ND_DRAW, ob);
+    WM_main_add_notifier(NC_SPACE | ND_SPACE_VIEW3D, nullptr);
+  }
+
+  if (!WM_jobs_test(wm, scene, WM_JOB_TYPE_OBJECT_BAKE)) {
+    if (ob != nullptr && ob->id.properties != nullptr) {
+      idp_int_replace(ob->id.properties, "tessera_building", 0);
+      WM_main_add_notifier(NC_OBJECT | ND_DRAW, ob);
+    }
+    WM_main_add_notifier(NC_SPACE | ND_SPACE_VIEW3D, nullptr);
+    return OPERATOR_FINISHED | OPERATOR_PASS_THROUGH;
+  }
+  if (event->type == EVT_ESCKEY && event->val == KM_PRESS) {
+    WM_jobs_kill_type(wm, scene, WM_JOB_TYPE_OBJECT_BAKE);
+    if (ob != nullptr && ob->id.properties != nullptr) {
+      idp_int_replace(ob->id.properties, "tessera_building", 0);
+      idp_string_replace(ob->id.properties, "tessera_build_status", "Cancelled");
+      WM_main_add_notifier(NC_OBJECT | ND_DRAW, ob);
+    }
+    WM_main_add_notifier(NC_SPACE | ND_SPACE_VIEW3D, nullptr);
+    return OPERATOR_CANCELLED;
+  }
+  return OPERATOR_PASS_THROUGH;
 }
 
 static wmOperatorStatus object_tessera_build_custom(bContext *C, wmOperator *op, bool is_invoke)
 {
   Object *ob = CTX_data_active_object(C);
   Mesh *mesh = id_cast<Mesh *>(ob->data);
+  Scene *scene = CTX_data_scene(C);
+  Main *bmain = CTX_data_main(C);
 
   auto *job = new TesseraBuildJob();
+  job->bmain = bmain;
+  job->ob_name = ob->id.name + 2;
   job->ob = ob;
-  job->mesh = mesh;
+  job->scene = scene;
   job->reports = op->reports;
+
+  /* Decoupled geometry extraction runs quickly on main thread. */
+  if (!tessera::extractMeshGeometry(*mesh, job->raw)) {
+    BKE_report(op->reports, RPT_ERROR, "Tessera: failed to extract mesh geometry");
+    delete job;
+    return OPERATOR_CANCELLED;
+  }
 
   RNA_string_get(op->ptr, "filepath", job->filepath);
   if (job->filepath[0] == '\0') {
@@ -206,20 +392,35 @@ static wmOperatorStatus object_tessera_build_custom(bContext *C, wmOperator *op,
     BLI_path_rel(job->stored_path, blend_path);
   }
 
+  /* Tag object as actively building clusters for UI reactivity. */
+  if (IDProperty *idgroup = IDP_EnsureProperties(&ob->id)) {
+    idp_int_replace(idgroup, "tessera_building", 1);
+    idp_float_replace(idgroup, "tessera_build_progress", 0.0f);
+    idp_string_replace(idgroup, "tessera_build_status", "Starting...");
+  }
+  WM_main_add_notifier(NC_OBJECT | ND_DRAW, ob);
+  WM_main_add_notifier(NC_SPACE | ND_SPACE_VIEW3D, nullptr);
+
   if (is_invoke) {
     job->is_nonblocking_job = true;
-    wmJob *wm_job = WM_jobs_get(CTX_wm_manager(C),
-                                CTX_wm_window(C),
-                                CTX_data_scene(C),
-                                "Building Tessera Clusters...",
+    op->customdata = job;
+    wmWindowManager *wm = CTX_wm_manager(C);
+    wmWindow *win = CTX_wm_window(C);
+
+    wmJob *wm_job = WM_jobs_get(wm,
+                                win,
+                                scene,
+                                "Building Tessera Clusters",
                                 WM_JOB_PROGRESS,
                                 WM_JOB_TYPE_OBJECT_BAKE);
+    job->wm_job = wm_job;
 
     WM_jobs_customdata_set(wm_job, job, tessera_build_free_job);
-    WM_jobs_timer(wm_job, 0.1, NC_OBJECT | ND_DRAW, NC_OBJECT | ND_DRAW);
+    WM_jobs_timer(wm_job, 0.05, NC_WM | ND_JOB, 0);
     WM_jobs_callbacks(wm_job, tessera_build_start_job, nullptr, nullptr, tessera_build_end_job);
 
-    WM_jobs_start(CTX_wm_manager(C), wm_job);
+    WM_jobs_start(wm, wm_job);
+    WM_event_add_modal_handler(C, op);
     return OPERATOR_RUNNING_MODAL;
   }
   else {
@@ -236,7 +437,8 @@ static wmOperatorStatus object_tessera_build_custom(bContext *C, wmOperator *op,
 
 static wmOperatorStatus object_tessera_build_exec(bContext *C, wmOperator *op)
 {
-  return object_tessera_build_custom(C, op, false);
+  const bool is_invoke = (op->flag & OP_IS_INVOKE) != 0;
+  return object_tessera_build_custom(C, op, is_invoke);
 }
 
 static wmOperatorStatus object_tessera_build_invoke(bContext *C, wmOperator *op, const wmEvent * /*event*/)
@@ -253,6 +455,7 @@ void OBJECT_OT_tessera_build(wmOperatorType *ot)
 
   ot->invoke = object_tessera_build_invoke;
   ot->exec = object_tessera_build_exec;
+  ot->modal = object_tessera_build_modal;
   ot->poll = object_tessera_build_poll;
 
   ot->flag = OPTYPE_REGISTER | OPTYPE_UNDO;

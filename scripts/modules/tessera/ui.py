@@ -31,8 +31,27 @@ class TESSERA_PT_object(bpy.types.Panel):
         ob = context.active_object
         tessera_props = getattr(ob, "tessera", None)
 
+        is_building = bool(ob.get("tessera_building", False))
+        build_progress = float(ob.get("tessera_build_progress", 0.0))
+        status_text = str(ob.get("tessera_build_status", "Processing..."))
+
         col = layout.column(align=True)
-        col.operator("tessera.build", icon='MOD_BUILD')
+        row = col.row(align=True)
+        row.enabled = not is_building
+        if is_building:
+            row.operator("object.tessera_build", text="Building Clusters...", icon='TIME')
+        else:
+            row.operator("object.tessera_build", text="Build Tessera", icon='MOD_BUILD')
+
+        if is_building:
+            box = layout.box()
+            if not status_text:
+                status_text = "Processing..."
+            box.label(text=status_text, icon='TIME')
+            p_row = box.row(align=True)
+            p_row.enabled = False
+            p_row.label(text=f"Progress: {build_progress * 100.0:.1f}%")
+            return
 
         nc2_path = ob.get("tessera_nc2")
         if nc2_path:

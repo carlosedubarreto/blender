@@ -57,7 +57,7 @@ void computeTriangleSphere(const float3 &a, const float3 &b, const float3 &c,
 
 }  // namespace detail
 
-bool buildFromMesh(const Mesh &mesh, TesseraData &out, TesseraProgressCallback progress_cb)
+bool extractMeshGeometry(const Mesh &mesh, TesseraRawMesh &out_raw)
 {
     const Span<float3> vert_positions = mesh.vert_positions();
     const Span<int> corner_verts = mesh.corner_verts();
@@ -91,19 +91,13 @@ bool buildFromMesh(const Mesh &mesh, TesseraData &out, TesseraProgressCallback p
         return false;
     }
 
-    if (progress_cb) {
-        progress_cb(0.0f, "Preparing mesh vertices and UVs...");
-    }
-
-    out.header.magic = kNc2Magic;
-    out.header.version = kNc2Version;
-    out.header.flags = 0;
-    if (has_uvs) { out.header.flags |= kNc2FlagHasUV; }
-    if (!vert_normals.is_empty()) { out.header.flags |= kNc2FlagHasNormals; }
+    out_raw.header_flags = 0;
+    if (has_uvs) { out_raw.header_flags |= kNc2FlagHasUV; }
+    if (!vert_normals.is_empty()) { out_raw.header_flags |= kNc2FlagHasNormals; }
 
     /* Input vertex pool with corner UV splitting so UV seams are preserved. */
-    std::vector<detail::BuildVertex> input_verts;
-    input_verts.reserve(verts_num);
+    out_raw.verts.clear();
+    out_raw.verts.reserve(verts_num);
 
     struct UVVertKey {
         float2 uv;
@@ -118,13 +112,13 @@ bool buildFromMesh(const Mesh &mesh, TesseraData &out, TesseraProgressCallback p
                 return entry.new_vert_id;
             }
         }
-        detail::BuildVertex bv;
+        TesseraRawVertex bv;
         bv.position = vert_positions[orig_vert];
         bv.normal = vert_normals.is_empty() ? float3(0.0f) : vert_normals[orig_vert];
         bv.uv = uv;
         bv.tangent = float4(1.0f, 0.0f, 0.0f, 1.0f);
-        uint32_t new_id = uint32_t(input_verts.size());
-        input_verts.push_back(bv);
+        uint32_t new_id = uint32_t(out_raw.verts.size());
+        out_raw.verts.push_back(bv);
         vert_to_corners[orig_vert].push_back({uv, new_id});
         return new_id;
     };
@@ -140,10 +134,10 @@ bool buildFromMesh(const Mesh &mesh, TesseraData &out, TesseraProgressCallback p
     if (tri_reserve == 0) {
         return false;
     }
-    std::vector<uint32_t> tri_verts;
-    tri_verts.reserve(tri_reserve * 3);
-    std::vector<uint32_t> tri_materials;
-    tri_materials.reserve(tri_reserve);
+    out_raw.tri_verts.clear();
+    out_raw.tri_verts.reserve(tri_reserve * 3);
+    out_raw.tri_materials.clear();
+    out_raw.tri_materials.reserve(tri_reserve);
 
     for (const int i : faces.index_range()) {
         const IndexRange face = faces[i];
@@ -159,28 +153,28 @@ bool buildFromMesh(const Mesh &mesh, TesseraData &out, TesseraProgressCallback p
         for (int k = 1; k + 1 < face.size(); ++k) {
             const int c1 = face.start() + k;
             const int c2 = face.start() + k + 1;
-            tri_verts.push_back(v0);
-            tri_verts.push_back(get_or_create_vertex(corner_verts[c1], c1));
-            tri_verts.push_back(get_or_create_vertex(corner_verts[c2], c2));
-            tri_materials.push_back(uint32_t(mat_idx));
+            out_raw.tri_verts.push_back(v0);
+            out_raw.tri_verts.push_back(get_or_create_vertex(corner_verts[c1], c1));
+            out_raw.tri_verts.push_back(get_or_create_vertex(corner_verts[c2], c2));
+            out_raw.tri_materials.push_back(uint32_t(mat_idx));
         }
     }
 
     /* Compute 4D MikkTSpace-compatible tangents if UV coordinates exist. */
     if (has_uvs) {
-        const int build_verts_num = int(input_verts.size());
+        const int build_verts_num = int(out_raw.verts.size());
         std::vector<float3> tan_accum(build_verts_num, float3(0.0f));
         std::vector<float3> bitan_accum(build_verts_num, float3(0.0f));
-        for (size_t t = 0; t + 2 < tri_verts.size(); t += 3) {
-            uint32_t i0 = tri_verts[t];
-            uint32_t i1 = tri_verts[t + 1];
-            uint32_t i2 = tri_verts[t + 2];
-            const float3 &p0 = input_verts[i0].position;
-            const float3 &p1 = input_verts[i1].position;
-            const float3 &p2 = input_verts[i2].position;
-            const float2 &uv0 = input_verts[i0].uv;
-            const float2 &uv1 = input_verts[i1].uv;
-            const float2 &uv2 = input_verts[i2].uv;
+        for (size_t t = 0; t + 2 < out_raw.tri_verts.size(); t += 3) {
+            uint32_t i0 = out_raw.tri_verts[t];
+            uint32_t i1 = out_raw.tri_verts[t + 1];
+            uint32_t i2 = out_raw.tri_verts[t + 2];
+            const float3 &p0 = out_raw.verts[i0].position;
+            const float3 &p1 = out_raw.verts[i1].position;
+            const float3 &p2 = out_raw.verts[i2].position;
+            const float2 &uv0 = out_raw.verts[i0].uv;
+            const float2 &uv1 = out_raw.verts[i1].uv;
+            const float2 &uv2 = out_raw.verts[i2].uv;
             float3 e1 = p1 - p0;
             float3 e2 = p2 - p0;
             float du1 = uv1.x - uv0.x;
@@ -201,7 +195,7 @@ bool buildFromMesh(const Mesh &mesh, TesseraData &out, TesseraProgressCallback p
             }
         }
         for (int i = 0; i < build_verts_num; ++i) {
-            const float3 &n = input_verts[i].normal;
+            const float3 &n = out_raw.verts[i].normal;
             const float3 &t_raw = tan_accum[i];
             const float3 &b_raw = bitan_accum[i];
             float3 t_ortho = t_raw - n * math::dot(n, t_raw);
@@ -212,16 +206,29 @@ bool buildFromMesh(const Mesh &mesh, TesseraData &out, TesseraProgressCallback p
                 t_ortho = float3(1.0f, 0.0f, 0.0f);
             }
             float sign = (math::dot(math::cross(n, t_ortho), b_raw) < 0.0f) ? -1.0f : 1.0f;
-            input_verts[i].tangent = float4(t_ortho.x, t_ortho.y, t_ortho.z, sign);
+            out_raw.verts[i].tangent = float4(t_ortho.x, t_ortho.y, t_ortho.z, sign);
         }
-        out.header.flags |= kNc2FlagHasTangents;
+        out_raw.header_flags |= kNc2FlagHasTangents;
     }
+
+    return true;
+}
+
+bool buildFromRawMesh(const TesseraRawMesh &raw, TesseraData &out, TesseraProgressCallback progress_cb)
+{
+    if (raw.verts.empty() || raw.tri_verts.empty()) {
+        return false;
+    }
+
+    out.header.magic = kNc2Magic;
+    out.header.version = kNc2Version;
+    out.header.flags = raw.header_flags;
 
     /* Build the cluster DAG: region-growing clustering plus hierarchical
      * merge + QEM simplification, partitioned strictly per material. */
     detail::BuilderParams params;
     const detail::BuildResult dag = detail::buildClusterDAG(
-        input_verts, tri_verts, params, tri_materials, progress_cb);
+        raw.verts, raw.tri_verts, params, raw.tri_materials, progress_cb);
     if (dag.clusters.empty()) {
         return false;
     }
@@ -368,6 +375,18 @@ bool buildFromMesh(const Mesh &mesh, TesseraData &out, TesseraProgressCallback p
         out.header.boundsMax[0] = out.header.boundsMax[1] = out.header.boundsMax[2] = 0.0f;
     }
     return true;
+}
+
+bool buildFromMesh(const Mesh &mesh, TesseraData &out, TesseraProgressCallback progress_cb)
+{
+    if (progress_cb) {
+        progress_cb(0.0f, "Preparing mesh vertices and UVs...");
+    }
+    TesseraRawMesh raw;
+    if (!extractMeshGeometry(mesh, raw)) {
+        return false;
+    }
+    return buildFromRawMesh(raw, out, progress_cb);
 }
 
 }  // namespace tessera
