@@ -324,6 +324,9 @@ static void tessera_write_telemetry_to_object(Object *ob, const tessera::Tessera
       idp_float_replace(group, "tessera_stat_pixel_error", telem.pixel_error);
       idp_float_replace(group, "tessera_stat_error", telem.pixel_error);
       idp_float_replace(group, "tessera_stat_culling_margin", telem.culling_margin);
+      idp_float_replace(group, "tessera_stat_tex_scale", telem.tex_scale);
+      idp_int_replace(group, "tessera_stat_tex_res_x", telem.tex_res_x);
+      idp_int_replace(group, "tessera_stat_tex_res_y", telem.tex_res_y);
     }
   };
 
@@ -1058,7 +1061,34 @@ static std::vector<tessera::TesseraMaterialTextures> tessera_extract_materials(O
       }
     }
   }
+
+  for (auto &mat : result) {
+    if (mat.diffuse != nullptr) {
+      GPU_texture_mipmap_mode(mat.diffuse, true, true);
+    }
+    if (mat.normal != nullptr) {
+      GPU_texture_mipmap_mode(mat.normal, true, true);
+    }
+    if (mat.roughness != nullptr) {
+      GPU_texture_mipmap_mode(mat.roughness, true, true);
+    }
+  }
   return result;
+}
+
+static std::string tessera_texture_lod_mode_get(Object *ob)
+{
+  if (ob == nullptr) {
+    return "AUTO";
+  }
+  const IDProperty *prop = tessera_property_find(ob, "tessera_texture_lod_mode");
+  if (prop != nullptr && prop->type == IDP_STRING) {
+    const char *str = IDP_string_get(prop);
+    if (str != nullptr && str[0] != '\0') {
+      return std::string(str);
+    }
+  }
+  return "AUTO";
 }
 
 bool TesseraModule::is_enabled(Object *ob) const
@@ -1182,6 +1212,86 @@ void TesseraModule::update_telemetry(ObjectState &state, const float3 &cam_pos)
     state.smoothed_dt = 0.0f;
   }
 
+  const float3 bounds_min(state.data.header.boundsMin[0],
+                          state.data.header.boundsMin[1],
+                          state.data.header.boundsMin[2]);
+  const float3 bounds_max(state.data.header.boundsMax[0],
+                          state.data.header.boundsMax[1],
+                          state.data.header.boundsMax[2]);
+  const float3 local_center = 0.5f * (bounds_min + bounds_max);
+  const float3 world_center = (state.object_mat * float4(local_center, 1.0f)).xyz();
+  const float cam_distance = math::distance(cam_pos, world_center);
+
+  std::string lod_mode = tessera_texture_lod_mode_get(state.ob);
+  float scale = 1.0f;
+  if (lod_mode == "FULL") {
+    scale = 1.0f;
+  }
+  else if (lod_mode == "HALF") {
+    scale = 0.5f;
+  }
+  else if (lod_mode == "QUARTER") {
+    scale = 0.25f;
+  }
+  else if (lod_mode == "EIGHTH") {
+    scale = 0.125f;
+  }
+  else { // "AUTO"
+    const float ref_dist = 6.0f;
+    const float raw_factor = std::clamp(ref_dist / std::max(cam_distance, 0.01f), 0.125f, 1.0f);
+    if (raw_factor >= 0.75f) {
+      scale = 1.0f;
+    }
+    else if (raw_factor >= 0.375f) {
+      scale = 0.5f;
+    }
+    else if (raw_factor >= 0.1875f) {
+      scale = 0.25f;
+    }
+    else {
+      scale = 0.125f;
+    }
+  }
+  state.current_tex_scale = scale;
+
+  int base_w = 0, base_h = 0;
+  for (const auto &mat : state.materials) {
+    if (mat.diffuse != nullptr) {
+      base_w = std::max(base_w, GPU_texture_width(mat.diffuse));
+      base_h = std::max(base_h, GPU_texture_height(mat.diffuse));
+    }
+    if (mat.normal != nullptr) {
+      base_w = std::max(base_w, GPU_texture_width(mat.normal));
+      base_h = std::max(base_h, GPU_texture_height(mat.normal));
+    }
+    if (mat.roughness != nullptr) {
+      base_w = std::max(base_w, GPU_texture_width(mat.roughness));
+      base_h = std::max(base_h, GPU_texture_height(mat.roughness));
+    }
+  }
+  if (base_w == 0 || base_h == 0) {
+    base_w = 4096;
+    base_h = 4096;
+  }
+  const int active_res_x = int(base_w * scale);
+  const int active_res_y = int(base_h * scale);
+
+  if (state.ob != nullptr) {
+    auto write_tex_props = [&](ID *id) {
+      if (id == nullptr) return;
+      if (IDProperty *group = IDP_EnsureProperties(id)) {
+        idp_float_replace(group, "tessera_stat_tex_scale", scale);
+        idp_int_replace(group, "tessera_stat_tex_res_x", active_res_x);
+        idp_int_replace(group, "tessera_stat_tex_res_y", active_res_y);
+      }
+    };
+    write_tex_props(&state.ob->id);
+    const ID *orig_id = DEG_get_original_id(&state.ob->id);
+    if (orig_id != nullptr && orig_id != &state.ob->id) {
+      write_tex_props(const_cast<ID *>(orig_id));
+    }
+  }
+
   /* Extract telemetry counters and update object properties. */
   if (show_stats || log_console || show_fps_hud) {
     using namespace std::chrono;
@@ -1191,20 +1301,14 @@ void TesseraModule::update_telemetry(ObjectState &state, const float3 &cam_pos)
                           duration_cast<milliseconds>(now - state.last_stat_time).count();
     if (elapsed_ms >= 60) {
       state.last_stat_time = now;
-      const float3 bounds_min(state.data.header.boundsMin[0],
-                              state.data.header.boundsMin[1],
-                              state.data.header.boundsMin[2]);
-      const float3 bounds_max(state.data.header.boundsMax[0],
-                              state.data.header.boundsMax[1],
-                              state.data.header.boundsMax[2]);
-      const float3 local_center = 0.5f * (bounds_min + bounds_max);
-      const float3 world_center = (state.object_mat * float4(local_center, 1.0f)).xyz();
-      const float cam_distance = math::distance(cam_pos, world_center);
 
       tessera::TesseraTelemetry telem = state.pass ? state.pass->getTelemetry() :
                                                      tessera::TesseraTelemetry{};
       telem.cam_distance = cam_distance;
       telem.pixel_error = state.pass ? state.pass->getPixelError() : state.pixel_error;
+      telem.tex_scale = scale;
+      telem.tex_res_x = active_res_x;
+      telem.tex_res_y = active_res_y;
 
       if ((show_stats || show_fps_hud) && state.ob != nullptr) {
         tessera_write_telemetry_to_object(state.ob, telem);
@@ -1212,7 +1316,7 @@ void TesseraModule::update_telemetry(ObjectState &state, const float3 &cam_pos)
       }
 
       if (log_console) {
-        printf("[Tessera Stats] %s | Dist: %.2fm | LOD: %u-%u | Clusters: %u/%u | Tris: %u/%u | Error: %.1fpx\n",
+        printf("[Tessera Stats] %s | Dist: %.2fm | LOD: %u-%u | Clusters: %u/%u | Tris: %u/%u | Error: %.1fpx | Tex: %.0f%% (%dx%d)\n",
                state.ob ? (state.ob->id.name + 2) : "Object",
                telem.cam_distance,
                telem.active_lod_min,
@@ -1221,7 +1325,10 @@ void TesseraModule::update_telemetry(ObjectState &state, const float3 &cam_pos)
                telem.total_clusters,
                telem.active_triangles,
                telem.total_triangles,
-               telem.pixel_error);
+               telem.pixel_error,
+               scale * 100.0f,
+               active_res_x,
+               active_res_y);
         fflush(stdout);
       }
     }
@@ -1396,6 +1503,7 @@ void TesseraModule::draw(const draw::View &view,
 
     update_telemetry(state, view.location());
 
+    state.pass->setTextureScale(state.current_tex_scale);
     state.pass->set_material_textures(state.materials);
     if (state.pass->drawCount() != 0) {
       state.pass->draw(resolution.x, resolution.y);
@@ -1500,6 +1608,7 @@ void TesseraModule::draw_gbuffer(const draw::View &view,
 
     update_telemetry(state, view.location());
 
+    state.pass->setTextureScale(state.current_tex_scale);
     state.pass->set_material_textures(state.materials);
     if (state.pass->drawCount() != 0) {
       state.pass->draw_gbuffer(resolution.x, resolution.y, state.object_mat);

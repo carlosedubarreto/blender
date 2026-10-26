@@ -725,6 +725,93 @@ def test_workbench_solid_mode_mesh_isolation():
     return True
 
 
+def test_texture_lod_scaling():
+    """Verify dynamic texture LOD scaling and manual override mode."""
+    print("\n" + "="*80)
+    print("RUNNING TEST 6: test_texture_lod_scaling")
+    print("="*80)
+
+    import bpy
+    import mathutils
+
+    sample_path = SAMPLE_GRAVEL_13
+    assert os.path.exists(sample_path), f"Sample asset not found: {sample_path}"
+
+    print(f"Loading {sample_path}...")
+    bpy.ops.wm.open_mainfile(filepath=sample_path)
+
+    scene = bpy.context.scene
+    ob = bpy.data.objects.get("Gravel_13")
+    assert ob is not None, "Gravel_13 object not found in scene"
+
+    scene.render.engine = 'BLENDER_EEVEE'
+    scene.render.resolution_x = 960
+    scene.render.resolution_y = 540
+
+    ob["tessera_enabled"] = 1
+    ob["tessera_texture_lod_mode"] = 'AUTO'
+    props = getattr(ob, "tessera", None)
+    if props:
+        props.texture_lod_mode = 'AUTO'
+
+    cam = scene.camera
+    if not cam:
+        cam_data = bpy.data.cameras.new("TestCam")
+        cam = bpy.data.objects.new("TestCam", cam_data)
+        scene.collection.objects.link(cam)
+        scene.camera = cam
+
+    def setup_camera(distance):
+        target = ob.location + mathutils.Vector((0.0, 0.0, 0.05))
+        eye = target + mathutils.Vector((0.0, -distance, distance * 0.2))
+        cam.location = eye
+        direction = (target - eye).normalized()
+        cam.rotation_euler = direction.to_track_quat('-Z', 'Y').to_euler()
+
+    temp_img = os.path.join(tempfile.gettempdir(), "tessera_tex_test.png")
+    scene.render.filepath = temp_img
+
+    # Phase 1: Close distance (2.0m) -> 100% scale (1.0)
+    print("\n[Phase 1] Position camera at 2.0m (assert scale is 1.0 / 100%)...")
+    setup_camera(2.0)
+    bpy.ops.render.render(write_still=True)
+    scale_close = float(ob.get("tessera_stat_tex_scale", 0.0))
+    rx_close = int(ob.get("tessera_stat_tex_res_x", 0))
+    ry_close = int(ob.get("tessera_stat_tex_res_y", 0))
+    print(f"  Camera distance: 2.0m | Texture Scale: {scale_close * 100:.1f}% ({rx_close}x{ry_close})")
+    assert abs(scale_close - 1.0) < 1e-4, f"Expected texture scale 1.0 at 2.0m, got {scale_close}"
+
+    # Phase 2: Far distance (30.0m) -> scale <= 0.5 (50% or lower)
+    print("\n[Phase 2] Move camera to 30.0m (assert scale <= 0.5 / 50% or lower)...")
+    setup_camera(30.0)
+    bpy.ops.render.render(write_still=True)
+    scale_far = float(ob.get("tessera_stat_tex_scale", 0.0))
+    rx_far = int(ob.get("tessera_stat_tex_res_y", 0))
+    ry_far = int(ob.get("tessera_stat_tex_res_y", 0))
+    print(f"  Camera distance: 30.0m | Texture Scale: {scale_far * 100:.1f}% ({rx_far}x{ry_far})")
+    assert scale_far <= 0.5, f"Expected texture scale <= 0.5 at 30.0m, got {scale_far}"
+
+    # Phase 3: Switch mode to HALF -> assert scale is strictly 0.5
+    print("\n[Phase 3] Switch mode to HALF (assert scale is strictly 0.5)...")
+    ob["tessera_texture_lod_mode"] = 'HALF'
+    if props:
+        props.texture_lod_mode = 'HALF'
+    setup_camera(2.0)
+    bpy.ops.render.render(write_still=True)
+    scale_half = float(ob.get("tessera_stat_tex_scale", 0.0))
+    rx_half = int(ob.get("tessera_stat_tex_res_x", 0))
+    ry_half = int(ob.get("tessera_stat_tex_res_y", 0))
+    print(f"  Mode: HALF | Texture Scale: {scale_half * 100:.1f}% ({rx_half}x{ry_half})")
+    assert abs(scale_half - 0.5) < 1e-4, f"Expected texture scale strictly 0.5 in HALF mode, got {scale_half}"
+
+    if os.path.exists(temp_img):
+        try: os.remove(temp_img)
+        except OSError: pass
+
+    print("PASS: Texture LOD scaling verified across dynamic distance and manual override.")
+    return True
+
+
 # ---------------------------------------------------------------------------
 # Test Runner & Entry Point
 # ---------------------------------------------------------------------------
@@ -748,6 +835,7 @@ def run_suite():
         ("test_reverse_z_occlusion_order", test_reverse_z_occlusion_order),
         ("test_camera_margin_control", test_camera_margin_control),
         ("test_workbench_solid_mode_mesh_isolation", test_workbench_solid_mode_mesh_isolation),
+        ("test_texture_lod_scaling", test_texture_lod_scaling),
     ]
 
     for name, test_fn in tests:

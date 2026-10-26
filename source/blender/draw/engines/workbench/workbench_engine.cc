@@ -389,6 +389,9 @@ class Instance : public DrawEngine {
         idp_float_replace(group, "tessera_stat_pixel_error", telem.pixel_error);
         idp_float_replace(group, "tessera_stat_error", telem.pixel_error);
         idp_float_replace(group, "tessera_stat_culling_margin", telem.culling_margin);
+        idp_float_replace(group, "tessera_stat_tex_scale", telem.tex_scale);
+        idp_int_replace(group, "tessera_stat_tex_res_x", telem.tex_res_x);
+        idp_int_replace(group, "tessera_stat_tex_res_y", telem.tex_res_y);
       }
     };
 

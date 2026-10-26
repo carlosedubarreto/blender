@@ -40,6 +40,9 @@ struct TesseraTelemetry {
     float cam_distance = 0.0f;
     float pixel_error = 1.0f;
     float culling_margin = 0.02f;
+    float tex_scale = 1.0f;
+    int tex_res_x = 0;
+    int tex_res_y = 0;
 };
 
 struct TesseraMaterialTextures {

@@ -59,6 +59,8 @@ def _enabled_update(self, context):
         self.id_data["tessera_culling_margin"] = float(getattr(self, "culling_margin", 0.02))
     if "tessera_view_source" not in self.id_data:
         self.id_data["tessera_view_source"] = int(getattr(self, "use_camera_view", False))
+    if "tessera_texture_lod_mode" not in self.id_data:
+        self.id_data["tessera_texture_lod_mode"] = str(getattr(self, "texture_lod_mode", "AUTO"))
     if self.enabled:
         import os
         nc2 = self.id_data.get("tessera_nc2")
@@ -68,6 +70,11 @@ def _enabled_update(self, context):
             self.id_data["tessera_nc2"] = existing
     _tag_tessera_redraw(self, context)
 
+
+
+def _texture_lod_update(self, context):
+    self.id_data["tessera_texture_lod_mode"] = str(self.texture_lod_mode)
+    _tag_tessera_redraw(self, context)
 
 
 def _visualize_clusters_update(self, context):
@@ -215,6 +222,21 @@ class TesseraProperties(bpy.types.PropertyGroup):
         ),
         default='VIEWPORT',
         update=_view_source_update,
+    )
+
+    # Texture resolution scaling mode.
+    texture_lod_mode: EnumProperty(
+        name="Texture LOD",
+        description="Texture resolution scaling mode",
+        items=[
+            ('AUTO', "Auto (Distance)", "Dynamically scale texture resolution based on distance to camera"),
+            ('FULL', "Full (100%)", "Always use full resolution"),
+            ('HALF', "Half (50%)", "Clamp maximum resolution to half"),
+            ('QUARTER', "Quarter (25%)", "Clamp maximum resolution to quarter"),
+            ('EIGHTH', "Eighth (12.5%)", "Clamp maximum resolution to 1/8th for low VRAM"),
+        ],
+        default='AUTO',
+        update=_texture_lod_update,
     )
 
     # Toggle cluster visualization mode.

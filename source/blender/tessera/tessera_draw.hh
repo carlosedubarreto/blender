@@ -76,6 +76,16 @@ public:
         renderer_.set_material_textures(materials);
     }
 
+    void setTextureScale(float scale)
+    {
+        renderer_.setTextureScale(scale);
+    }
+
+    float getTextureScale() const
+    {
+        return renderer_.getTextureScale();
+    }
+
     /**
      * Screen-space error threshold in pixels for LOD selection.
      * Higher values select coarser clusters (faster, less detail).

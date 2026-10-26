@@ -206,8 +206,8 @@ void main()
     ddy_uv = vec2(0.0);
   }
   const float max_grad = 0.05;
-  ddx_uv = clamp(ddx_uv, vec2(-max_grad), vec2(max_grad));
-  ddy_uv = clamp(ddy_uv, vec2(-max_grad), vec2(max_grad));
+  ddx_uv = clamp(ddx_uv, vec2(-max_grad), vec2(max_grad)) * tex_scale_inv;
+  ddy_uv = clamp(ddy_uv, vec2(-max_grad), vec2(max_grad)) * tex_scale_inv;
 
   if (mat_idx == 0u) {
     if (has_d) tex_diff = textureGrad(tex_diffuse_0, uv, ddx_uv, ddy_uv);
@@ -409,8 +409,8 @@ void main()
     ddy_uv = vec2(0.0);
   }
   const float max_grad = 0.05;
-  ddx_uv = clamp(ddx_uv, vec2(-max_grad), vec2(max_grad));
-  ddy_uv = clamp(ddy_uv, vec2(-max_grad), vec2(max_grad));
+  ddx_uv = clamp(ddx_uv, vec2(-max_grad), vec2(max_grad)) * tex_scale_inv;
+  ddy_uv = clamp(ddy_uv, vec2(-max_grad), vec2(max_grad)) * tex_scale_inv;
 
   if (mat_idx == 0u) {
     if (has_d) tex_diff = textureGrad(tex_diffuse_0, uv, ddx_uv, ddy_uv);
@@ -601,6 +601,7 @@ gpu::Shader *createMaterialShader()
     info.push_constant(Type::float3_t, "camera_pos");
     info.push_constant(Type::int_t, "shading_mode");
     info.push_constant(Type::int_t, "reverse_z");
+    info.push_constant(Type::float_t, "tex_scale_inv");
 
     const GPUShaderCreateInfo *raw = reinterpret_cast<const GPUShaderCreateInfo *>(&info);
     return GPU_shader_create_from_info_python(raw);
@@ -681,6 +682,7 @@ gpu::Shader *createGbufferShader()
 
     info.push_constant(Type::float4x4_t, "model_mat");
     info.push_constant(Type::int_t, "reverse_z");
+    info.push_constant(Type::float_t, "tex_scale_inv");
 
     const GPUShaderCreateInfo *raw = reinterpret_cast<const GPUShaderCreateInfo *>(&info);
     return GPU_shader_create_from_info_python(raw);
@@ -1040,6 +1042,7 @@ void TesseraVisibilityPass::render(gpu::StorageBuf *command_buf,
         mMaterialShader, "camera_pos", cam_pos.x, cam_pos.y, cam_pos.z);
     GPU_shader_uniform_1i(mMaterialShader, "shading_mode", shading_mode);
     GPU_shader_uniform_1i(mMaterialShader, "reverse_z", reverse_z ? 1 : 0);
+    GPU_shader_uniform_1f(mMaterialShader, "tex_scale_inv", 1.0f / mTextureScale);
 
     GPU_batch_draw(mFullscreenBatch);
 }
@@ -1259,6 +1262,7 @@ void TesseraVisibilityPass::render_gbuffer(gpu::StorageBuf *command_buf,
 
     GPU_shader_uniform_mat4(mGbufferShader, "model_mat", object_model.ptr());
     GPU_shader_uniform_1i(mGbufferShader, "reverse_z", reverse_z ? 1 : 0);
+    GPU_shader_uniform_1f(mGbufferShader, "tex_scale_inv", 1.0f / mTextureScale);
 
     GPU_batch_draw(mFullscreenBatch);
 }

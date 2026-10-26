@@ -101,6 +101,16 @@ public:
         mVisibilityPass.set_material_textures(materials);
     }
 
+    void setTextureScale(float scale)
+    {
+        mVisibilityPass.setTextureScale(scale);
+    }
+
+    float getTextureScale() const
+    {
+        return mVisibilityPass.getTextureScale();
+    }
+
     /**
      * Call once per frame to render the selected clusters into the currently
      * bound framebuffer with the visibility-buffer pipeline.

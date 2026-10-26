@@ -61,6 +61,7 @@ class TesseraModule {
     tessera::TesseraData data;
     std::vector<tessera::TesseraMaterialTextures> materials;
     std::unique_ptr<tessera::TesseraDrawPass> pass;
+    float current_tex_scale = 1.0f;
   };
 
   std::mutex mutex_;

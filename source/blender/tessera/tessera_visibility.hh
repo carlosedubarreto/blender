@@ -123,7 +123,18 @@ class TesseraVisibilityPass
         mMaterials = materials;
     }
 
+    void setTextureScale(float scale)
+    {
+        mTextureScale = std::clamp(scale, 0.05f, 1.0f);
+    }
+
+    float getTextureScale() const
+    {
+        return mTextureScale;
+    }
+
  private:
+    float mTextureScale = 1.0f;
     bool ensure_targets(int width, int height);
     bool upload_dirty_data();
 

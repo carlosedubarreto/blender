@@ -57,7 +57,20 @@ def draw_tessera_hud():
     region_h = context.region.height if context.region else 600
     y_offset = region_h - 60
 
-    text = f"Tessera: {fps:.1f} FPS ({ft_ms:.2f} ms) | {clusters:,} clusters | {tris:,} tris | Margin: {eff_margin:.2f}m ({mode_str})"
+    scale = float(ob.get("tessera_stat_tex_scale", 1.0))
+    scale_pct = int(round(scale * 100))
+    if scale >= 0.99:
+        tex_str = "100% (Full)"
+    elif scale >= 0.49:
+        tex_str = "50% (1/2)"
+    elif scale >= 0.24:
+        tex_str = "25% (1/4)"
+    elif scale >= 0.12:
+        tex_str = "12.5% (1/8)"
+    else:
+        tex_str = f"{scale_pct}%"
+
+    text = f"Tessera: {fps:.1f} FPS ({ft_ms:.2f} ms) | {clusters:,} clusters | {tris:,} tris | Margin: {eff_margin:.2f}m ({mode_str}) | Tex: {tex_str}"
 
     try:
         # Optional subtle background pill/box
@@ -284,6 +297,7 @@ class TESSERA_PT_object(bpy.types.Panel):
                 prop_col.use_property_decorate = False
                 prop_col.prop(tessera_props, "pixel_error", text="Pixel Error")
                 prop_col.prop(tessera_props, "culling_margin", text="Camera Margin")
+                prop_col.prop(tessera_props, "texture_lod_mode", text="Texture LOD")
                 prop_col.prop(tessera_props, "visualize_clusters")
 
                 cam_row = layout.row(align=True)
@@ -339,6 +353,23 @@ class TESSERA_PT_object(bpy.types.Panel):
                     active_tris = ob.get('tessera_stat_triangles', 0)
                     total_tris = ob.get('tessera_total_triangles', 0)
                     t_col.label(text=f"Rendered Tris: {active_tris:,} / {total_tris:,}", icon='MESH_DATA')
+
+                    scale = float(ob.get("tessera_stat_tex_scale", 1.0))
+                    rx = int(ob.get("tessera_stat_tex_res_x", 0))
+                    ry = int(ob.get("tessera_stat_tex_res_y", 0))
+                    scale_pct = int(round(scale * 100))
+                    res_str = f" - {rx}x{ry}" if (rx > 0 and ry > 0) else ""
+                    if scale >= 0.99:
+                        status_str = f"100% (Full Res{res_str})"
+                    elif scale >= 0.49:
+                        status_str = f"50% (Half Res{res_str})"
+                    elif scale >= 0.24:
+                        status_str = f"25% (Quarter Res{res_str})"
+                    elif scale >= 0.12:
+                        status_str = f"12.5% (Eighth Res{res_str})"
+                    else:
+                        status_str = f"{scale_pct}% ({rx}x{ry})"
+                    t_col.label(text=f"Texture Scale: {status_str}", icon='IMAGE_DATA')
 
                     dist = ob.get('tessera_stat_distance', 0.0)
                     err = ob.get('tessera_stat_pixel_error', ob.get('tessera_stat_error', 1.0))
