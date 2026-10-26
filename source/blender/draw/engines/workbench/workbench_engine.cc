@@ -86,7 +86,7 @@ class Instance : public DrawEngine {
     int64_t file_mtime = 0;
     int64_t file_size = -1;
     float4x4 object_mat = float4x4::identity();
-    bool visualize_clusters = false;
+    int visualize_clusters = 0;
     bool tessera_enabled = true;
     float pixel_error = 1.0f;
     float culling_margin = 0.02f;
@@ -111,12 +111,34 @@ class Instance : public DrawEngine {
 
   /* Tessera data ownership helpers. */
 
+  static IDProperty *tessera_property_find(Object *ob, const char *prop_name)
+  {
+    if (ob == nullptr) {
+      return nullptr;
+    }
+    IDProperty *group = IDP_GetProperties(&ob->id);
+    if (group != nullptr) {
+      if (IDProperty *prop = IDP_GetPropertyFromGroup(group, prop_name)) {
+        return prop;
+      }
+    }
+    const ID *orig_id = DEG_get_original_id(&ob->id);
+    if (orig_id != nullptr && orig_id != &ob->id) {
+      IDProperty *orig_group = IDP_GetProperties(const_cast<ID *>(orig_id));
+      if (orig_group != nullptr) {
+        if (IDProperty *prop = IDP_GetPropertyFromGroup(orig_group, prop_name)) {
+          return prop;
+        }
+      }
+    }
+    return nullptr;
+  }
+
   static bool tessera_path_get(Object *ob, std::string &r_path)
   {
-    const IDProperty *group = IDP_GetProperties(&ob->id);
-    if (group != nullptr) {
-      const IDProperty *prop = IDP_GetPropertyTypeFromGroup(group, "tessera_nc2", IDP_STRING);
-      if (prop != nullptr && prop->data.pointer != nullptr) {
+    const IDProperty *prop = tessera_property_find(ob, "tessera_nc2");
+    if (prop != nullptr) {
+      if (prop->type == IDP_STRING && prop->data.pointer != nullptr) {
         r_path = static_cast<const char *>(prop->data.pointer);
         if (!r_path.empty()) {
           return true;
@@ -146,30 +168,34 @@ class Instance : public DrawEngine {
     return false;
   }
 
-  static bool tessera_visualize_get(Object *ob)
+  static int tessera_visualize_get(Object *ob)
   {
-    const IDProperty *group = IDP_GetProperties(&ob->id);
-    if (group == nullptr) {
-      return false;
-    }
-    const IDProperty *prop = IDP_GetPropertyFromGroup(group, "tessera_visualize_clusters");
+    const IDProperty *prop = tessera_property_find(ob, "tessera_visualize_clusters");
     if (prop == nullptr) {
-      return false;
+      return 0;
     }
-    return prop->data.val != 0;
+    if (prop->type == IDP_INT) {
+      return IDP_int_get(prop);
+    }
+    if (prop->type == IDP_FLOAT) {
+      return int(IDP_float_get(prop));
+    }
+    if (prop->type == IDP_DOUBLE) {
+      return int(IDP_double_get(prop));
+    }
+    return prop->data.val;
   }
 
   /** Master switch: false disables the Tessera path (falls back to the regular
    * mesh draw). Defaults to true when the property is absent. */
   static bool tessera_enabled_get(Object *ob)
   {
-    IDProperty *group = IDP_GetProperties(&ob->id);
-    if (group == nullptr) {
-      return true;
-    }
-    IDProperty *prop = IDP_GetPropertyFromGroup(group, "tessera_enabled");
+    const IDProperty *prop = tessera_property_find(ob, "tessera_enabled");
     if (prop == nullptr) {
       return true;
+    }
+    if (prop->type == IDP_INT) {
+      return IDP_int_get(prop) != 0;
     }
     return prop->data.val != 0;
   }
@@ -189,11 +215,7 @@ class Instance : public DrawEngine {
   /** LOD quality control: tolerated screen-space error in pixels. */
   static float tessera_pixel_error_get(Object *ob)
   {
-    IDProperty *group = IDP_GetProperties(&ob->id);
-    if (group == nullptr) {
-      return 1.0f;
-    }
-    IDProperty *prop = IDP_GetPropertyFromGroup(group, "tessera_pixel_error");
+    const IDProperty *prop = tessera_property_find(ob, "tessera_pixel_error");
     if (prop == nullptr) {
       return 1.0f;
     }
@@ -212,11 +234,7 @@ class Instance : public DrawEngine {
 
   static float tessera_culling_margin_get(Object *ob)
   {
-    IDProperty *group = IDP_GetProperties(&ob->id);
-    if (group == nullptr) {
-      return 0.02f;
-    }
-    IDProperty *prop = IDP_GetPropertyFromGroup(group, "tessera_culling_margin");
+    const IDProperty *prop = tessera_property_find(ob, "tessera_culling_margin");
     if (prop == nullptr) {
       return 0.02f;
     }
@@ -237,24 +255,19 @@ class Instance : public DrawEngine {
   /** LOD view source: 0 = viewport view, 1 = the scene's active camera. */
   static int tessera_view_source_get(Object *ob)
   {
-    IDProperty *group = IDP_GetProperties(&ob->id);
-    if (group == nullptr) {
-      return 0;
-    }
-    IDProperty *prop = IDP_GetPropertyFromGroup(group, "tessera_view_source");
+    const IDProperty *prop = tessera_property_find(ob, "tessera_view_source");
     if (prop == nullptr) {
       return 0;
+    }
+    if (prop->type == IDP_INT) {
+      return IDP_int_get(prop);
     }
     return prop->data.val;
   }
 
   static bool tessera_show_stats_get(Object *ob)
   {
-    IDProperty *group = IDP_GetProperties(&ob->id);
-    if (group == nullptr) {
-      return true;
-    }
-    IDProperty *prop = IDP_GetPropertyFromGroup(group, "tessera_show_stats");
+    const IDProperty *prop = tessera_property_find(ob, "tessera_show_stats");
     if (prop == nullptr) {
       return true;
     }
@@ -266,11 +279,7 @@ class Instance : public DrawEngine {
 
   static bool tessera_log_console_get(Object *ob)
   {
-    IDProperty *group = IDP_GetProperties(&ob->id);
-    if (group == nullptr) {
-      return false;
-    }
-    IDProperty *prop = IDP_GetPropertyFromGroup(group, "tessera_log_console");
+    const IDProperty *prop = tessera_property_find(ob, "tessera_log_console");
     if (prop == nullptr) {
       return false;
     }
@@ -282,20 +291,7 @@ class Instance : public DrawEngine {
 
   static bool tessera_show_fps_panel_get(Object *ob)
   {
-    if (ob == nullptr) {
-      return false;
-    }
-    IDProperty *group = IDP_GetProperties(&ob->id);
-    if (group == nullptr) {
-      const ID *orig_id = DEG_get_original_id(&ob->id);
-      if (orig_id != nullptr && orig_id != &ob->id) {
-        group = IDP_GetProperties(const_cast<ID *>(orig_id));
-      }
-    }
-    if (group == nullptr) {
-      return false;
-    }
-    IDProperty *prop = IDP_GetPropertyFromGroup(group, "tessera_show_fps_panel");
+    const IDProperty *prop = tessera_property_find(ob, "tessera_show_fps_panel");
     if (prop == nullptr) {
       return false;
     }
@@ -307,20 +303,7 @@ class Instance : public DrawEngine {
 
   static bool tessera_show_fps_hud_get(Object *ob)
   {
-    if (ob == nullptr) {
-      return false;
-    }
-    IDProperty *group = IDP_GetProperties(&ob->id);
-    if (group == nullptr) {
-      const ID *orig_id = DEG_get_original_id(&ob->id);
-      if (orig_id != nullptr && orig_id != &ob->id) {
-        group = IDP_GetProperties(const_cast<ID *>(orig_id));
-      }
-    }
-    if (group == nullptr) {
-      return false;
-    }
-    IDProperty *prop = IDP_GetPropertyFromGroup(group, "tessera_show_fps_hud");
+    const IDProperty *prop = tessera_property_find(ob, "tessera_show_fps_hud");
     if (prop == nullptr) {
       return false;
     }
@@ -621,6 +604,7 @@ class Instance : public DrawEngine {
         }
       }
 
+      state.pass->setReverseZ(false);
       const float culling_margin = (state.ob != nullptr) ?
           tessera_culling_margin_get(state.ob) : state.culling_margin;
       state.culling_margin = culling_margin;
@@ -630,14 +614,52 @@ class Instance : public DrawEngine {
           tessera_pixel_error_get(state.ob) : state.pixel_error;
       state.pixel_error = pixel_error;
       state.pass->setPixelError(pixel_error);
-      state.pass->setShadingMode(state.visualize_clusters ?
-                                     tessera::TESSERA_SHADING_CLUSTERS :
-                                     tessera::TESSERA_SHADING_DIFFUSE);
+
+      tessera::TesseraShadingMode mode = tessera::TESSERA_SHADING_DIFFUSE;
+      if (state.visualize_clusters == 1) {
+        mode = tessera::TESSERA_SHADING_CLUSTERS;
+      }
+      else if (state.visualize_clusters == 2) {
+        mode = tessera::TESSERA_SHADING_NORMALS;
+      }
+      else if (state.visualize_clusters == 3) {
+        mode = tessera::TESSERA_SHADING_TANGENTS;
+      }
+      else if (state.visualize_clusters == 4) {
+        mode = tessera::TESSERA_SHADING_UVS;
+      }
+      state.pass->setShadingMode(mode);
+
+      if (mode == tessera::TESSERA_SHADING_DIFFUSE) {
+        std::vector<tessera::TesseraMaterialTextures> mats(1);
+        if (scene_state_.shading.color_type == V3D_SHADING_SINGLE_COLOR) {
+          mats[0].base_color = float4(scene_state_.shading.single_color[0],
+                                      scene_state_.shading.single_color[1],
+                                      scene_state_.shading.single_color[2],
+                                      1.0f);
+        }
+        else if (scene_state_.shading.color_type == V3D_SHADING_OBJECT_COLOR && state.ob != nullptr) {
+          mats[0].base_color = float4(state.ob->color[0], state.ob->color[1], state.ob->color[2], 1.0f);
+        }
+        else {
+          mats[0].base_color = float4(0.8f, 0.8f, 0.8f, 1.0f);
+        }
+        if (scene_state_.shading.light == V3D_LIGHTING_FLAT) {
+          mats[0].roughness_value = 1.0f;
+          mats[0].specular_value = 0.0f;
+        }
+        else {
+          mats[0].roughness_value = 0.5f;
+          mats[0].specular_value = 0.5f;
+        }
+        state.pass->set_material_textures(mats);
+      }
+
       const bool show_stats = state.show_stats;
       const bool log_console = state.log_console;
       const bool show_fps_panel = state.show_fps_panel;
       const bool show_fps_hud = state.show_fps_hud;
-      state.pass->setTelemetryEnabled(show_stats || log_console || show_fps_hud);
+      state.pass->setTelemetryEnabled(show_stats || log_console || show_fps_hud || show_fps_panel);
       state.pass->update(state.data,
                          object_persmat,
                          viewport_proj_scale_y,
@@ -844,6 +866,20 @@ class Instance : public DrawEngine {
       return;
     }
 
+    if (this->tessera_is_enabled(ob)) {
+      /* 1. Record object into Tessera's instance pipeline */
+      this->tessera_record(ob);
+
+      /* 2. CRITICAL: Completely bypass standard Workbench mesh submission!
+       * DO NOT call:
+       *   - this->mesh_sync(...)
+       *   - this->geometry_sync(...)
+       *   - DRW_shgroup_call_add(...)
+       *   - workbench_material_cache_get(...)
+       * Early-return immediately so ZERO standard geometry batches are queued. */
+      return;
+    }
+
     const ObjectState object_state = ObjectState(this->draw_ctx, scene_state_, resources_, ob);
 
     bool is_object_data_visible = (DRW_object_visibility_in_active_context(ob) &
@@ -868,11 +904,6 @@ class Instance : public DrawEngine {
     ResourceHandleRange emitter_handle = {};
 
     if (is_object_data_visible) {
-      if (this->tessera_is_enabled(ob)) {
-        this->tessera_record(ob);
-        /* Tessera-owned object: rendered exclusively by the Tessera pass in draw(). */
-        return;
-      }
       if (object_state.sculpt_pbvh) {
         ResourceHandleRange handle = manager.unique_handle_for_sculpt(ob_ref);
         this->sculpt_sync(ob_ref, handle, object_state);
@@ -965,6 +996,10 @@ class Instance : public DrawEngine {
 
   void mesh_sync(ObjectRef &ob_ref, ResourceHandleRange handle, const ObjectState &object_state)
   {
+    if (this->tessera_is_enabled(ob_ref.object)) {
+      return;
+    }
+
     bool has_transparent_material = false;
 
     if (object_state.use_per_material_batches) {
@@ -1031,6 +1066,10 @@ class Instance : public DrawEngine {
 
   void sculpt_sync(ObjectRef &ob_ref, ResourceHandleRange handle, const ObjectState &object_state)
   {
+    if (this->tessera_is_enabled(ob_ref.object)) {
+      return;
+    }
+
     SculptBatchFeature features = SCULPT_BATCH_DEFAULT;
     if (object_state.color_type == V3D_SHADING_VERTEX_COLOR) {
       features = SCULPT_BATCH_VERTEX_COLOR;

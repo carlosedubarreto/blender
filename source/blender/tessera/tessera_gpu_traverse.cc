@@ -52,11 +52,12 @@ void main()
   float err_c = errs.x;
   float err_p = errs.y;
 
-  float dist_c = max(distance(camera_pos, center) - radius, 1e-4);
+  const float near_clip = 0.01;
+  float dist_c = max(distance(camera_pos, center) - radius, near_clip);
   float screen_err_c = (err_c <= 0.0) ? 0.0 : (err_c * proj_scale_y * (viewport_height * 0.5) / dist_c);
 
   vec4 parent_sphere = cluster_parent_sphere[ci];
-  float dist_p = max(distance(camera_pos, parent_sphere.xyz) - parent_sphere.w, 1e-4);
+  float dist_p = max(distance(camera_pos, parent_sphere.xyz) - parent_sphere.w, near_clip);
   float screen_err_p = (err_p >= 3.0e38) ? 1.0e39 : (err_p * proj_scale_y * (viewport_height * 0.5) / dist_p);
 
   if (!(screen_err_c <= pixel_error && screen_err_p > pixel_error)) {

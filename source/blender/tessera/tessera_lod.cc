@@ -174,7 +174,7 @@ float projectedErrorPx(const float3 &center, float radius, float error,
     const float dist = orthographic ?
                            1.0f :
                            std::max(math::distance(camPos, center) - radius,
-                                    1e-6f);
+                                    0.01f);
     return error * projScaleY * (viewportHeight * 0.5f) / dist;
 }
 

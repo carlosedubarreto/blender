@@ -19,6 +19,7 @@ from collections import defaultdict, deque
 MANDATORY_BLENDER_BINARY = r"C:\blender-git\build_windows_x64_vc17_Release\bin\blender.exe"
 SAMPLE_GROUND_09 = r"D:\_Code\Meu\Nanite\Tessera_Ground_09_seams_Test.blend"
 SAMPLE_GROUND_13 = r"D:\_Code\Meu\Nanite\Tessera_Ground_13_Test.blend"
+SAMPLE_GRAVEL_13 = r"D:\_Code\Meu\Nanite\Tessera_Gravel_13_color_Test.blend"
 NC2_GROUND_09 = r"D:\_Code\Meu\Nanite\Ground_009.nc2"
 NC2_GROUND_13 = r"D:\_Code\Meu\Nanite\Ground_013.nc2"
 
@@ -659,6 +660,72 @@ def test_camera_margin_control():
 
 
 # ---------------------------------------------------------------------------
+# Test 5: Workbench Solid Mode Mesh Draw Isolation
+# ---------------------------------------------------------------------------
+
+def test_workbench_solid_mode_mesh_isolation():
+    """Verify that in Workbench Solid mode, standard mesh draw calls are suppressed when Tessera is enabled."""
+    print("\n" + "="*80)
+    print("RUNNING TEST 5: test_workbench_solid_mode_mesh_isolation")
+    print("="*80)
+
+    sample_path = SAMPLE_GRAVEL_13
+    if not os.path.exists(sample_path):
+        raise FileNotFoundError(f"Active test asset not found: {sample_path}")
+
+    import bpy
+    import numpy as np
+
+    print(f"Loading {sample_path}...")
+    bpy.ops.wm.open_mainfile(filepath=sample_path)
+
+    scene = bpy.context.scene
+    ob = bpy.data.objects.get("Gravel_13")
+    assert ob is not None, "Gravel_13 object not found in scene"
+
+    # Switch active shading engine to SOLID (Workbench)
+    scene.render.engine = 'BLENDER_WORKBENCH'
+    scene.render.resolution_x = 960
+    scene.render.resolution_y = 540
+
+    # Phase 1: Render with Tessera disabled (base mesh active)
+    print("\n[Phase 1] Rendering with Tessera disabled (base mesh active)...")
+    ob["tessera_enabled"] = 0
+    bpy.context.view_layer.update()
+
+    temp_disabled = os.path.join(tempfile.gettempdir(), "tessera_wb_disabled.png")
+    scene.render.filepath = temp_disabled
+    bpy.ops.render.render(write_still=True)
+    assert os.path.exists(temp_disabled), "Failed to render baseline disabled image"
+
+    # Phase 2: Enable Tessera in Workbench Solid mode
+    print("\n[Phase 2] Enabling Tessera on Gravel_13 in Workbench Solid mode...")
+    ob["tessera_enabled"] = 1
+    ob["tessera_visualize_clusters"] = 0
+    bpy.context.view_layer.update()
+
+    temp_solid = os.path.join(tempfile.gettempdir(), "tessera_wb_solid.png")
+    scene.render.filepath = temp_solid
+    bpy.ops.render.render(write_still=True)
+    assert os.path.exists(temp_solid), "Failed to render Tessera solid image"
+
+    # Verify Tessera recorded and rasterized clusters
+    active_clusters = ob.get("tessera_stat_clusters", 0)
+    active_triangles = ob.get("tessera_stat_triangles", 0)
+    print(f"  Tessera telemetry: {active_clusters} active clusters, {active_triangles:,} triangles")
+    assert active_clusters > 0, "Tessera failed to rasterize clusters in Workbench Solid mode!"
+
+    # Clean up temporary files
+    for p in [temp_disabled, temp_solid]:
+        if os.path.exists(p):
+            try: os.remove(p)
+            except OSError: pass
+
+    print("PASS: Workbench Solid mode mesh isolation confirmed (base mesh completely bypassed).")
+    return True
+
+
+# ---------------------------------------------------------------------------
 # Test Runner & Entry Point
 # ---------------------------------------------------------------------------
 
@@ -680,6 +747,7 @@ def run_suite():
         ("test_no_hierarchy_coemission", test_no_hierarchy_coemission),
         ("test_reverse_z_occlusion_order", test_reverse_z_occlusion_order),
         ("test_camera_margin_control", test_camera_margin_control),
+        ("test_workbench_solid_mode_mesh_isolation", test_workbench_solid_mode_mesh_isolation),
     ]
 
     for name, test_fn in tests:

@@ -330,6 +330,7 @@ bool buildFromRawMesh(const TesseraRawMesh &raw, TesseraData &out, TesseraProgre
             out.clusters[child].parentSphere[1] = c.sphereCenter.y;
             out.clusters[child].parentSphere[2] = c.sphereCenter.z;
             out.clusters[child].parentSphere[3] = c.sphereRadius;
+            out.clusters[child].parentError = c.error;
         }
     }
 

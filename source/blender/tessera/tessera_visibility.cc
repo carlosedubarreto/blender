@@ -79,9 +79,7 @@ void main()
 static const char *VIS_FRAG_SOURCE = R"(
 void main()
 {
-  gl_FragDepth = gl_FragCoord.z;
-  imageStore(vis_image, ivec2(gl_FragCoord.xy),
-             uvec4(tri_id, packHalf2x16(bary), cluster_id, 0u));
+  out_vis = uvec4(tri_id, packHalf2x16(bary), cluster_id, gl_FrontFacing ? 1u : 0u);
 }
 )";
 
@@ -155,7 +153,8 @@ void main()
     return;
   }
   if (shading_mode == 2u) {
-    out_color = vec4(nor * 0.5 + 0.5, out_alpha);
+    vec3 disp_nor = (vis.w != 0u) ? nor : -nor;
+    out_color = vec4(disp_nor * 0.5 + 0.5, out_alpha);
     return;
   }
   if (shading_mode == 3u) {
@@ -262,14 +261,19 @@ void main()
   vec3 n_mapped = tex_norm * 2.0 - 1.0;
   vec3 shaded_nor = has_n ? normalize(TBN * n_mapped) : N;
 
+  bool is_front_facing = (vis.w != 0u);
+  if (!is_front_facing) {
+    shaded_nor = -shaded_nor;
+  }
+
   /* Headlight / camera lighting with specular highlight */
   vec3 world_pos = (model_mat * vec4(pos, 1.0)).xyz;
   vec3 light_dir = normalize(camera_pos - world_pos);
-  float NdotL = max(dot(shaded_nor, light_dir), 0.0);
+  float NdotL = clamp(dot(shaded_nor, light_dir), 0.0, 1.0);
 
   vec3 view_dir = light_dir;
   vec3 half_dir = normalize(light_dir + view_dir);
-  float NdotH = max(dot(shaded_nor, half_dir), 0.0);
+  float NdotH = clamp(dot(shaded_nor, half_dir), 0.0, 1.0);
   float spec_power = (1.0 - clamp(roughness, 0.04, 0.98)) * 64.0;
   float spec = pow(NdotH, max(1.0, spec_power)) * (1.0 - roughness);
 
@@ -466,8 +470,12 @@ void main()
   vec3 world_geo_n = cross(world_p1 - world_p0, world_p2 - world_p0);
   float geo_len = length(world_geo_n);
   world_geo_n = (geo_len > 1e-12) ? (world_geo_n / geo_len) : world_nor;
-  if (dot(world_geo_n, world_nor) < 0.0) {
+
+  /* Preserve true winding orientation recorded in vis.w */
+  bool is_front_facing = (vis.w != 0u);
+  if (!is_front_facing) {
     world_geo_n = -world_geo_n;
+    shaded_nor = -shaded_nor;
   }
 
   uint geo_norm_bits = geometry_normal_pack(world_geo_n, shaded_nor);
@@ -525,14 +533,10 @@ gpu::Shader *createVisShader()
 
     /* Vertex pulling: vid attribute supplies the absolute index position. */
     info.vertex_in(0, Type::uint_t, "vid");
+    info.fragment_out(0, Type::uint4_t, "out_vis");
     info.storage_buf(0, Qualifier::read, "uint", "tri_indices[]");
     info.storage_buf(1, Qualifier::read, "float", "positions[]");
     info.storage_buf(2, Qualifier::read, "uvec4", "cluster_meta[]");
-    info.image(0,
-               gpu::TextureFormat::UINT_32_32_32_32,
-               Qualifier::write,
-               ImageReadWriteType::Uint2D,
-               "vis_image");
 
     info.push_constant(Type::float4x4_t, "view_proj");
     info.push_constant(Type::int_t, "debug_clusters");
@@ -792,14 +796,14 @@ bool TesseraVisibilityPass::ensure_targets(int width, int height)
                                         height,
                                         1,
                                         gpu::TextureFormat::UINT_32_32_32_32,
-                                        GPU_TEXTURE_USAGE_GENERAL,
+                                        GPU_TEXTURE_USAGE_ATTACHMENT | GPU_TEXTURE_USAGE_SHADER_READ,
                                         nullptr);
     mDepthTexture = GPU_texture_create_2d("tessera_vis_depth",
                                           width,
                                           height,
                                           1,
                                           gpu::TextureFormat::SFLOAT_32_DEPTH,
-                                          GPU_TEXTURE_USAGE_GENERAL,
+                                          GPU_TEXTURE_USAGE_ATTACHMENT | GPU_TEXTURE_USAGE_SHADER_READ,
                                           nullptr);
     if (mVisTexture == nullptr || mDepthTexture == nullptr) {
         return false;
@@ -807,7 +811,7 @@ bool TesseraVisibilityPass::ensure_targets(int width, int height)
     mFrameBuffer = GPU_framebuffer_create("tessera_vis_fb");
     GPU_framebuffer_ensure_config(&mFrameBuffer,
                                   {GPU_ATTACHMENT_TEXTURE(mDepthTexture),
-                                   GPU_ATTACHMENT_NONE});
+                                   GPU_ATTACHMENT_TEXTURE(mVisTexture)});
     return mFrameBuffer != nullptr;
 }
 
@@ -913,7 +917,7 @@ void TesseraVisibilityPass::render(gpu::StorageBuf *command_buf,
     GPU_depth_mask(true);
     GPU_face_culling(GPU_CULL_NONE);
     GPU_blend(GPU_BLEND_NONE);
-    GPU_color_mask(false, false, false, false);
+    GPU_color_mask(true, true, true, true);
 
     GPU_shader_bind(mVisShader);
     GPU_storagebuf_bind(mIndicesBuf, 0);
@@ -921,7 +925,6 @@ void TesseraVisibilityPass::render(gpu::StorageBuf *command_buf,
     if (mClusterMetaBuf != nullptr) {
         GPU_storagebuf_bind(mClusterMetaBuf, 2);
     }
-    GPU_texture_image_bind(mVisTexture, 0);
     GPU_shader_uniform_mat4(mVisShader, "view_proj", viewProj.ptr());
     GPU_shader_uniform_1i(
         mVisShader,
@@ -1139,7 +1142,7 @@ void TesseraVisibilityPass::render_gbuffer(gpu::StorageBuf *command_buf,
     GPU_depth_mask(true);
     GPU_face_culling(GPU_CULL_NONE);
     GPU_blend(GPU_BLEND_NONE);
-    GPU_color_mask(false, false, false, false);
+    GPU_color_mask(true, true, true, true);
 
     GPU_shader_bind(mVisShader);
     GPU_storagebuf_bind(mIndicesBuf, 0);
@@ -1147,7 +1150,6 @@ void TesseraVisibilityPass::render_gbuffer(gpu::StorageBuf *command_buf,
     if (mClusterMetaBuf != nullptr) {
         GPU_storagebuf_bind(mClusterMetaBuf, 2);
     }
-    GPU_texture_image_bind(mVisTexture, 0);
     GPU_shader_uniform_mat4(mVisShader, "view_proj", viewProj.ptr());
     GPU_shader_uniform_1i(mVisShader, "debug_clusters", 0);
     GPU_shader_uniform_1i(mVisShader, "cluster_count", int(mClusterCount));

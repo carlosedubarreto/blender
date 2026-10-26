@@ -649,7 +649,10 @@ BuildResult buildClusterDAG(const std::vector<BuildVertex> &verts,
             for (const uint32_t cid : mg) {
                 max_child_error = std::max(max_child_error, R.clusters[cid].error);
             }
-            const float accumulated_error = max_child_error + std::max(simplified.error, 1e-4f);
+            /* Guarantee strict error monotonicity up the tree: parent error must strictly exceed
+             * all constituent children by at least epsilon (scaled for large error values). */
+            const float error_eps = std::max(1e-4f, max_child_error * 1e-4f);
+            const float accumulated_error = max_child_error + std::max(simplified.error, error_eps);
 
             std::vector<uint32_t> parents;
             for (const auto &part : parts) {
@@ -689,6 +692,22 @@ BuildResult buildClusterDAG(const std::vector<BuildVertex> &verts,
                 }
                 R.clusters[cid].parentError = accumulated_error;
                 R.clusters[best].children.push_back(cid);
+            }
+
+            /* Ensure parent clusters strictly enclose all their children's bounding spheres
+             * and maintain strict error monotonicity. */
+            for (const uint32_t pid : parents) {
+                float group_max_child_err = 0.0f;
+                for (const uint32_t cid : R.clusters[pid].children) {
+                    group_max_child_err = std::max(group_max_child_err, R.clusters[cid].error);
+                    const float d = math::distance(R.clusters[pid].sphereCenter, R.clusters[cid].sphereCenter);
+                    R.clusters[pid].sphereRadius = std::max(R.clusters[pid].sphereRadius, d + R.clusters[cid].sphereRadius);
+                }
+                const float p_eps = std::max(1e-4f, group_max_child_err * 1e-4f);
+                R.clusters[pid].error = std::max(accumulated_error, group_max_child_err + p_eps);
+                for (const uint32_t cid : R.clusters[pid].children) {
+                    R.clusters[cid].parentError = R.clusters[pid].error;
+                }
             }
         }
 

@@ -254,6 +254,49 @@ SimplifyResult simplifyTriangles(const std::vector<float3> &positions,
         live.insert(e.first);
     }
 
+    /* True when moving vertex `v` of triangle `t` to `newp` degenerates or
+     * flips the triangle's normal. Rejects normal inversion (n_orig . n_new < 0.2). */
+    auto flips = [&](uint32_t t, uint32_t v, const float3 &newp) {
+        const auto &tv = tris[t];
+        float3 p[3];
+        for (int k = 0; k < 3; ++k) {
+            p[k] = verts[tv[k]];
+            if (tv[k] == v) {
+                p[k] = newp;
+            }
+        }
+        const float3 un = math::cross(p[1] - p[0], p[2] - p[0]);
+        if (math::length_squared(un) <= 1e-20f) {
+            return true;
+        }
+        return math::dot(math::normalize(un), fnorm[t]) < 0.2f;
+    };
+
+    /* Check if collapsing (a, b) to pos causes any adjacent triangle to fold or invert normals. */
+    auto causes_flip = [&](uint32_t a, uint32_t b, const float3 &pos) {
+        for (const uint32_t t : vtris[a]) {
+            const auto &tv = tris[t];
+            if (tv[0] == tv[1] || tv[1] == tv[2] || tv[0] == tv[2]) {
+                continue;
+            }
+            const bool has_b = (tv[0] == b || tv[1] == b || tv[2] == b);
+            if (!has_b && flips(t, a, pos)) {
+                return true;
+            }
+        }
+        for (const uint32_t t : vtris[b]) {
+            const auto &tv = tris[t];
+            if (tv[0] == tv[1] || tv[1] == tv[2] || tv[0] == tv[2]) {
+                continue;
+            }
+            const bool has_a = (tv[0] == a || tv[1] == a || tv[2] == a);
+            if (!has_a && flips(t, b, pos)) {
+                return true;
+            }
+        }
+        return false;
+    };
+
     auto edge_cost = [&](uint32_t a, uint32_t b) {
         if (locked[a] && locked[b]) {
             return 1e30;
@@ -263,12 +306,42 @@ SimplifyResult simplifyTriangles(const std::vector<float3> &positions,
         float3 pos;
         if (locked[a]) {
             pos = verts[a];
+            if (causes_flip(a, b, pos)) {
+                return 1e30;
+            }
         }
         else if (locked[b]) {
             pos = verts[b];
+            if (causes_flip(a, b, pos)) {
+                return 1e30;
+            }
         }
-        else if (!optimal_position(Qe, pos)) {
-            pos = (verts[a] + verts[b]) * 0.5f;
+        else {
+            bool found_pos = false;
+            if (optimal_position(Qe, pos) && !causes_flip(a, b, pos)) {
+                found_pos = true;
+            }
+            if (!found_pos) {
+                pos = (verts[a] + verts[b]) * 0.5f;
+                if (!causes_flip(a, b, pos)) {
+                    found_pos = true;
+                }
+            }
+            if (!found_pos) {
+                pos = verts[a];
+                if (!causes_flip(a, b, pos)) {
+                    found_pos = true;
+                }
+            }
+            if (!found_pos) {
+                pos = verts[b];
+                if (!causes_flip(a, b, pos)) {
+                    found_pos = true;
+                }
+            }
+            if (!found_pos) {
+                return 1e30;
+            }
         }
         double cost = std::max(quadric_cost(Qe, pos), 0.0);
         if (locked[a] || locked[b]) {
@@ -283,11 +356,17 @@ SimplifyResult simplifyTriangles(const std::vector<float3> &positions,
     auto push_edge = [&](uint32_t a, uint32_t b) {
         const uint64_t key = edge_key(a, b);
         if (live.count(key)) {
-            queue.push({edge_cost(a, b), key, 0.0});
+            const double c = edge_cost(a, b);
+            if (c < 1e29) {
+                queue.push({c, key, 0.0});
+            }
         }
     };
     for (const uint64_t key : live) {
-        queue.push({edge_cost(key >> 32, key & 0xffffffff), key, 0.0});
+        const double c = edge_cost(key >> 32, key & 0xffffffff);
+        if (c < 1e29) {
+            queue.push({c, key, 0.0});
+        }
     }
 
     uint32_t live_tris = ntris;
@@ -326,24 +405,6 @@ SimplifyResult simplifyTriangles(const std::vector<float3> &positions,
         }
     };
 
-    /* True when moving vertex `v` of triangle `t` to `newp` degenerates or
-     * flips the triangle's normal. */
-    auto flips = [&](uint32_t t, uint32_t v, const float3 &newp) {
-        const auto &tv = tris[t];
-        float3 p[3];
-        for (int k = 0; k < 3; ++k) {
-            p[k] = verts[tv[k]];
-            if (tv[k] == v) {
-                p[k] = newp;
-            }
-        }
-        const float3 un = math::cross(p[1] - p[0], p[2] - p[0]);
-        if (math::length_squared(un) <= 1e-20f) {
-            return true;
-        }
-        return math::dot(math::normalize(un), fnorm[t]) <= 0.05f;
-    };
-
     // --- PART5 ---
 
     /* Collapse loop. When the queue drains before reaching the target
@@ -357,7 +418,10 @@ SimplifyResult simplifyTriangles(const std::vector<float3> &positions,
                 break;
             }
             for (const uint64_t key : live) {
-                queue.push({edge_cost(key >> 32, key & 0xffffffff), key, 0.0});
+                const double c = edge_cost(key >> 32, key & 0xffffffff);
+                if (c < 1e29) {
+                    queue.push({c, key, 0.0});
+                }
             }
             if (queue.empty()) {
                 break;
@@ -365,12 +429,18 @@ SimplifyResult simplifyTriangles(const std::vector<float3> &positions,
         }
         const QueueEntry entry = queue.top();
         queue.pop();
+        if (entry.cost >= 1e29) {
+            continue;
+        }
         const uint32_t a = uint32_t(entry.key >> 32);
         const uint32_t b = uint32_t(entry.key & 0xffffffff);
         if (!live.count(entry.key)) {
             continue;
         }
         const double cur = edge_cost(a, b);
+        if (cur >= 1e29) {
+            continue;
+        }
         if (std::abs((cur + entry.penalty) - entry.cost) >
             1e-9 * (1.0 + std::abs(entry.cost)))
         {
@@ -393,9 +463,38 @@ SimplifyResult simplifyTriangles(const std::vector<float3> &positions,
         else if (locked[b]) {
             newp = verts[b];
         }
-        else if (!optimal_position(Qab, newp)) {
-            newp = (verts[a] + verts[b]) * 0.5f;
+        else {
+            bool found_pos = false;
+            if (optimal_position(Qab, newp) && !causes_flip(a, b, newp)) {
+                found_pos = true;
+            }
+            if (!found_pos) {
+                newp = (verts[a] + verts[b]) * 0.5f;
+                if (!causes_flip(a, b, newp)) {
+                    found_pos = true;
+                }
+            }
+            if (!found_pos) {
+                newp = verts[a];
+                if (!causes_flip(a, b, newp)) {
+                    found_pos = true;
+                }
+            }
+            if (!found_pos) {
+                newp = verts[b];
+                if (!causes_flip(a, b, newp)) {
+                    found_pos = true;
+                }
+            }
+            if (!found_pos) {
+                continue;
+            }
         }
+
+        if (causes_flip(a, b, newp)) {
+            continue;
+        }
+
         /* The surviving vertex a inherits b's boundary lock: when the locked
          * endpoint b is removed, a takes its place on the border and must be
          * frozen there too (otherwise later collapses would deform the
@@ -403,37 +502,6 @@ SimplifyResult simplifyTriangles(const std::vector<float3> &positions,
         if (locked[b]) {
             locked[a] = 1;
             orig_indices[a] = orig_indices[b];
-        }
-
-        bool ok = true;
-        for (const uint32_t t : vtris[a]) {
-            const auto &tv = tris[t];
-            if (tv[0] == tv[1] || tv[1] == tv[2] || tv[0] == tv[2]) {
-                continue;
-            }
-            const bool has_b = (tv[0] == b || tv[1] == b || tv[2] == b);
-            if (!has_b && flips(t, a, newp)) {
-                ok = false;
-                break;
-            }
-        }
-        if (ok) {
-            for (const uint32_t t : vtris[b]) {
-                const auto &tv = tris[t];
-                if (tv[0] == tv[1] || tv[1] == tv[2] || tv[0] == tv[2]) {
-                    continue;
-                }
-                const bool has_a = (tv[0] == a || tv[1] == a || tv[2] == a);
-                if (!has_a && flips(t, b, newp)) {
-                    ok = false;
-                    break;
-                }
-            }
-        }
-        if (!ok) {
-            /* Rejected (flip/topology): drop this entry; the pass-based
-             * rebuild below retries it with updated geometry later. */
-            continue;
         }
 
         // --- PART6 ---
