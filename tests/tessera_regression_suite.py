@@ -482,6 +482,183 @@ def test_reverse_z_occlusion_order():
 
 
 # ---------------------------------------------------------------------------
+# Test 4: Camera Margin Control & Boundary Cluster Expansion
+# ---------------------------------------------------------------------------
+
+def test_camera_margin_control():
+    """Validates camera margin frustum culling: cluster ratio, visual voiding, expansion, and recovery."""
+    print("\n" + "="*80)
+    print("RUNNING TEST 4: test_camera_margin_control (Visual Void & Strict Cluster Ratio)")
+    print("="*80)
+
+    import numpy as np
+    import mathutils
+    import bpy
+    import tempfile
+    import os
+
+    # Load test asset
+    bpy.ops.wm.open_mainfile(filepath=SAMPLE_GROUND_13)
+    scene = bpy.context.scene
+    scene.render.engine = 'BLENDER_EEVEE'
+    scene.render.resolution_x = 640
+    scene.render.resolution_y = 360
+
+    ob = bpy.data.objects.get("Ground_013") or bpy.data.objects.get("Ground_13")
+    assert ob is not None, "Ground_013 object not found in test blend file"
+
+    ob["tessera_enabled"] = 1
+    if hasattr(ob, "tessera"):
+        ob.tessera.enabled = True
+
+    # Compute bounding box in world space
+    world_bbox = [ob.matrix_world @ mathutils.Vector(b) for b in ob.bound_box]
+    min_c = mathutils.Vector([min(b[i] for b in world_bbox) for i in range(3)])
+    max_c = mathutils.Vector([max(b[i] for b in world_bbox) for i in range(3)])
+    center = (min_c + max_c) * 0.5
+    dims = max_c - min_c
+
+    # Camera setup:
+    # 1. Cull camera: positioned so 50% of Ground_013 lies outside the frustum
+    cam_cull_data = bpy.data.cameras.new("CullCam")
+    cam_cull = bpy.data.objects.new("CullCam", cam_cull_data)
+    scene.collection.objects.link(cam_cull)
+    cam_cull.location = mathutils.Vector((center.x + dims.x * 0.25, center.y, 4.0))
+    cam_cull.rotation_euler = mathutils.Euler((0.0, 0.0, 0.0), 'XYZ')
+
+    # 2. Witness camera: frames the full mesh to inspect culled vs filled pixels
+    cam_witness_data = bpy.data.cameras.new("WitnessCam")
+    cam_witness = bpy.data.objects.new("WitnessCam", cam_witness_data)
+    scene.collection.objects.link(cam_witness)
+    cam_witness.location = mathutils.Vector((center.x, center.y, 8.0))
+    cam_witness.rotation_euler = mathutils.Euler((0.0, 0.0, 0.0), 'XYZ')
+    scene.camera = cam_witness
+
+    ob["tessera_cull_camera"] = cam_cull.name
+    ob["tessera_view_source"] = 1
+
+    # First determine total cluster count of the full mesh (rendered at margin 15.0)
+    print("\n[Phase 1] Evaluating total full-mesh cluster count at culling_margin = 15.0...")
+    ob["tessera_culling_margin"] = 15.0
+    if hasattr(ob, "tessera"):
+        ob.tessera.culling_margin = 15.0
+    bpy.context.view_layer.update()
+    temp_m15 = os.path.join(tempfile.gettempdir(), "test_margin_15.png")
+    scene.render.filepath = temp_m15
+    bpy.ops.render.render(write_still=True)
+
+    total_clusters = ob.get("tessera_stat_clusters")
+    total_triangles = ob.get("tessera_stat_triangles")
+    print(f"  Full Mesh Total Clusters: {total_clusters} ({total_triangles:,} triangles)")
+    assert total_clusters is not None and total_clusters > 0, "No clusters recorded at margin 15.0"
+
+    # Phase 2: Render at culling_margin = 0.0
+    print("\n[Phase 2] Strict culling evaluation at culling_margin = 0.0...")
+    ob["tessera_culling_margin"] = 0.0
+    if hasattr(ob, "tessera"):
+        ob.tessera.culling_margin = 0.0
+    bpy.context.view_layer.update()
+    temp_m0 = os.path.join(tempfile.gettempdir(), "test_margin_0.png")
+    scene.render.filepath = temp_m0
+    bpy.ops.render.render(write_still=True)
+
+    clusters_margin_0 = ob.get("tessera_stat_clusters")
+    tris_margin_0 = ob.get("tessera_stat_triangles")
+    eff_m0 = ob.get("tessera_stat_culling_margin")
+    print(f"  Margin 0.0: {clusters_margin_0} active clusters ({tris_margin_0:,} triangles) | Margin: {eff_m0:.2f}m")
+
+    # Assertion 1 (Cluster Ratio): active_clusters <= 0.65 * total_clusters
+    cluster_ratio_0 = clusters_margin_0 / float(total_clusters)
+    print(f"  Cluster Ratio at Margin 0.0: {cluster_ratio_0:.3f} (threshold <= 0.65)")
+    assert cluster_ratio_0 <= 0.65, (
+        f"Assertion 1 FAILED! active_clusters ({clusters_margin_0}) is {cluster_ratio_0*100:.1f}% "
+        f"of total_clusters ({total_clusters}). Culling is bypassed!"
+    )
+
+    # Read pixel buffers
+    img0 = bpy.data.images.load(temp_m0)
+    w0, h0 = img0.size
+    px0 = np.array(img0.pixels[:], dtype=np.float32).reshape((h0, w0, 4))
+    bpy.data.images.remove(img0)
+
+    img15 = bpy.data.images.load(temp_m15)
+    w15, h15 = img15.size
+    px15 = np.array(img15.pixels[:], dtype=np.float32).reshape((h15, w15, 4))
+    bpy.data.images.remove(img15)
+
+    # Compute difference mask between full mesh (margin 15) and culled mesh (margin 0)
+    diff = np.abs(px15[:, :, :3] - px0[:, :, :3])
+    diff_mask = (diff.max(axis=-1) > 0.05)
+    diff_pixel_count = diff_mask.sum()
+    print(f"  Void/Diff pixel count: {diff_pixel_count:,} pixels")
+
+    # Assertion 2 (Visual Void Verification):
+    # In px0, the pixels in the culled region must contain background/world color
+    culled_pixels_px0 = px0[diff_mask]
+    bg_std_0 = culled_pixels_px0[:, :3].std(axis=0).max()
+    print(f"  Culled region px0 std dev: {bg_std_0:.5f} (must be near-zero world color)")
+    assert diff_pixel_count > 1000, f"Assertion 2 FAILED: Insufficient void pixels detected ({diff_pixel_count})"
+    assert bg_std_0 < 0.02, (
+        f"Assertion 2 FAILED! Pixels outside camera boundary contain non-background noise (std={bg_std_0:.4f})."
+    )
+
+    # Phase 3: Margin expansion to 15.0
+    print("\n[Phase 3] Expanding culling_margin = 15.0...")
+    ob["tessera_culling_margin"] = 15.0
+    if hasattr(ob, "tessera"):
+        ob.tessera.culling_margin = 15.0
+    bpy.context.view_layer.update()
+    bpy.ops.render.render()
+
+    clusters_margin_15 = ob.get("tessera_stat_clusters")
+    tris_margin_15 = ob.get("tessera_stat_triangles")
+    eff_m15 = ob.get("tessera_stat_culling_margin")
+    print(f"  Margin 15.0: {clusters_margin_15} active clusters ({tris_margin_15:,} triangles) | Margin: {eff_m15:.2f}m")
+
+    # Assertion 3: Active cluster count >= 0.95 * total_clusters
+    cluster_ratio_15 = clusters_margin_15 / float(total_clusters)
+    print(f"  Cluster Ratio at Margin 15.0: {cluster_ratio_15:.3f} (threshold >= 0.95)")
+    assert cluster_ratio_15 >= 0.95, (
+        f"Assertion 3 FAILED! Active clusters at margin 15.0 ({clusters_margin_15}) is only "
+        f"{cluster_ratio_15*100:.1f}% of total ({total_clusters}), expected >= 95%."
+    )
+
+    # Assertion 4: Void pixels filled
+    culled_pixels_px15 = px15[diff_mask]
+    color_shift = np.abs(culled_pixels_px15[:, :3].mean(axis=0) - culled_pixels_px0[:, :3].mean(axis=0)).max()
+    print(f"  Color shift in void region after fill: {color_shift:.4f}")
+    assert color_shift > 0.05, (
+        f"Assertion 4 FAILED! Previously empty void pixels were not filled with rasterized clusters."
+    )
+
+    # Phase 4: Contractive Recovery Check
+    print("\n[Phase 4] Resetting culling_margin = 0.0 (verifying contractive recovery)...")
+    ob["tessera_culling_margin"] = 0.0
+    if hasattr(ob, "tessera"):
+        ob.tessera.culling_margin = 0.0
+    bpy.context.view_layer.update()
+    bpy.ops.render.render()
+
+    clusters_reset = ob.get("tessera_stat_clusters")
+    tris_reset = ob.get("tessera_stat_triangles")
+    print(f"  Margin reset: {clusters_reset} active clusters ({tris_reset:,} triangles)")
+
+    assert clusters_reset == clusters_margin_0, (
+        f"Contractive recovery failed! Cluster count after reset ({clusters_reset}) "
+        f"does not match initial margin 0.0 count ({clusters_margin_0})."
+    )
+
+    # Clean up temporary files
+    for p in [temp_m0, temp_m15]:
+        if os.path.exists(p):
+            try: os.remove(p)
+            except OSError: pass
+
+    print("PASS: Camera margin control verified successfully (Cluster Ratio, Visual Void, Expansion, Recovery).")
+    return True
+
+
+# ---------------------------------------------------------------------------
 # Test Runner & Entry Point
 # ---------------------------------------------------------------------------
 
@@ -502,6 +679,7 @@ def run_suite():
         ("test_cluster_seam_watertightness", test_cluster_seam_watertightness),
         ("test_no_hierarchy_coemission", test_no_hierarchy_coemission),
         ("test_reverse_z_occlusion_order", test_reverse_z_occlusion_order),
+        ("test_camera_margin_control", test_camera_margin_control),
     ]
 
     for name, test_fn in tests:

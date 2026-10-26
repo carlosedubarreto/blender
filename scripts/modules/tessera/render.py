@@ -85,6 +85,12 @@ def _culling_margin_update(self, context):
     _tag_tessera_redraw(self, context)
 
 
+def get_effective_margin(ob, context=None):
+    if ob is None:
+        return 0.02
+    return max(0.0, float(ob.get("tessera_culling_margin", 0.02)))
+
+
 def _view_source_update(self, context):
     val = (self.view_source == 'CAMERA')
     self.id_data["tessera_view_source"] = int(val)

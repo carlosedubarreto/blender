@@ -174,6 +174,18 @@ class Instance : public DrawEngine {
     return prop->data.val != 0;
   }
 
+  static bool tessera_is_enabled(Object *ob)
+  {
+    if (ob == nullptr) {
+      return false;
+    }
+    if (!tessera_enabled_get(ob)) {
+      return false;
+    }
+    std::string dummy;
+    return tessera_path_get(ob, dummy);
+  }
+
   /** LOD quality control: tolerated screen-space error in pixels. */
   static float tessera_pixel_error_get(Object *ob)
   {
@@ -218,6 +230,7 @@ class Instance : public DrawEngine {
     else if (prop->type == IDP_INT) {
       value = float(IDP_int_get(prop));
     }
+
     return (value >= 0.0f) ? value : 0.0f;
   }
 
@@ -403,6 +416,27 @@ class Instance : public DrawEngine {
     }
   }
 
+  static void tessera_stat_culling_margin_write(Object *ob, float margin)
+  {
+    if (ob == nullptr) {
+      return;
+    }
+    auto write_props = [&](ID *id) {
+      if (id == nullptr) {
+        return;
+      }
+      if (IDProperty *group = IDP_EnsureProperties(id)) {
+        idp_float_replace(group, "tessera_stat_culling_margin", margin);
+      }
+    };
+
+    write_props(&ob->id);
+    const ID *orig_id = DEG_get_original_id(&ob->id);
+    if (orig_id != nullptr && orig_id != &ob->id) {
+      write_props(const_cast<ID *>(orig_id));
+    }
+  }
+
   /**
    * Projection*view matrix of the scene's active camera, fitted to the target
    * resolution. Returns false when the scene has no usable camera.
@@ -410,23 +444,46 @@ class Instance : public DrawEngine {
   static bool tessera_camera_persmat(const Scene *scene,
                                     const DRWContext *draw_ctx,
                                     const int2 &resolution,
+                                    const Object *state_ob,
                                     float4x4 &r_persmat,
                                     float &r_proj_scale_y)
   {
-    if (scene == nullptr || scene->camera == nullptr ||
-        draw_ctx->depsgraph == nullptr)
-    {
+    if (scene == nullptr || draw_ctx->depsgraph == nullptr) {
       return false;
     }
-    const Object *cam_ob = DEG_get_evaluated(draw_ctx->depsgraph, scene->camera);
+    const Object *cam_ob = nullptr;
+    if (state_ob != nullptr) {
+      IDProperty *group = IDP_GetProperties(const_cast<ID *>(&state_ob->id));
+      if (group != nullptr) {
+        IDProperty *cull_cam_prop = IDP_GetPropertyFromGroup(group, "tessera_cull_camera");
+        if (cull_cam_prop != nullptr && cull_cam_prop->type == IDP_STRING) {
+          const char *cam_name = IDP_string_get(cull_cam_prop);
+          if (cam_name != nullptr && cam_name[0] != '\0') {
+            Main *bmain = DEG_get_bmain(draw_ctx->depsgraph);
+            if (bmain != nullptr) {
+              Object *found = static_cast<Object *>(
+                  BLI_findstring(&bmain->objects, cam_name, offsetof(ID, name) + 2));
+              if (found != nullptr) {
+                cam_ob = DEG_get_evaluated(draw_ctx->depsgraph, found);
+              }
+            }
+          }
+        }
+      }
+    }
+    if (cam_ob == nullptr && scene->camera != nullptr) {
+      cam_ob = DEG_get_evaluated(draw_ctx->depsgraph, scene->camera);
+    }
     if (cam_ob == nullptr || cam_ob->type != OB_CAMERA || cam_ob->data == nullptr) {
       return false;
     }
     CameraParams params;
     BKE_camera_params_init(&params);
     BKE_camera_params_from_object(&params, cam_ob);
+    const int winx = (scene->r.xsch * scene->r.size) / 100;
+    const int winy = (scene->r.ysch * scene->r.size) / 100;
     BKE_camera_params_compute_viewplane(
-        &params, resolution.x, resolution.y, scene->r.xasp, scene->r.yasp);
+        &params, winx > 0 ? winx : resolution.x, winy > 0 ? winy : resolution.y, scene->r.xasp, scene->r.yasp);
     BKE_camera_params_compute_matrix(&params);
     float4x4 winmat = float4x4::identity();
     for (int i = 0; i < 4; ++i) {
@@ -481,8 +538,8 @@ class Instance : public DrawEngine {
     state.show_fps_hud = tessera_show_fps_hud_get(ob);
     state.visualize_clusters = tessera_visualize_get(ob);
     state.pixel_error = tessera_pixel_error_get(ob);
-    state.culling_margin = tessera_culling_margin_get(ob);
     state.view_source = tessera_view_source_get(ob);
+    state.culling_margin = tessera_culling_margin_get(ob);
     state.object_mat = ob->object_to_world();
 
     /* (Re)load the cluster data when the file path, mtime, or size changed. */
@@ -535,14 +592,19 @@ class Instance : public DrawEngine {
       /* Rasterization matrix: always projects to the active viewport framebuffer. */
       const float4x4 object_persmat = viewport_persmat * state.object_mat;
 
-      /* LOD view source: optional override to evaluate LOD selection and culling
-       * from the scene's active camera perspective instead of the viewport. */
+      const int view_source = (state.ob != nullptr) ?
+          tessera_view_source_get(state.ob) : state.view_source;
+      state.view_source = view_source;
+
       float4x4 cam_persmat;
       float cam_proj_scale_y = viewport_proj_scale_y;
+      const bool is_cam_view = (state.view_source != 0) ||
+                               (this->draw_ctx != nullptr && this->draw_ctx->rv3d != nullptr &&
+                                this->draw_ctx->rv3d->persp == RV3D_CAMOB);
       bool has_cam_lod = false;
-      if (state.view_source != 0) {
+      if (is_cam_view) {
         if (tessera_camera_persmat(
-                scene_state_.scene, this->draw_ctx, resolution, cam_persmat, cam_proj_scale_y)) {
+                scene_state_.scene, this->draw_ctx, resolution, state.ob, cam_persmat, cam_proj_scale_y)) {
           has_cam_lod = true;
         }
       }
@@ -558,8 +620,16 @@ class Instance : public DrawEngine {
           continue;
         }
       }
-      state.pass->setPixelError(state.pixel_error);
-      state.pass->setCullingMargin(state.culling_margin);
+
+      const float culling_margin = (state.ob != nullptr) ?
+          tessera_culling_margin_get(state.ob) : state.culling_margin;
+      state.culling_margin = culling_margin;
+      state.pass->setCullingMargin(culling_margin);
+      tessera_stat_culling_margin_write(state.ob, culling_margin);
+      const float pixel_error = (state.ob != nullptr) ?
+          tessera_pixel_error_get(state.ob) : state.pixel_error;
+      state.pixel_error = pixel_error;
+      state.pass->setPixelError(pixel_error);
       state.pass->setShadingMode(state.visualize_clusters ?
                                      tessera::TESSERA_SHADING_CLUSTERS :
                                      tessera::TESSERA_SHADING_DIFFUSE);
@@ -798,8 +868,9 @@ class Instance : public DrawEngine {
     ResourceHandleRange emitter_handle = {};
 
     if (is_object_data_visible) {
-      if (this->tessera_record(ob)) {
-        /* Tessera-owned object: rendered by the Tessera pass in draw(). */
+      if (this->tessera_is_enabled(ob)) {
+        this->tessera_record(ob);
+        /* Tessera-owned object: rendered exclusively by the Tessera pass in draw(). */
         return;
       }
       if (object_state.sculpt_pbvh) {

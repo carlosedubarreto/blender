@@ -368,6 +368,7 @@ std::size_t selectClustersFlat(const TesseraData &data,
     const TesseraViewInfo lod_view = (lodViewProj != nullptr) ?
         getViewInfo(*lodViewProj, viewportHeight, (lodProjScaleY != nullptr) ? *lodProjScaleY : projScaleY) :
         draw_view;
+    const TesseraViewInfo &culling_view = (lodViewProj != nullptr) ? lod_view : draw_view;
 
     const std::size_t maxClusters = params.maxClustersPerFrame > 0
                                         ? std::size_t(params.maxClustersPerFrame)
@@ -383,7 +384,7 @@ std::size_t selectClustersFlat(const TesseraData &data,
         }
         const float3 center(cluster.sphere[0], cluster.sphere[1], cluster.sphere[2]);
         const float radius = cluster.sphere[3];
-        if (!sphere_in_frustum(draw_view.planes, center, radius, params.cullingMargin)) {
+        if (!sphere_in_frustum(culling_view.planes, center, radius, params.cullingMargin)) {
             continue;
         }
 

@@ -70,11 +70,23 @@ public:
                 const float *lodProjScaleY = nullptr);
 
     /** Override the LOD pixel error threshold for the next frames. */
-    void setPixelError(float pixelError) { mPixelError = pixelError; }
+    void setPixelError(float pixelError)
+    {
+        if (std::abs(mPixelError - pixelError) > 1e-4f) {
+            mPixelError = pixelError;
+            mCacheDirty = true;
+        }
+    }
     float getPixelError() const { return mPixelError; }
 
     /** Camera frustum margin in meters / scene units. Extends culling boundaries outward. */
-    void setCullingMargin(float margin) { mCullingMargin = margin; }
+    void setCullingMargin(float margin)
+    {
+        if (std::abs(mCullingMargin - margin) > 1e-4f) {
+            mCullingMargin = margin;
+            mCacheDirty = true;
+        }
+    }
     float getCullingMargin() const { return mCullingMargin; }
 
     /** Select the material-pass shading mode (diffuse/clusters/normals). */
@@ -210,6 +222,7 @@ private:
     float mLastCullingMargin = -1.0f;
     bool mLastTelemetryEnabled = false;
     bool mMatricesCurrent = false;  // track if matrices have been updated this frame
+    bool mCacheDirty = false;       // force re-run of GPU/CPU traversal
 
     // LOD pixel error threshold (pixels).
     float mPixelError = 1.0f;

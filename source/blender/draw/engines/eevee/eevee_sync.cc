@@ -215,25 +215,18 @@ void SyncModule::sync_mesh(const ObjectRef &ob_ref)
     return;
   }
 
-  if (inst_.tessera.record(ob_ref.object)) {
-    /* Tessera-owned object: rendered by Tessera pipeline in G-Buffer pass.
-     * Register with shadow pipeline and bounds so scene lights and shadows detect it! */
+  if (inst_.tessera.is_enabled(ob_ref.object)) {
+    /* 1. Register with Tessera GPU streaming pipeline */
+    inst_.tessera.record(ob_ref.object);
+
+    /* 2. Register transform and bounding boxes for scene bounds */
     ObjectHandle ob_handle = sync_object(ob_ref, inst_.manager->unique_handle(ob_ref));
+
+    /* 3. Register object for shadow map generation */
     inst_.shadows.sync_object(ob_handle, false, false, false);
 
-    MaterialArray &material_array = inst_.materials.material_array_get(ob_handle, false);
-    Span<gpu::Batch *> mat_geom = DRW_cache_object_surface_material_get(
-        ob_handle.object, material_array.gpu_materials);
-    for (auto i : material_array.gpu_materials.index_range()) {
-      gpu::Batch *geom = mat_geom[i];
-      if (geom == nullptr) {
-        continue;
-      }
-      Material &material = material_array.materials[i];
-      if (material.shadow.sub_pass != nullptr) {
-        geometry_call(material.shadow.sub_pass, geom, ob_handle.res_handle);
-      }
-    }
+    /* CRITICAL FIX: DO NOT bind material.shading or geometry_call for the main view!
+     * Exit before adding standard mesh draw calls to EEVEE's G-Buffer / forward lists. */
     return;
   }
 
@@ -291,7 +284,7 @@ void SyncModule::sync_mesh(const ObjectRef &ob_ref)
 
 bool SyncModule::sync_sculpt(const ObjectRef &ob_ref)
 {
-  if (!inst_.use_surfaces) {
+  if (!inst_.use_surfaces || inst_.tessera.is_enabled(ob_ref.object)) {
     return false;
   }
 

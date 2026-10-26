@@ -150,7 +150,7 @@ void TesseraRenderer::update(const TesseraData &data,
     /* Freshness check — only re-traverse if matrices, data, telemetry or view parameters changed */
     bool data_changed = (mLastData == nullptr) || (&data != mLastData);
     bool telem_changed = (mLastTelemetryEnabled != mTelemetryEnabled);
-    bool view_changed = !mMatricesCurrent ||
+    bool view_changed = !mMatricesCurrent || mCacheDirty ||
                         (mLastViewProj != viewProj) ||
                         (mLastLodViewProj != lod_vp) ||
                         (mLastProjScaleY != projScaleY) ||
@@ -164,6 +164,7 @@ void TesseraRenderer::update(const TesseraData &data,
         return;
     }
     mMatricesCurrent = true;
+    mCacheDirty = false;
     mPendingCommands.clear();
 
     mLastData = &data;
@@ -268,6 +269,7 @@ void TesseraRenderer::updateWithGpuTraversal(const TesseraData &data,
     const TesseraViewInfo lod_view = (lodViewProj != nullptr) ?
         getViewInfo(*lodViewProj, viewportHeight, (lodProjScaleY != nullptr) ? *lodProjScaleY : projScaleY) :
         draw_view;
+    const TesseraViewInfo &culling_view = (lodViewProj != nullptr) ? lod_view : draw_view;
 
     GPU_shader_bind(mTraverseShader);
     GPU_storagebuf_bind(mSphereBuf, 0);
@@ -292,7 +294,7 @@ void TesseraRenderer::updateWithGpuTraversal(const TesseraData &data,
     GPU_shader_uniform_1i(mTraverseShader, "max_commands_per_material", int(mMaxCommandsPerMaterial));
     GPU_shader_uniform_1i(mTraverseShader, "record_telemetry", mTelemetryEnabled ? 1 : 0);
     GPU_shader_uniform_4fv_array(mTraverseShader, "frustum_planes", 6,
-                                 draw_view.planes);
+                                 culling_view.planes);
 
     const uint32_t group_size = 64;
     const uint32_t groups = uint32_t((clusterCount + group_size - 1) / group_size);
@@ -348,6 +350,7 @@ void TesseraRenderer::updateWithCpuTraversal(const TesseraData &data,
     const TesseraViewInfo lod_view = (lodViewProj != nullptr) ?
         getViewInfo(*lodViewProj, viewportHeight, (lodProjScaleY != nullptr) ? *lodProjScaleY : projScaleY) :
         draw_view;
+    const TesseraViewInfo &culling_view = (lodViewProj != nullptr) ? lod_view : draw_view;
     std::vector<TesseraCluster> selected;
 
     for (uint32_t ci = 0; ci < uint32_t(data.clusters.size()); ++ci) {
@@ -357,7 +360,7 @@ void TesseraRenderer::updateWithCpuTraversal(const TesseraData &data,
         }
         const float3 center(cluster.sphere[0], cluster.sphere[1], cluster.sphere[2]);
         const float radius = cluster.sphere[3];
-        if (!sphere_in_frustum(draw_view.planes, center, radius, mCullingMargin)) {
+        if (!sphere_in_frustum(culling_view.planes, center, radius, mCullingMargin)) {
             continue;
         }
 

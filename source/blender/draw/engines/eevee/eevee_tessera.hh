@@ -73,6 +73,7 @@ class TesseraModule {
   ~TesseraModule();
 
   void begin_sync();
+  bool is_enabled(Object *ob) const;
   bool record(Object *ob);
   bool has_objects() const;
   bool has_cluster_visualization() const;

@@ -46,13 +46,18 @@ def draw_tessera_hud():
     clusters = int(ob.get("tessera_stat_clusters", 0))
     tris = int(ob.get("tessera_stat_triangles", 0))
 
+    from tessera.render import get_effective_margin
+    eff_margin = float(ob.get("tessera_stat_culling_margin", get_effective_margin(ob, context)))
+    is_cam_active = (ob.get("tessera_view_source", 0) == 1) or is_viewport_in_camera_view(context)
+    mode_str = "Camera Locked" if is_cam_active else "Viewport Active"
+
     # Position in top-left margin (offset from header/gizmos)
     font_id = 0
     x_offset = 20
     region_h = context.region.height if context.region else 600
     y_offset = region_h - 60
 
-    text = f"Tessera: {fps:.1f} FPS ({ft_ms:.2f} ms) | {clusters:,} clusters | {tris:,} tris"
+    text = f"Tessera: {fps:.1f} FPS ({ft_ms:.2f} ms) | {clusters:,} clusters | {tris:,} tris | Margin: {eff_margin:.2f}m ({mode_str})"
 
     try:
         # Optional subtle background pill/box
@@ -270,6 +275,10 @@ class TESSERA_PT_object(bpy.types.Panel):
             col.operator("tessera.clear", text="Clear Tessera Data", icon='X')
 
             if is_enabled and tessera_props is not None:
+                # Camera View toggle button with dynamic alert state
+                in_cam_perspective = is_viewport_in_camera_view(context)
+                is_cam_lod_active = (ob.get("tessera_view_source", 0) == 1) or in_cam_perspective
+
                 prop_col = layout.column(align=True)
                 prop_col.use_property_split = True
                 prop_col.use_property_decorate = False
@@ -277,12 +286,8 @@ class TESSERA_PT_object(bpy.types.Panel):
                 prop_col.prop(tessera_props, "culling_margin", text="Camera Margin")
                 prop_col.prop(tessera_props, "visualize_clusters")
 
-                # Camera View toggle button with dynamic alert state
-                in_cam_perspective = is_viewport_in_camera_view(context)
-                is_cam_lod_active = (ob.get("tessera_view_source", 0) == 1)
-
                 cam_row = layout.row(align=True)
-                if in_cam_perspective and not is_cam_lod_active:
+                if in_cam_perspective and not (ob.get("tessera_view_source", 0) == 1):
                     cam_row.alert = True
                     cam_row.prop(
                         tessera_props,
@@ -293,8 +298,9 @@ class TESSERA_PT_object(bpy.types.Panel):
                     )
                 else:
                     cam_row.alert = False
-                    btn_text = "Camera LOD: Active" if is_cam_lod_active else "Camera LOD: Viewport"
-                    btn_icon = 'CHECKBOX_HLT' if is_cam_lod_active else 'CAMERA_DATA'
+                    is_view_src_cam = (ob.get("tessera_view_source", 0) == 1)
+                    btn_text = "Camera LOD: Active" if is_view_src_cam else "Camera LOD: Viewport"
+                    btn_icon = 'CHECKBOX_HLT' if is_view_src_cam else 'CAMERA_DATA'
                     cam_row.prop(
                         tessera_props,
                         "use_camera_view",
@@ -336,10 +342,12 @@ class TESSERA_PT_object(bpy.types.Panel):
 
                     dist = ob.get('tessera_stat_distance', 0.0)
                     err = ob.get('tessera_stat_pixel_error', ob.get('tessera_stat_error', 1.0))
-                    margin = ob.get('tessera_stat_culling_margin', ob.get('tessera_culling_margin', 2.0))
+                    from tessera.render import get_effective_margin
+                    eff_margin = float(ob.get('tessera_stat_culling_margin', get_effective_margin(ob, context)))
+                    mode_str = "Camera Locked" if is_cam_lod_active else "Viewport Active"
                     t_col.label(text=f"Camera Distance: {dist:.2f} m", icon='CAMERA_DATA')
                     t_col.label(text=f"Projected Error: {err:.1f} px", icon='DRIVER_DISTANCE')
-                    t_col.label(text=f"Camera Margin: {margin:.1f} m", icon='BORDERMOVE')
+                    t_col.label(text=f"Active Margin: {eff_margin:.2f} m ({mode_str})", icon='FULLSCREEN_ENTER')
 
         # State 3: No Tessera Cache Found
         else:
