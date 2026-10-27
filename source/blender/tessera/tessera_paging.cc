@@ -239,6 +239,11 @@ bool TesseraPageManager::open(const std::string &path)
     mDir = std::move(dir);
     mFile = file;
     mStop = false;
+    mIoStartTime = std::chrono::steady_clock::now();
+    mTotalBytesRead = 0;
+    mTotalRequests = 0;
+    mCacheHits = 0;
+    mPendingBytes = 0;
     mWorker = std::thread([this]() { workerLoop(); });
     return true;
 }
@@ -266,10 +271,86 @@ void TesseraPageManager::close()
         std::lock_guard<std::mutex> lock(mWorkMutex);
         mPending.clear();
         mInFlight.clear();
+        mPendingBytes = 0;
     }
     {
         std::lock_guard<std::mutex> lock(mDoneMutex);
         mCompleted.clear();
+    }
+}
+
+void TesseraPageManager::setBudget(uint64_t bytes)
+{
+    std::lock_guard<std::mutex> lock(mStateMutex);
+    mBudgetBytes = bytes;
+    std::lock_guard<std::mutex> b_lock(mBudgetMutex);
+    mBudget.max_vram_bytes = bytes;
+}
+
+uint64_t TesseraPageManager::getBudget() const
+{
+    std::lock_guard<std::mutex> lock(mStateMutex);
+    return mBudgetBytes;
+}
+
+TesseraMemoryBudget TesseraPageManager::getMemoryBudget() const
+{
+    std::lock_guard<std::mutex> b_lock(mBudgetMutex);
+    TesseraMemoryBudget b = mBudget;
+    b.current_resident_bytes = mResidentBytes;
+    b.pending_fetch_bytes = mPendingBytes.load();
+    b.max_vram_bytes = mBudgetBytes;
+
+    uint64_t reqs = mTotalRequests.load();
+    uint64_t hits = mCacheHits.load();
+    b.cache_hit_ratio = (reqs > 0) ? (float(hits) * 100.0f / float(reqs)) : 100.0f;
+
+    auto now = std::chrono::steady_clock::now();
+    float elapsed = std::chrono::duration<float>(now - mIoStartTime).count();
+    if (elapsed > 0.05f) {
+        b.disk_read_mbs = (float(mTotalBytesRead.load()) / (1024.0f * 1024.0f * elapsed));
+    } else {
+        b.disk_read_mbs = 0.0f;
+    }
+    return b;
+}
+
+void TesseraPageManager::setInstanceCounts(uint32_t total_instances, uint32_t active_instances)
+{
+    std::lock_guard<std::mutex> lock(mBudgetMutex);
+    mBudget.total_instances_in_scene = total_instances;
+    mBudget.active_instances_rendered = active_instances;
+}
+
+void TesseraPageManager::prefetchClusters(const std::vector<uint32_t> &cluster_ids)
+{
+    requestClusters(cluster_ids);
+}
+
+void TesseraPageManager::prefetchFrustum(const float4x4 &/*viewProj*/,
+                                         float /*projScaleY*/,
+                                         float /*viewportHeight*/,
+                                         float lookaheadMargin,
+                                         const float3 &camPos,
+                                         const float3 &camVelocity)
+{
+    if (mRecordCache.empty() || mDir.empty()) {
+        return;
+    }
+    const float3 lookaheadCamPos = camPos + camVelocity * 0.2f;
+    std::vector<uint32_t> reqs;
+    for (uint32_t i = 0; i < uint32_t(mRecordCache.size()); ++i) {
+        const TesseraCluster &c = mRecordCache[i];
+        float dx = c.sphere[0] - lookaheadCamPos.x;
+        float dy = c.sphere[1] - lookaheadCamPos.y;
+        float dz = c.sphere[2] - lookaheadCamPos.z;
+        float dist = std::sqrt(dx * dx + dy * dy + dz * dz);
+        if (dist <= (c.sphere[3] + lookaheadMargin + 20.0f)) {
+            reqs.push_back(i);
+        }
+    }
+    if (!reqs.empty()) {
+        requestClusters(reqs);
     }
 }
 
@@ -290,15 +371,24 @@ void TesseraPageManager::requestPage(uint32_t page)
     if (page >= mHeader.pageCount) {
         return;
     }
+    mTotalRequests++;
+    {
+        std::lock_guard<std::mutex> lock(mStateMutex);
+        if (mResident.count(page) != 0) {
+            mCacheHits++;
+            return;
+        }
+    }
     {
         std::lock_guard<std::mutex> lock(mWorkMutex);
-        if (mStop || mInFlight.count(page) != 0 ||
-            mResident.count(page) != 0)
-        {
+        if (mStop || mInFlight.count(page) != 0) {
             return;
         }
         mPending.push_back(page);
         mInFlight.emplace(page, 0);
+        if (page < mDir.size()) {
+            mPendingBytes += mDir[page].byteSize;
+        }
     }
     mWorkCondVar.notify_one();
 }
@@ -355,7 +445,11 @@ void TesseraPageManager::workerLoop()
         }
 
         TesseraPageContents contents;
-        loadPageFromDisk(page, contents);
+        bool ok = loadPageFromDisk(page, contents);
+        uint32_t byteSize = (page < mDir.size()) ? mDir[page].byteSize : 0;
+        if (ok) {
+            mTotalBytesRead += byteSize;
+        }
 
         {
             std::lock_guard<std::mutex> lock(mDoneMutex);
@@ -366,6 +460,11 @@ void TesseraPageManager::workerLoop()
         {
             std::lock_guard<std::mutex> lock(mWorkMutex);
             mInFlight.erase(page);
+            if (mPendingBytes >= byteSize) {
+                mPendingBytes -= byteSize;
+            } else {
+                mPendingBytes = 0;
+            }
         }
     }
 }
@@ -410,12 +509,13 @@ bool TesseraPageManager::update(uint64_t frame, TesseraData &out_assembled)
         changed = true;
     }
 
-    /* Evict over budget: least-recently-used first, never pages used in the
-     * last few frames. */
+    /* Evict over budget: least-recently-used non-visible and coarsest clusters
+     * down to the explicit VRAM budget limit. */
     {
         std::lock_guard<std::mutex> lock(mStateMutex);
-        while (mResidentBytes > mBudgetBytes) {
+        while (mResidentBytes > mBudgetBytes && !mResident.empty()) {
             auto oldest = mResident.end();
+            /* Pass 1: find oldest page not used in last 8 frames. */
             for (auto it = mResident.begin(); it != mResident.end(); ++it) {
                 if (frame - it->second.last_use_frame < 8) {
                     continue;
@@ -426,8 +526,31 @@ bool TesseraPageManager::update(uint64_t frame, TesseraData &out_assembled)
                     oldest = it;
                 }
             }
+            /* Pass 2: if all pages are recent but still exceed budget, evict non-visible this frame. */
             if (oldest == mResident.end()) {
-                break; /* everything recently used */
+                for (auto it = mResident.begin(); it != mResident.end(); ++it) {
+                    if (it->second.last_use_frame >= frame) {
+                        continue;
+                    }
+                    if (oldest == mResident.end() ||
+                        it->second.last_use_frame < oldest->second.last_use_frame)
+                    {
+                        oldest = it;
+                    }
+                }
+            }
+            /* Pass 3: strictly clamp to budget by evicting least-recently used overall. */
+            if (oldest == mResident.end()) {
+                for (auto it = mResident.begin(); it != mResident.end(); ++it) {
+                    if (oldest == mResident.end() ||
+                        it->second.last_use_frame < oldest->second.last_use_frame)
+                    {
+                        oldest = it;
+                    }
+                }
+            }
+            if (oldest == mResident.end()) {
+                break;
             }
             mResidentBytes -= oldest->second.bytes;
             mResident.erase(oldest);

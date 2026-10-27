@@ -20,7 +20,7 @@ from bpy.props import StringProperty, BoolProperty
 
 # Register the C++ library symbols (optional: done automatically by Blender
 # when the library is linked). We only expose Python functions here.
-from . import build, load, render, ui  # noqa: F401
+from . import build, load, operators, render, ui  # noqa: F401
 
 bl_info = {
     "name": "Tessera",
@@ -38,6 +38,7 @@ bl_info = {
 def register():
     build.register()
     load.register()
+    operators.register()
     render.register()
     ui.register()
 
@@ -45,5 +46,6 @@ def register():
 def unregister():
     build.unregister()
     load.unregister()
+    operators.unregister()
     render.unregister()
     ui.unregister()

@@ -369,7 +369,11 @@ class Instance : public DrawEngine {
     }
   }
 
-  static void tessera_write_telemetry_to_object(Object *ob, const tessera::TesseraTelemetry &telem)
+  static void tessera_write_telemetry_to_object(Object *ob,
+                                                const tessera::TesseraTelemetry &telem,
+                                                const tessera::TesseraMemoryBudget *budget = nullptr,
+                                                uint32_t total_instances = 0,
+                                                uint32_t active_instances = 0)
   {
     if (ob == nullptr) {
       return;
@@ -392,6 +396,15 @@ class Instance : public DrawEngine {
         idp_float_replace(group, "tessera_stat_tex_scale", telem.tex_scale);
         idp_int_replace(group, "tessera_stat_tex_res_x", telem.tex_res_x);
         idp_int_replace(group, "tessera_stat_tex_res_y", telem.tex_res_y);
+        if (budget != nullptr) {
+          idp_float_replace(group, "tessera_stat_vram_resident_mb", float(budget->current_resident_bytes) / (1024.0f * 1024.0f));
+          idp_float_replace(group, "tessera_stat_vram_budget_mb", float(budget->max_vram_bytes) / (1024.0f * 1024.0f));
+          idp_float_replace(group, "tessera_stat_disk_read_mbs", budget->disk_read_mbs);
+          idp_float_replace(group, "tessera_stat_cache_hit_ratio", budget->cache_hit_ratio);
+          idp_int_replace(group, "tessera_stat_total_instances", int(total_instances));
+          idp_int_replace(group, "tessera_stat_active_instances", int(active_instances));
+          idp_int_replace(group, "tessera_stat_pending_requests", int(budget->pending_fetch_bytes));
+        }
       }
     };
 
@@ -715,9 +728,52 @@ class Instance : public DrawEngine {
           telem.cam_distance = cam_distance;
           telem.pixel_error = state.pass->getPixelError();
 
+          tessera::TesseraMemoryBudget budget = state.pass ? state.pass->getMemoryBudget() :
+                                                             tessera::TesseraMemoryBudget{};
+          int vram_budget_mb = 1024;
+          if (scene_state_.scene != nullptr) {
+            if (IDProperty *group = IDP_GetProperties(&scene_state_.scene->id)) {
+              if (IDProperty *prop = IDP_GetPropertyFromGroup(group, "tessera_vram_budget_mb")) {
+                if (prop->type == IDP_INT) {
+                  vram_budget_mb = IDP_int_get(prop);
+                }
+              }
+            }
+          }
+          if (vram_budget_mb < 128) {
+            vram_budget_mb = 128;
+          }
+          if (vram_budget_mb > 16384) {
+            vram_budget_mb = 16384;
+          }
+          if (state.pass) {
+            state.pass->setBudget(size_t(vram_budget_mb) * 1024ULL * 1024ULL);
+          }
+          uint32_t total_instances = uint32_t(tessera_objects_.size());
+          uint32_t active_instances = 0;
+          for (const auto it : tessera_objects_.items()) {
+            if (it.value->used && !it.value->data.clusters.empty()) {
+              active_instances++;
+            }
+          }
+          if (state.pass) {
+            state.pass->setInstanceCounts(total_instances, active_instances);
+          }
+          budget = state.pass ? state.pass->getMemoryBudget() : budget;
+
           if ((show_stats || show_fps_hud) && state.ob != nullptr) {
-            tessera_write_telemetry_to_object(state.ob, telem);
+            tessera_write_telemetry_to_object(state.ob, telem, &budget, total_instances, active_instances);
             WM_main_add_notifier(NC_OBJECT | ND_DRAW, state.ob);
+            if (scene_state_.scene != nullptr) {
+              if (IDProperty *sgroup = IDP_EnsureProperties(&scene_state_.scene->id)) {
+                idp_float_replace(sgroup, "tessera_stat_vram_resident_mb", float(budget.current_resident_bytes) / (1024.0f * 1024.0f));
+                idp_float_replace(sgroup, "tessera_stat_vram_budget_mb", float(budget.max_vram_bytes) / (1024.0f * 1024.0f));
+                idp_float_replace(sgroup, "tessera_stat_disk_read_mbs", budget.disk_read_mbs);
+                idp_float_replace(sgroup, "tessera_stat_cache_hit_ratio", budget.cache_hit_ratio);
+                idp_int_replace(sgroup, "tessera_stat_total_instances", int(total_instances));
+                idp_int_replace(sgroup, "tessera_stat_active_instances", int(active_instances));
+              }
+            }
           }
 
           if (log_console) {

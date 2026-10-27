@@ -44,13 +44,60 @@ def _tag_tessera_redraw(self, context):
     re-evaluation (a bare ``update_tag()`` with no refresh flags is a no-op)
     and request a redraw of every 3D viewport.
     """
-    self.id_data.update_tag(refresh={'OBJECT'})
-    window = context.window
-    if window is None or window.screen is None:
+    target = getattr(self, "id_data", self)
+    if hasattr(target, "update_tag"):
+        try:
+            target.update_tag(refresh={'OBJECT'})
+        except Exception:
+            pass
+    if context:
+        window = getattr(context, "window", None)
+        if window and getattr(window, "screen", None):
+            for area in window.screen.areas:
+                if getattr(area, "type", None) == 'VIEW_3D':
+                    area.tag_redraw()
+
+
+def _batch_prop_update(self, context, prop_name):
+    scene = getattr(context, "scene", None)
+    if scene is None:
+        scene = getattr(self, "id_data", None)
+        if scene is None and hasattr(bpy, "context") and hasattr(bpy.context, "scene"):
+            scene = bpy.context.scene
+    if scene is None:
         return
-    for area in window.screen.areas:
-        if area.type == 'VIEW_3D':
-            area.tag_redraw()
+
+    scope = getattr(self, "batch_scope", getattr(self, "tessera_batch_scope", 'ALL_SCENE'))
+    val = getattr(self, f"batch_{prop_name}", getattr(self, f"tessera_batch_{prop_name}", getattr(self, prop_name, None)))
+    if val is None:
+        return
+
+    targets = scene.objects if scope == 'ALL_SCENE' else getattr(context, "selected_objects", [])
+
+    for ob in targets:
+        if ob.type == 'MESH':
+            if hasattr(ob, "tessera"):
+                if hasattr(ob.tessera, prop_name):
+                    try:
+                        setattr(ob.tessera, prop_name, val)
+                    except Exception:
+                        pass
+            ob[f"tessera_{prop_name}"] = int(val) if isinstance(val, bool) else val
+            if prop_name == "enabled" and val:
+                from tessera.ui import get_existing_nc2_path
+                existing = get_existing_nc2_path(ob)
+                if existing:
+                    ob["tessera_nc2"] = existing
+            elif prop_name == "use_camera_view":
+                ob["tessera_view_source"] = int(val)
+            _tag_tessera_redraw(ob, context)
+
+    if context and hasattr(context, "window_manager") and context.window_manager:
+        for window in context.window_manager.windows:
+            if window.screen:
+                for area in window.screen.areas:
+                    if getattr(area, "type", None) == 'VIEW_3D':
+                        area.tag_redraw()
 
 
 def _enabled_update(self, context):
@@ -287,12 +334,155 @@ class TesseraProperties(bpy.types.PropertyGroup):
     )
 
 
+class TesseraSceneSettings(bpy.types.PropertyGroup):
+    """Scene-level Tessera settings and universal batch controls."""
+
+    batch_scope: EnumProperty(
+        name="Target Scope",
+        description="Target scope for batch operations and slider adjustments",
+        items=[
+            ('ALL_SCENE', "All Scene Objects", "Apply changes across all meshes in the scene"),
+            ('SELECTED', "Selected Only", "Apply changes only to selected meshes"),
+        ],
+        default='ALL_SCENE',
+    )
+
+    batch_enabled: BoolProperty(
+        name="Batch Tessera Enabled",
+        description="Enable or disable Tessera across target meshes",
+        default=True,
+        update=lambda s, c: _batch_prop_update(s, c, "enabled"),
+    )
+
+    batch_pixel_error: FloatProperty(
+        name="Batch Pixel Error",
+        description="Target screen-space error threshold for LOD selection across target meshes",
+        min=0.1,
+        max=100.0,
+        default=1.0,
+        update=lambda s, c: _batch_prop_update(s, c, "pixel_error"),
+    )
+
+    batch_culling_margin: FloatProperty(
+        name="Batch Camera Margin",
+        description="Distance in units to keep clusters active beyond camera view borders",
+        min=0.0,
+        max=50.0,
+        default=0.02,
+        unit='LENGTH',
+        update=lambda s, c: _batch_prop_update(s, c, "culling_margin"),
+    )
+
+    batch_texture_lod_mode: EnumProperty(
+        name="Batch Texture LOD",
+        description="Texture resolution scaling mode across target meshes",
+        items=[
+            ('AUTO', "Auto (Distance)", "Dynamically scale texture resolution based on distance to camera"),
+            ('FULL', "Full (100%)", "Always use full resolution"),
+            ('HALF', "Half (50%)", "Clamp maximum resolution to half"),
+            ('QUARTER', "Quarter (25%)", "Clamp maximum resolution to quarter"),
+            ('EIGHTH', "Eighth (12.5%)", "Clamp maximum resolution to 1/8th for low VRAM"),
+        ],
+        default='AUTO',
+        update=lambda s, c: _batch_prop_update(s, c, "texture_lod_mode"),
+    )
+
+    batch_use_camera_view: BoolProperty(
+        name="Batch Camera View",
+        description="Lock cluster LOD and culling calculation to active scene camera",
+        default=False,
+        update=lambda s, c: _batch_prop_update(s, c, "use_camera_view"),
+    )
+
+    # Aliases mirroring object properties for direct batch access
+    tessera_enabled: BoolProperty(
+        name="Tessera Enabled",
+        default=True,
+        update=lambda s, c: _batch_prop_update(s, c, "enabled"),
+    )
+
+    pixel_error: FloatProperty(
+        name="Pixel Error",
+        min=0.1,
+        max=100.0,
+        default=1.0,
+        update=lambda s, c: _batch_prop_update(s, c, "pixel_error"),
+    )
+
+    culling_margin: FloatProperty(
+        name="Camera Margin",
+        min=0.0,
+        max=50.0,
+        default=0.02,
+        unit='LENGTH',
+        update=lambda s, c: _batch_prop_update(s, c, "culling_margin"),
+    )
+
+    texture_lod_mode: EnumProperty(
+        name="Texture LOD",
+        items=[
+            ('AUTO', "Auto (Distance)", "Dynamically scale texture resolution based on distance to camera"),
+            ('FULL', "Full (100%)", "Always use full resolution"),
+            ('HALF', "Half (50%)", "Clamp maximum resolution to half"),
+            ('QUARTER', "Quarter (25%)", "Clamp maximum resolution to quarter"),
+            ('EIGHTH', "Eighth (12.5%)", "Clamp maximum resolution to 1/8th for low VRAM"),
+        ],
+        default='AUTO',
+        update=lambda s, c: _batch_prop_update(s, c, "texture_lod_mode"),
+    )
+
+    use_camera_view: BoolProperty(
+        name="Use Camera View",
+        default=False,
+        update=lambda s, c: _batch_prop_update(s, c, "use_camera_view"),
+    )
+
+    tree_display_mode: EnumProperty(
+        name="Display Mode",
+        description="Outliner organization style",
+        items=[
+            ('COLLECTIONS', "Collections", "Organize tree by collection hierarchy"),
+            ('OBJECTS', "Flat Objects", "Display flat list of all mesh objects in scene"),
+        ],
+        default='COLLECTIONS',
+    )
+
+
+def _budget_update(self, context):
+    self["tessera_vram_budget_mb"] = int(self.tessera_vram_budget_mb)
+    if context and context.scene:
+        for ob in context.scene.objects:
+            if ob.get("tessera_enabled", False):
+                _tag_tessera_redraw(ob, context)
+
 
 def register():
     bpy.utils.register_class(TesseraProperties)
     bpy.types.Object.tessera = PointerProperty(type=TesseraProperties)
+    bpy.utils.register_class(TesseraSceneSettings)
+    bpy.types.Scene.tessera = PointerProperty(type=TesseraSceneSettings)
+    bpy.types.Scene.tessera_vram_budget_mb = bpy.props.IntProperty(
+        name="VRAM Budget (MB)",
+        description="VRAM budget limit for resident streaming cluster cache",
+        default=1024,
+        min=128,
+        max=16384,
+        update=_budget_update,
+    )
+    bpy.types.Scene.tessera_auto_build_missing = bpy.props.BoolProperty(
+        name="Auto-Build Missing Caches",
+        description="Automatically trigger background builds for objects missing .nc2",
+        default=True,
+    )
 
 
 def unregister():
+    if hasattr(bpy.types.Scene, "tessera_auto_build_missing"):
+        del bpy.types.Scene.tessera_auto_build_missing
+    if hasattr(bpy.types.Scene, "tessera_vram_budget_mb"):
+        del bpy.types.Scene.tessera_vram_budget_mb
+    if hasattr(bpy.types.Scene, "tessera"):
+        del bpy.types.Scene.tessera
+    bpy.utils.unregister_class(TesseraSceneSettings)
     del bpy.types.Object.tessera
     bpy.utils.unregister_class(TesseraProperties)

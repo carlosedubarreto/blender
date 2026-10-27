@@ -28,6 +28,7 @@
 #include "tessera_lod.hh"
 
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <cstdint>
 #include <cstdio>
@@ -64,6 +65,17 @@ struct TesseraPageContents {
     std::vector<float> uvs;         /* 2 per vertex */
     std::vector<uint32_t> indices;  /* page-local */
     std::vector<TesseraCluster> clusters;
+};
+
+/** Live streaming telemetry and memory budgeting state. */
+struct TesseraMemoryBudget {
+    size_t max_vram_bytes = 1024ULL * 1024ULL * 1024ULL; /* 1 GB default */
+    size_t current_resident_bytes = 0;
+    size_t pending_fetch_bytes = 0;
+    uint32_t total_instances_in_scene = 0;
+    uint32_t active_instances_rendered = 0;
+    float disk_read_mbs = 0.0f;
+    float cache_hit_ratio = 100.0f;
 };
 
 /**
@@ -114,8 +126,24 @@ class TesseraPageManager
     uint32_t clusterCount() const { return mHeader.clusterCount; }
     uint64_t residentBytes() const { return mResidentBytes; }
 
-    /** Residency byte budget (eviction target). Default: 64 MiB. */
-    void setBudget(uint64_t bytes) { mBudgetBytes = bytes; }
+    /** Residency byte budget (eviction target). Default: 1024 MiB. */
+    void setBudget(uint64_t bytes);
+    uint64_t getBudget() const;
+
+    /** Get live memory budgeting & streaming telemetry. */
+    TesseraMemoryBudget getMemoryBudget() const;
+
+    /** Pre-fetch clusters using camera trajectory & lookahead horizon. */
+    void prefetchClusters(const std::vector<uint32_t> &cluster_ids);
+    void prefetchFrustum(const float4x4 &viewProj,
+                         float projScaleY,
+                         float viewportHeight,
+                         float lookaheadMargin,
+                         const float3 &camPos,
+                         const float3 &camVelocity);
+
+    /** Update active & total scene instance telemetry. */
+    void setInstanceCounts(uint32_t total_instances, uint32_t active_instances);
 
     /** True when every cluster's page is resident. */
     bool fullyResident() const;
@@ -167,8 +195,16 @@ class TesseraPageManager
     };
     std::unordered_map<uint32_t, ResidentPage> mResident;
     uint64_t mResidentBytes = 0;
-    uint64_t mBudgetBytes = 64ull * 1024ull * 1024ull;
+    uint64_t mBudgetBytes = 1024ULL * 1024ULL * 1024ULL;
     mutable std::mutex mStateMutex;
+
+    mutable std::mutex mBudgetMutex;
+    TesseraMemoryBudget mBudget;
+    std::atomic<uint64_t> mTotalBytesRead{0};
+    std::atomic<uint64_t> mTotalRequests{0};
+    std::atomic<uint64_t> mCacheHits{0};
+    std::atomic<uint64_t> mPendingBytes{0};
+    std::chrono::steady_clock::time_point mIoStartTime = std::chrono::steady_clock::now();
 
     // Request queue (guarded by mWorkMutex + signaled via mWorkCondVar).
     std::deque<uint32_t> mPending;

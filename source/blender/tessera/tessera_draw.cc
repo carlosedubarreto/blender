@@ -140,6 +140,40 @@ bool TesseraDrawPass::streamingSettled() const
     return mStreamer == nullptr || mStreamer->fullyResident();
 }
 
+TesseraMemoryBudget TesseraDrawPass::getMemoryBudget() const
+{
+    if (mStreamer != nullptr) {
+        return mStreamer->getMemoryBudget();
+    }
+    TesseraMemoryBudget budget;
+    budget.current_resident_bytes = data_.positions.size() * sizeof(float) +
+                                    data_.indices.size() * sizeof(uint32_t) +
+                                    data_.clusters.size() * sizeof(TesseraCluster);
+    budget.max_vram_bytes = 1024ULL * 1024ULL * 1024ULL;
+    return budget;
+}
+
+void TesseraDrawPass::setBudget(size_t bytes)
+{
+    if (mStreamer != nullptr) {
+        mStreamer->setBudget(bytes);
+    }
+}
+
+void TesseraDrawPass::setInstanceCounts(uint32_t total, uint32_t active)
+{
+    if (mStreamer != nullptr) {
+        mStreamer->setInstanceCounts(total, active);
+    }
+}
+
+void TesseraDrawPass::prefetchClusters(const std::vector<uint32_t> &cluster_ids)
+{
+    if (mStreamer != nullptr) {
+        mStreamer->prefetchClusters(cluster_ids);
+    }
+}
+
 void TesseraDrawPass::setShadingMode(TesseraShadingMode mode)
 {
     renderer_.setShadingMode(mode);

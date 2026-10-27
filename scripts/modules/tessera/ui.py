@@ -70,7 +70,25 @@ def draw_tessera_hud():
     else:
         tex_str = f"{scale_pct}%"
 
-    text = f"Tessera: {fps:.1f} FPS ({ft_ms:.2f} ms) | {clusters:,} clusters | {tris:,} tris | Margin: {eff_margin:.2f}m ({mode_str}) | Tex: {tex_str}"
+    scene = context.scene
+    vram_res = float(ob.get("tessera_stat_vram_resident_mb", scene.get("tessera_stat_vram_resident_mb", 0.0) if scene else 0.0))
+    budget_mb = float(getattr(scene, "tessera_vram_budget_mb", 1024))
+    tot_inst = int(ob.get("tessera_stat_total_instances", scene.get("tessera_stat_total_instances", 1) if scene else 1))
+    act_inst = int(ob.get("tessera_stat_active_instances", scene.get("tessera_stat_active_instances", 1) if scene else 1))
+
+    def format_count(n):
+        if n >= 1_000_000:
+            return f"{n / 1_000_000:.1f}M"
+        elif n >= 1_000:
+            return f"{n / 1_000:.1f}k"
+        return f"{n:,}"
+
+    inst_str = format_count(tot_inst)
+    active_inst_str = format_count(act_inst)
+
+    text = (f"Tessera: {fps:.1f} FPS ({ft_ms:.2f} ms) | {clusters:,} clusters | {tris:,} tris | "
+            f"Margin: {eff_margin:.2f}m ({mode_str}) | Tex: {tex_str} | "
+            f"Mem: {vram_res:.0f}/{budget_mb:.0f}MB | Inst: {inst_str} ({active_inst_str} vis)")
 
     try:
         # Optional subtle background pill/box
@@ -226,19 +244,24 @@ def get_existing_nc2_path(ob):
 class TESSERA_PT_object(bpy.types.Panel):
     """Tessera options for the active mesh object."""
 
-    bl_label = "Tessera"
+    bl_label = "Tessera Object Telemetry & Settings"
     bl_space_type = 'VIEW_3D'
     bl_region_type = 'UI'
     bl_category = "Tessera"
+    bl_order = 2
 
     @classmethod
     def poll(cls, context):
-        ob = context.active_object
-        return ob is not None and ob.type == 'MESH'
+        return context.scene is not None
 
     def draw(self, context):
         layout = self.layout
         ob = context.active_object
+        if ob is None or ob.type != 'MESH':
+            box = layout.box()
+            box.label(text="Select a mesh object for individual telemetry and manual overrides.", icon='INFO')
+            return
+
         tessera_props = getattr(ob, "tessera", None)
 
         is_building = bool(ob.get("tessera_building", False))
@@ -387,8 +410,190 @@ class TESSERA_PT_object(bpy.types.Panel):
             col.operator("object.tessera_build", text="Build Tessera", icon='MOD_SOLIDIFY')
 
 
+class TESSERA_PT_batch_controls(bpy.types.Panel):
+    """Universal Scene Batch Controls."""
+
+    bl_label = "Batch Controls"
+    bl_space_type = 'VIEW_3D'
+    bl_region_type = 'UI'
+    bl_category = "Tessera"
+    bl_order = 0
+
+    @classmethod
+    def poll(cls, context):
+        return context.scene is not None
+
+    def draw(self, context):
+        layout = self.layout
+        scene = context.scene
+        t_scene = getattr(scene, "tessera", None)
+        if not t_scene:
+            return
+
+        box = layout.box()
+        box.label(text="Batch Scope", icon='VIEWZOOM')
+        box.prop(t_scene, "batch_scope", expand=True)
+
+        col = box.column(align=True)
+        if t_scene.batch_scope == 'ALL_SCENE':
+            col.operator("tessera.batch_enable_all", text="Enable All Scene Meshes", icon='CHECKMARK')
+        else:
+            r = col.row(align=True)
+            r.operator("tessera.batch_enable_selected", text="Enable Selected", icon='RESTRICT_SELECT_OFF')
+            r.operator("tessera.batch_disable_selected", text="Disable Selected", icon='RESTRICT_SELECT_ON')
+
+        b_col = layout.column(align=True)
+        b_col.prop(t_scene, "batch_enabled", text="Batch Tessera Enabled")
+        b_col.prop(t_scene, "batch_pixel_error", text="Batch Pixel Error", slider=True)
+        b_col.prop(t_scene, "batch_culling_margin", text="Batch Camera Margin")
+        b_col.prop(t_scene, "batch_texture_lod_mode", text="Batch Texture LOD")
+        b_col.prop(t_scene, "batch_use_camera_view", text="Batch Camera Locked LOD", icon='CAMERA_DATA')
+
+
+class TESSERA_PT_tree_view(bpy.types.Panel):
+    """Collapsible Collection & Object Tree View."""
+
+    bl_label = "Tessera Scene Tree"
+    bl_space_type = 'VIEW_3D'
+    bl_region_type = 'UI'
+    bl_category = "Tessera"
+    bl_order = 1
+
+    @classmethod
+    def poll(cls, context):
+        return context.scene is not None
+
+    def draw(self, context):
+        layout = self.layout
+        scene = context.scene
+        t_scene = getattr(scene, "tessera", None)
+
+        if t_scene:
+            row = layout.row(align=True)
+            row.prop(t_scene, "tree_display_mode", expand=True)
+            mode = t_scene.tree_display_mode
+        else:
+            mode = 'COLLECTIONS'
+
+        if mode == 'COLLECTIONS':
+            collections = list(scene.collection.children)
+            if not collections:
+                collections = [scene.collection]
+            elif any(o.type == 'MESH' for o in scene.collection.objects):
+                if scene.collection not in collections:
+                    collections.insert(0, scene.collection)
+
+            for col in collections:
+                mesh_obs = [o for o in col.all_objects if o.type == 'MESH']
+                is_expanded = bool(col.get("tessera_tree_expanded", True))
+
+                c_box = layout.box()
+                header_row = c_box.row(align=True)
+                arrow_icon = 'TRIA_DOWN' if is_expanded else 'TRIA_RIGHT'
+                op_toggle = header_row.operator("tessera.toggle_collection", text="", icon=arrow_icon, emboss=False)
+                op_toggle.collection_name = col.name
+
+                header_row.label(text=f"{col.name} ({len(mesh_obs)})", icon='OUTLINER_COLLECTION')
+                op_build_col = header_row.operator("tessera.build_collection", text="", icon='MOD_BUILD')
+                op_build_col.collection_name = col.name
+
+                if is_expanded and mesh_obs:
+                    item_col = c_box.column(align=True)
+                    for ob in mesh_obs:
+                        i_row = item_col.row(align=True)
+                        has_nc2 = get_existing_nc2_path(ob) is not None
+                        icon_status = 'CHECKMARK' if has_nc2 else 'CANCEL'
+                        i_row.label(text="", icon=icon_status)
+                        i_row.label(text=ob.name, icon='MESH_DATA')
+
+                        if hasattr(ob, "tessera"):
+                            i_row.prop(ob.tessera, "enabled", text="")
+                        else:
+                            i_row.prop(ob, '["tessera_enabled"]', text="")
+
+                        op_build_ob = i_row.operator("tessera.build_single_object", text="", icon='FILE_REFRESH')
+                        op_build_ob.object_name = ob.name
+
+        else:  # 'OBJECTS' (Flat Objects)
+            mesh_obs = [o for o in scene.objects if o.type == 'MESH']
+            if not mesh_obs:
+                layout.label(text="No mesh objects in scene", icon='INFO')
+                return
+
+            box = layout.box()
+            item_col = box.column(align=True)
+            for ob in mesh_obs:
+                i_row = item_col.row(align=True)
+                has_nc2 = get_existing_nc2_path(ob) is not None
+                icon_status = 'CHECKMARK' if has_nc2 else 'CANCEL'
+                i_row.label(text="", icon=icon_status)
+                i_row.label(text=ob.name, icon='MESH_DATA')
+
+                if hasattr(ob, "tessera"):
+                    i_row.prop(ob.tessera, "enabled", text="")
+                else:
+                    i_row.prop(ob, '["tessera_enabled"]', text="")
+
+                op_build_ob = i_row.operator("tessera.build_single_object", text="", icon='FILE_REFRESH')
+                op_build_ob.object_name = ob.name
+
+
+class TESSERA_PT_scene_manager(bpy.types.Panel):
+    """Scene Batch & Memory Manager."""
+
+    bl_label = "Scene Batch & Memory Manager"
+    bl_space_type = 'VIEW_3D'
+    bl_region_type = 'UI'
+    bl_category = "Tessera"
+    bl_order = 3
+
+    @classmethod
+    def poll(cls, context):
+        return context.scene is not None
+
+    def draw(self, context):
+        layout = self.layout
+        scene = context.scene
+
+        # Batch Controls Box
+        box = layout.box()
+        box.label(text="Batch Controls", icon='GROUP')
+        col = box.column(align=True)
+        col.operator("tessera.batch_enable_all", text="Enable All", icon='CHECKMARK')
+        row = col.row(align=True)
+        row.operator("tessera.batch_enable_selected", text="Enable Selected", icon='RESTRICT_SELECT_OFF')
+        row.operator("tessera.batch_disable_selected", text="Disable Selected", icon='RESTRICT_SELECT_ON')
+
+        box.prop(scene, "tessera_auto_build_missing", text="Auto-Build Missing Caches")
+        box.operator("tessera.batch_build_all", text="Batch Build All Missing .nc2", icon='FILE_CACHE')
+
+        # Memory Budget & Streaming Box
+        sbox = layout.box()
+        sbox.label(text="Streaming & Memory Budget", icon='MEMORY')
+        sbox.prop(scene, "tessera_vram_budget_mb", text="VRAM Budget (MB)", slider=True)
+
+        ob = context.active_object
+        vram_res = float(ob.get("tessera_stat_vram_resident_mb", scene.get("tessera_stat_vram_resident_mb", 0.0)) if ob else scene.get("tessera_stat_vram_resident_mb", 0.0))
+        budget_mb = float(getattr(scene, "tessera_vram_budget_mb", 1024))
+        pct = (vram_res / max(budget_mb, 1.0)) * 100.0
+
+        disk_mbs = float(ob.get("tessera_stat_disk_read_mbs", scene.get("tessera_stat_disk_read_mbs", 0.0)) if ob else scene.get("tessera_stat_disk_read_mbs", 0.0))
+        hit_rate = float(ob.get("tessera_stat_cache_hit_ratio", scene.get("tessera_stat_cache_hit_ratio", 100.0)) if ob else scene.get("tessera_stat_cache_hit_ratio", 100.0))
+
+        tot_inst = int(ob.get("tessera_stat_total_instances", scene.get("tessera_stat_total_instances", 0)) if ob else scene.get("tessera_stat_total_instances", 0))
+        act_inst = int(ob.get("tessera_stat_active_instances", scene.get("tessera_stat_active_instances", 0)) if ob else scene.get("tessera_stat_active_instances", 0))
+
+        tcol = sbox.column(align=True)
+        tcol.label(text=f"VRAM Resident: {vram_res:.1f} MB / {budget_mb:.0f} MB ({pct:.1f}%)", icon='DISK_DRIVE')
+        tcol.label(text=f"Disk Pre-fetch: {disk_mbs:.1f} MB/s | Hit Rate: {hit_rate:.1f}%", icon='SORTTIME')
+        tcol.label(text=f"Instances: {tot_inst:,} (Active: {act_inst:,})", icon='DUPLICATE')
+
+
 classes = (
+    TESSERA_PT_batch_controls,
+    TESSERA_PT_tree_view,
     TESSERA_PT_object,
+    TESSERA_PT_scene_manager,
 )
 
 

@@ -161,6 +161,12 @@ public:
     /** True when no pages are missing anymore. */
     bool streamingSettled() const;
 
+    /** Memory budget & streaming telemetry. */
+    TesseraMemoryBudget getMemoryBudget() const;
+    void setBudget(size_t bytes);
+    void setInstanceCounts(uint32_t total, uint32_t active);
+    void prefetchClusters(const std::vector<uint32_t> &cluster_ids);
+
 private:
     TesseraData data_;
     float4x4 view_proj_;

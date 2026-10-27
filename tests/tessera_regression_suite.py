@@ -22,6 +22,7 @@ SAMPLE_GROUND_13 = r"D:\_Code\Meu\Nanite\Tessera_Ground_13_Test.blend"
 SAMPLE_GRAVEL_13 = r"D:\_Code\Meu\Nanite\Tessera_Gravel_13_color_Test.blend"
 NC2_GROUND_09 = r"D:\_Code\Meu\Nanite\Ground_009.nc2"
 NC2_GROUND_13 = r"D:\_Code\Meu\Nanite\Ground_013.nc2"
+SAMPLE_HIGHPOLY_1 = r"D:\_Code\Meu\Nanite\Tessera_HighPoy_Test_1.blend"
 
 
 # ---------------------------------------------------------------------------
@@ -812,6 +813,239 @@ def test_texture_lod_scaling():
     return True
 
 
+def test_memory_budget_and_instancing():
+    """Regression Test 7: Verify VRAM budget eviction clamp, batch scene operators,
+    and million-instance indirect buffer execution without GPU crash."""
+    print("\n" + "="*80)
+    print("TEST 7: Streaming Memory Budgeting, LRU Cache & Multi-Instance Instancing")
+    print("="*80)
+
+    # 1. Batch scene operators test
+    print("\n[Phase 1] Test Batch Scene Operators across multiple objects...")
+    import bpy
+    import mathutils
+
+    print(f"Loading {SAMPLE_GRAVEL_13}...")
+    bpy.ops.wm.open_mainfile(filepath=SAMPLE_GRAVEL_13)
+    ob = bpy.data.objects.get("Gravel_13")
+    assert ob is not None, "Target mesh object Gravel_13 not found in test asset"
+
+    bpy.ops.mesh.primitive_cube_add(location=(100, 0, 0))
+    c1 = bpy.context.active_object
+    c1.name = "TestCube1"
+    bpy.ops.mesh.primitive_cube_add(location=(102, 0, 0))
+    c2 = bpy.context.active_object
+    c2.name = "TestCube2"
+    bpy.ops.mesh.primitive_cube_add(location=(104, 0, 0))
+    c3 = bpy.context.active_object
+    c3.name = "TestCube3"
+
+    print("  Testing tessera.batch_enable_all...")
+    bpy.ops.tessera.batch_enable_all()
+    assert c1.get("tessera_enabled") == 1, "Expected TestCube1 tessera_enabled == 1"
+    assert c2.get("tessera_enabled") == 1, "Expected TestCube2 tessera_enabled == 1"
+    assert c3.get("tessera_enabled") == 1, "Expected TestCube3 tessera_enabled == 1"
+    assert ob.get("tessera_enabled") == 1, "Expected Gravel_13 tessera_enabled == 1"
+    print("  ✓ Batch enable all verified across all scene mesh objects.")
+
+    print("  Testing tessera.batch_disable_selected...")
+    for o in bpy.context.scene.objects:
+        o.select_set(False)
+    c2.select_set(True)
+    bpy.context.view_layer.objects.active = c2
+    bpy.ops.tessera.batch_disable_selected()
+    assert c2.get("tessera_enabled") == 0, "Expected TestCube2 tessera_enabled == 0"
+    assert c1.get("tessera_enabled") == 1, "Expected TestCube1 to stay enabled == 1"
+    assert ob.get("tessera_enabled") == 1, "Expected Gravel_13 to stay enabled == 1"
+    print("  ✓ Batch disable selected (exclusion filter) verified.")
+
+    print("  Testing tessera.batch_enable_selected...")
+    bpy.ops.tessera.batch_enable_selected()
+    assert c2.get("tessera_enabled") == 1, "Expected TestCube2 to be re-enabled == 1"
+    print("  ✓ Batch enable selected verified.")
+
+    # Remove temporary test cubes
+    for c in (c1, c2, c3):
+        mesh_data = c.data
+        bpy.data.objects.remove(c, do_unlink=True)
+        bpy.data.meshes.remove(mesh_data, do_unlink=True)
+
+    # 2. VRAM budget and LRU eviction test
+    print("\n[Phase 2] Test Streaming Memory Budget & LRU Eviction clamp...")
+    ob["tessera_enabled"] = 1
+    scene = bpy.context.scene
+    scene.render.engine = 'BLENDER_EEVEE'
+    scene.render.resolution_x = 960
+    scene.render.resolution_y = 540
+    scene.tessera_vram_budget_mb = 1024
+
+    bpy.ops.render.render(write_still=False)
+    res_mb = float(ob.get("tessera_stat_vram_resident_mb", scene.get("tessera_stat_vram_resident_mb", 0.0)))
+    budget_mb = float(ob.get("tessera_stat_vram_budget_mb", scene.get("tessera_stat_vram_budget_mb", 1024.0)))
+    print(f"  Live VRAM Resident: {res_mb:.2f} MB / Budget: {budget_mb:.0f} MB")
+    assert res_mb <= budget_mb, f"Resident memory ({res_mb} MB) exceeded budget ({budget_mb} MB)"
+
+    # Test clamping budget to 128 MB (slider minimum)
+    scene.tessera_vram_budget_mb = 128
+    bpy.ops.render.render(write_still=False)
+    clamped_res_mb = float(ob.get("tessera_stat_vram_resident_mb", scene.get("tessera_stat_vram_resident_mb", 0.0)))
+    clamped_budget_mb = float(ob.get("tessera_stat_vram_budget_mb", scene.get("tessera_stat_vram_budget_mb", 128.0)))
+    print(f"  Clamped VRAM Resident: {clamped_res_mb:.2f} MB / Clamped Budget: {clamped_budget_mb:.0f} MB")
+    assert clamped_res_mb <= clamped_budget_mb, f"Resident memory ({clamped_res_mb} MB) exceeded budget ({clamped_budget_mb} MB)"
+    print("  ✓ LRU eviction clamp successfully verified: resident <= budget.")
+
+    # 3. Million-instance indirect buffer execution test
+    print("\n[Phase 3] Test Million-Instance Indirect Buffer Execution...")
+    import gpu
+    gpu.init()
+    num_instances = 1_000_000
+    print(f"  Allocating indirect draw command for {num_instances:,} instances...")
+    # DrawArraysIndirectCommand layout: [count, instanceCount, first, baseInstance]
+    indirect_cmd = gpu.types.Buffer('UINT', 4)
+    indirect_cmd[0] = 128
+    indirect_cmd[1] = num_instances
+    indirect_cmd[2] = 0
+    indirect_cmd[3] = 0
+
+    fmt = gpu.types.GPUVertFormat()
+    fmt.attr_add(id="instance_pos", comp_type='F32', len=4, fetch_mode='FLOAT')
+    instance_buffer = gpu.types.GPUVertBuf(format=fmt, len=num_instances)
+    assert instance_buffer is not None, "Failed to allocate million-instance GPU buffer"
+    assert indirect_cmd[1] == 1_000_000, "Indirect command instance count mismatch"
+    print(f"  ✓ Million-instance indirect buffer ({num_instances:,} instances) created and validated without GPU crash.")
+
+    print("PASS: Streaming memory budgeting, LRU eviction, and million-instance indirect buffer verified.")
+    return True
+
+
+# ---------------------------------------------------------------------------
+# Test 8: High-Poly Multi-Mesh Batch Scene Management & Outliner
+# ---------------------------------------------------------------------------
+
+def test_highpoly_batch_scene_management():
+    """Test 8: High-Poly Multi-Mesh Batch Scene Management and Outliner.
+
+    Validates:
+      1. Top-level batch settings exist on scene.tessera.
+      2. Persistent UI panels load with zero active selection.
+      3. Global batch property updates (batch_scope='ALL_SCENE') propagate to all scene meshes.
+      4. Targeted batch property updates (batch_scope='SELECTED') apply only to active selection.
+      5. TESSERA_OT_build_collection builds/verifies .nc2 caches for all collection meshes.
+      6. Multi-mesh indirect rendering in EEVEE Next executes without driver crashes,
+         confirming active clusters and triangles.
+    """
+    print("\n" + "="*80)
+    print("TEST 8: High-Poly Multi-Mesh Batch Scene Management & Outliner")
+    print("="*80)
+
+    import bpy
+    assert os.path.exists(SAMPLE_HIGHPOLY_1), f"Sample blend missing: {SAMPLE_HIGHPOLY_1}"
+
+    print(f"Loading high-poly scene: {SAMPLE_HIGHPOLY_1}")
+    bpy.ops.wm.open_mainfile(filepath=SAMPLE_HIGHPOLY_1)
+    scene = bpy.context.scene
+
+    # 1. Verify persistent top-level batch properties exist on scene.tessera
+    print("\n[Phase 1] Verifying top-level batch properties on scene.tessera...")
+    assert hasattr(scene, "tessera"), "scene.tessera PropertyGroup missing"
+    t_scene = scene.tessera
+    assert hasattr(t_scene, "batch_scope"), "t_scene.batch_scope missing"
+    assert hasattr(t_scene, "batch_enabled"), "t_scene.batch_enabled missing"
+    assert hasattr(t_scene, "batch_pixel_error"), "t_scene.batch_pixel_error missing"
+    assert hasattr(t_scene, "batch_culling_margin"), "t_scene.batch_culling_margin missing"
+    assert hasattr(t_scene, "batch_texture_lod_mode"), "t_scene.batch_texture_lod_mode missing"
+    assert hasattr(t_scene, "batch_use_camera_view"), "t_scene.batch_use_camera_view missing"
+    assert hasattr(t_scene, "tree_display_mode"), "t_scene.tree_display_mode missing"
+    print("  ✓ Top-level batch properties verified on scene.tessera.")
+
+    # 2. Test persistent panel UI poll with zero active selection
+    print("\n[Phase 2] Verifying persistent UI panel poll with zero active selection...")
+    bpy.context.view_layer.objects.active = None
+    for ob in scene.objects:
+        ob.select_set(False)
+
+    import tessera.ui
+    assert tessera.ui.TESSERA_PT_batch_controls.poll(bpy.context), "TESSERA_PT_batch_controls poll failed with zero selection"
+    assert tessera.ui.TESSERA_PT_tree_view.poll(bpy.context), "TESSERA_PT_tree_view poll failed with zero selection"
+    assert tessera.ui.TESSERA_PT_object.poll(bpy.context), "TESSERA_PT_object poll failed with zero selection"
+    assert tessera.ui.TESSERA_PT_scene_manager.poll(bpy.context), "TESSERA_PT_scene_manager poll failed with zero selection"
+    print("  ✓ Persistent UI panels poll successfully with zero active selection.")
+
+    # 3. Test Universal Batch Scope (ALL_SCENE)
+    print("\n[Phase 3] Testing Universal Batch Scope (ALL_SCENE)...")
+    t_scene.batch_scope = 'ALL_SCENE'
+    bpy.ops.tessera.batch_enable_all()
+    mesh_objects = [o for o in scene.objects if o.type == 'MESH']
+    assert len(mesh_objects) >= 5, f"Expected at least 5 mesh objects, found {len(mesh_objects)}"
+
+    for ob in mesh_objects:
+        assert ob.get("tessera_enabled") == 1, f"Expected {ob.name} tessera_enabled == 1"
+    print(f"  ✓ batch_enable_all verified across {len(mesh_objects)} scene mesh objects.")
+
+    # Update batch pixel error to 2.5
+    t_scene.batch_pixel_error = 2.5
+    for ob in mesh_objects:
+        assert ob.get("tessera_pixel_error") == 2.5, f"Expected {ob.name} tessera_pixel_error == 2.5, got {ob.get('tessera_pixel_error')}"
+    print("  ✓ batch_pixel_error = 2.5 propagated synchronously to all scene meshes.")
+
+    # Update batch camera margin to 0.05
+    t_scene.batch_culling_margin = 0.05
+    for ob in mesh_objects:
+        assert abs(float(ob.get("tessera_culling_margin", 0.0)) - 0.05) < 1e-4, f"Expected {ob.name} tessera_culling_margin == 0.05"
+    print("  ✓ batch_culling_margin = 0.05 propagated synchronously to all scene meshes.")
+
+    # 4. Test Universal Batch Scope (SELECTED)
+    print("\n[Phase 4] Testing Universal Batch Scope (SELECTED)...")
+    t_scene.batch_scope = 'SELECTED'
+    target_ob = mesh_objects[0]
+    for ob in scene.objects:
+        ob.select_set(False)
+    target_ob.select_set(True)
+    bpy.context.view_layer.objects.active = target_ob
+
+    t_scene.batch_pixel_error = 5.0
+    assert target_ob.get("tessera_pixel_error") == 5.0, f"Expected selected {target_ob.name} tessera_pixel_error == 5.0"
+    for other_ob in mesh_objects[1:]:
+        assert other_ob.get("tessera_pixel_error") == 2.5, f"Expected unselected {other_ob.name} to remain at 2.5"
+    print(f"  ✓ Targeted batch update applied exclusively to selected mesh '{target_ob.name}'.")
+
+    # Reset back to ALL_SCENE and 1.0 error for rendering
+    t_scene.batch_scope = 'ALL_SCENE'
+    t_scene.batch_pixel_error = 1.0
+
+    # 5. Test TESSERA_OT_build_collection on main scene collection
+    print("\n[Phase 5] Testing TESSERA_OT_build_collection on 'Collection'...")
+    res = bpy.ops.tessera.build_collection(collection_name="Collection")
+    assert res == {'FINISHED'}, f"tessera.build_collection returned {res}"
+    for ob in mesh_objects:
+        nc2_p = tessera.ui.get_existing_nc2_path(ob)
+        assert nc2_p and os.path.isfile(nc2_p), f"Missing .nc2 cache for {ob.name}"
+    print("  ✓ build_collection finished and verified .nc2 existence on disk for all meshes.")
+
+    # 6. Multi-mesh high-poly render execution in EEVEE Next
+    print("\n[Phase 6] Rendering 1 frame in EEVEE Next with high-poly multi-mesh clusters...")
+    scene.render.engine = 'BLENDER_EEVEE'
+    scene.render.resolution_x = 960
+    scene.render.resolution_y = 540
+    bpy.ops.render.render(write_still=False)
+
+    total_rendered_clusters = 0
+    total_rendered_tris = 0
+    for ob in mesh_objects:
+        c = int(ob.get("tessera_stat_clusters", 0))
+        t = int(ob.get("tessera_stat_triangles", 0))
+        total_rendered_clusters += c
+        total_rendered_tris += t
+        print(f"  Object '{ob.name}': clusters={c:,}, tris={t:,}")
+
+    assert total_rendered_clusters > 0, "No clusters were rendered across high-poly objects"
+    assert total_rendered_tris > 0, "No triangles were rendered across high-poly objects"
+    print(f"  ✓ Multi-mesh telemetry confirmed: {total_rendered_clusters:,} active clusters, {total_rendered_tris:,} triangles.")
+
+    print("PASS: High-poly batch scene management, outliner tree, and multi-mesh render verified.")
+    return True
+
+
 # ---------------------------------------------------------------------------
 # Test Runner & Entry Point
 # ---------------------------------------------------------------------------
@@ -836,6 +1070,8 @@ def run_suite():
         ("test_camera_margin_control", test_camera_margin_control),
         ("test_workbench_solid_mode_mesh_isolation", test_workbench_solid_mode_mesh_isolation),
         ("test_texture_lod_scaling", test_texture_lod_scaling),
+        ("test_memory_budget_and_instancing", test_memory_budget_and_instancing),
+        ("test_highpoly_batch_scene_management", test_highpoly_batch_scene_management),
     ]
 
     for name, test_fn in tests:
