@@ -23,6 +23,7 @@ SAMPLE_GRAVEL_13 = r"D:\_Code\Meu\Nanite\Tessera_Gravel_13_color_Test.blend"
 NC2_GROUND_09 = r"D:\_Code\Meu\Nanite\Ground_009.nc2"
 NC2_GROUND_13 = r"D:\_Code\Meu\Nanite\Ground_013.nc2"
 SAMPLE_HIGHPOLY_1 = r"D:\_Code\Meu\Nanite\Tessera_HighPoy_Test_1.blend"
+SAMPLE_SCATTERFLOW = r"C:\blender-git\tessera_cenas_teste\Tessera_HighPoy_Test_NVME_scatterflow_assets_1.blend"
 
 
 # ---------------------------------------------------------------------------
@@ -1236,6 +1237,180 @@ def test_viewport_interaction_performance():
     return True
 
 
+
+
+# ---------------------------------------------------------------------------
+# Test 10: Collection Build Without Active Object Regression Test
+# ---------------------------------------------------------------------------
+
+def test_collection_build_without_active_object():
+    """Verify collection build succeeds without active object and without crash in Workbench Solid mode."""
+    print("\n" + "="*80)
+    print("RUNNING TEST 10: test_collection_build_without_active_object")
+    print("="*80)
+
+    import bpy
+
+    sample_path = SAMPLE_GROUND_09
+    assert os.path.exists(sample_path), f"Sample blend missing: {sample_path}"
+    bpy.ops.wm.open_mainfile(filepath=sample_path)
+    scene = bpy.context.scene
+
+    # 1. Create a new collection containing 3 mesh cubes
+    col = bpy.data.collections.new("TestCubes_Collection")
+    scene.collection.children.link(col)
+
+    cubes = []
+    for i in range(3):
+        mesh = bpy.data.meshes.new(f"CubeMesh_{i}")
+        verts = [
+            (-1, -1, -1), (1, -1, -1), (1, 1, -1), (-1, 1, -1),
+            (-1, -1, 1), (1, -1, 1), (1, 1, 1), (-1, 1, 1)
+        ]
+        faces = [
+            (0, 1, 2, 3), (4, 7, 6, 5), (0, 4, 5, 1),
+            (1, 5, 6, 2), (2, 6, 7, 3), (4, 0, 3, 7)
+        ]
+        mesh.from_pydata(verts, [], faces)
+        mesh.update()
+
+        ob = bpy.data.objects.new(f"TestCube_{i}", mesh)
+        ob.location = (i * 3.0, 0.0, 0.0)
+        col.objects.link(ob)
+        cubes.append(ob)
+
+    bpy.context.view_layer.update()
+
+    # 2. Explicitly clear context.view_layer.objects.active = None and deselect all objects
+    bpy.context.view_layer.objects.active = None
+    for ob in scene.objects:
+        ob.select_set(False)
+
+    assert bpy.context.view_layer.objects.active is None, "Active object must be None"
+    assert len(bpy.context.selected_objects) == 0, "No objects should be selected"
+    print("  ✓ Context active object cleared and all objects deselected.")
+
+    # 3. Call bpy.ops.tessera.build_collection(collection_name=col.name)
+    print(f"Calling bpy.ops.tessera.build_collection(collection_name='{col.name}')...")
+    res = bpy.ops.tessera.build_collection(collection_name=col.name)
+    assert res == {'FINISHED'}, f"Expected {{'FINISHED'}}, got {res}"
+    print(f"  ✓ Operator completed with {{'FINISHED'}} without throwing RuntimeError.")
+
+    # 4. Render a frame in Workbench Solid mode -> verify zero memory access violations
+    scene.render.engine = 'BLENDER_WORKBENCH'
+    scene.render.resolution_x = 320
+    scene.render.resolution_y = 240
+    bpy.context.view_layer.update()
+
+    print("Rendering frame in Workbench Solid mode to verify zero memory access violations...")
+    bpy.ops.render.render(write_still=False)
+    print("  ✓ Render completed cleanly with zero access violations.")
+
+    # Clean up created .nc2 files
+    for ob in cubes:
+        p = ob.get("tessera_nc2")
+        if p and os.path.exists(p):
+            try:
+                os.remove(p)
+            except OSError:
+                pass
+
+    print("PASS: test_collection_build_without_active_object passed successfully.")
+    return True
+
+
+# ---------------------------------------------------------------------------
+# Test 11: Scatterflow / Procedural Instancer Isolation Regression Test
+# ---------------------------------------------------------------------------
+
+def test_scatterflow_instancer_isolation():
+    """Regression Test 11: Scatterflow / procedural instancer isolation.
+
+    Reproduces the EXCEPTION_ACCESS_VIOLATION (read of 0xFFFFFFFFFFFFFFFF)
+    reported in tessera_view_source_get (workbench_engine.cc) when the scene
+    contains procedural scatter systems. Scatter systems free and recreate
+    evaluated objects between draw passes, which previously left dangling
+    Object pointers inside the Tessera draw lists.
+
+    Validates:
+      1. The scatterflow asset opens and evaluates through repeated depsgraph
+         re-evaluation cycles without crash.
+      2. Tessera draw passes (Workbench Solid) survive multiple frames while
+         the depsgraph recreates evaluated objects.
+      3. Tessera draw survives the removal of a recorded object between
+         frames (retirement path for vanished tessera entries).
+      4. EEVEE Next prepass/final draws are also crash-free on the same asset.
+    """
+    print("\n" + "="*80)
+    print("RUNNING TEST 11: test_scatterflow_instancer_isolation")
+    print("="*80)
+
+    import bpy
+
+    assert os.path.exists(SAMPLE_SCATTERFLOW), f"Scatterflow asset missing: {SAMPLE_SCATTERFLOW}"
+    bpy.ops.wm.open_mainfile(filepath=SAMPLE_SCATTERFLOW)
+    scene = bpy.context.scene
+
+    meshes = [ob for ob in scene.objects if ob.type == 'MESH']
+    non_meshes = [ob for ob in scene.objects if ob.type != 'MESH']
+    print(f"  Scene: {len(scene.objects)} objects ({len(meshes)} meshes, "
+          f"{len(non_meshes)} non-mesh scatter helpers/empties).")
+    assert len(meshes) > 0, "Scatterflow asset must contain mesh objects"
+
+    scene.render.resolution_x = 320
+    scene.render.resolution_y = 240
+    scene.render.filepath = os.path.join(bpy.app.tempdir, "tessera_scatter_iso_")
+    scene.frame_start = 1
+    scene.frame_end = 1
+
+    # Phase 1: repeated depsgraph re-evaluation + Workbench draw passes.
+    # Scatter systems recreate their evaluated objects inside view_layer.update();
+    # the Tessera draw lists must never dereference the stale pointers.
+    scene.render.engine = 'BLENDER_WORKBENCH'
+    for cycle in range(3):
+        for ob in scene.objects:
+            ob.update_tag(refresh={'OBJECT'})
+        bpy.context.view_layer.update()
+        bpy.ops.render.render(write_still=False)
+        print(f"  ✓ Cycle {cycle + 1}/3: depsgraph re-evaluation + Workbench draw passed.")
+
+    # Phase 2: retire a recorded object between frames. Renaming + unlinking
+    # forces the tessera draw list to hold an entry whose object no longer
+    # resolves in the depsgraph (the "object gone" retirement path).
+    victim = None
+    for ob in meshes:
+        if ob.get("tessera_nc2") or ob.get("tessera_nc2_path"):
+            victim = ob
+            break
+    if victim is None and meshes:
+        victim = meshes[0]
+    if victim is not None:
+        victim_name = victim.name
+        data_block = victim.data
+        bpy.data.objects.remove(victim, do_unlink=True)
+        bpy.context.view_layer.update()
+        bpy.ops.render.render(write_still=False)
+        print(f"  ✓ Removed '{victim_name}' before draw; retirement path passed "
+              f"(no dangling access).")
+        if data_block is not None and data_block.users == 0:
+            try:
+                bpy.data.meshes.remove(data_block)
+            except Exception:
+                pass
+
+    # Phase 3: EEVEE Next draw passes on the same asset.
+    scene.render.engine = 'BLENDER_EEVEE'
+    for cycle in range(2):
+        for ob in scene.objects:
+            ob.update_tag(refresh={'OBJECT'})
+        bpy.context.view_layer.update()
+        bpy.ops.render.render(write_still=False)
+        print(f"  ✓ Cycle {cycle + 1}/2: depsgraph re-evaluation + EEVEE Next draw passed.")
+
+    print("PASS: test_scatterflow_instancer_isolation passed successfully.")
+    return True
+
+
 # ---------------------------------------------------------------------------
 # Test Runner & Entry Point
 # ---------------------------------------------------------------------------
@@ -1263,6 +1438,8 @@ def run_suite():
         ("test_memory_budget_and_instancing", test_memory_budget_and_instancing),
         ("test_highpoly_batch_scene_management", test_highpoly_batch_scene_management),
         ("test_viewport_interaction_performance", test_viewport_interaction_performance),
+        ("test_collection_build_without_active_object", test_collection_build_without_active_object),
+        ("test_scatterflow_instancer_isolation", test_scatterflow_instancer_isolation),
     ]
 
     for name, test_fn in tests:

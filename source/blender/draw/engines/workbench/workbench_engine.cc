@@ -113,32 +113,57 @@ class Instance : public DrawEngine {
 
   /* Tessera data ownership helpers. */
 
-  static IDProperty *tessera_property_find(Object *ob, const char *prop_name)
+  static IDProperty *tessera_property_find_safe(Object *ob, const char *prop_name)
   {
-    if (ob == nullptr) {
+    if (!ob) {
       return nullptr;
     }
-    IDProperty *group = IDP_GetProperties(&ob->id);
-    if (group != nullptr) {
-      if (IDProperty *prop = IDP_GetPropertyFromGroup(group, prop_name)) {
+    /* Check evaluated ID first */
+    if (ob->id.properties && ob->id.properties->type == IDP_GROUP) {
+      IDProperty *prop = IDP_GetPropertyFromGroup(ob->id.properties, prop_name);
+      if (prop) {
         return prop;
       }
     }
-    const ID *orig_id = DEG_get_original_id(&ob->id);
-    if (orig_id != nullptr && orig_id != &ob->id) {
-      IDProperty *orig_group = IDP_GetProperties(const_cast<ID *>(orig_id));
-      if (orig_group != nullptr) {
-        if (IDProperty *prop = IDP_GetPropertyFromGroup(orig_group, prop_name)) {
-          return prop;
-        }
-      }
+    /* Fallback to original datablock */
+    ID *orig_id = DEG_get_original_id(&ob->id);
+    if (orig_id && orig_id->properties && orig_id->properties->type == IDP_GROUP) {
+      return IDP_GetPropertyFromGroup(orig_id->properties, prop_name);
     }
     return nullptr;
   }
 
+  static IDProperty *tessera_property_find(Object *ob, const char *prop_name)
+  {
+    return tessera_property_find_safe(ob, prop_name);
+  }
+
+  /**
+   * Strict Tessera object qualification: procedural instancers and scatter
+   * systems (e.g. ScatterFlow) generate helper empties, curve/pointcloud
+   * objects and temporary evaluated objects. Those must never be registered
+   * into or drawn through the Tessera pipeline. Visibility filtering is
+   * already handled at sync time (DRW_object_is_renderable), so only the
+   * hard structural requirements are enforced here.
+   */
+  static bool is_tessera_eligible_mesh(Object *ob)
+  {
+    if (ob == nullptr) {
+      return false;
+    }
+    /* Strictly require mesh type and a valid mesh datablock. */
+    if (ob->type != OB_MESH || ob->data == nullptr) {
+      return false;
+    }
+    return true;
+  }
+
   static bool tessera_path_get(Object *ob, std::string &r_path)
   {
-    const IDProperty *prop = tessera_property_find(ob, "tessera_nc2");
+    if (!ob) {
+      return false;
+    }
+    const IDProperty *prop = tessera_property_find_safe(ob, "tessera_nc2");
     if (prop != nullptr) {
       if (prop->type == IDP_STRING && prop->data.pointer != nullptr) {
         r_path = static_cast<const char *>(prop->data.pointer);
@@ -172,7 +197,10 @@ class Instance : public DrawEngine {
 
   static int tessera_visualize_get(Object *ob)
   {
-    const IDProperty *prop = tessera_property_find(ob, "tessera_visualize_clusters");
+    if (!ob) {
+      return 0;
+    }
+    const IDProperty *prop = tessera_property_find_safe(ob, "tessera_visualize_clusters");
     if (prop == nullptr) {
       return 0;
     }
@@ -192,7 +220,10 @@ class Instance : public DrawEngine {
    * mesh draw). Defaults to true when the property is absent. */
   static bool tessera_enabled_get(Object *ob)
   {
-    const IDProperty *prop = tessera_property_find(ob, "tessera_enabled");
+    if (!ob) {
+      return false;
+    }
+    const IDProperty *prop = tessera_property_find_safe(ob, "tessera_enabled");
     if (prop == nullptr) {
       return true;
     }
@@ -204,7 +235,7 @@ class Instance : public DrawEngine {
 
   static bool tessera_is_enabled(Object *ob)
   {
-    if (ob == nullptr) {
+    if (!is_tessera_eligible_mesh(ob)) {
       return false;
     }
     if (!tessera_enabled_get(ob)) {
@@ -217,7 +248,10 @@ class Instance : public DrawEngine {
   /** LOD quality control: tolerated screen-space error in pixels. */
   static float tessera_pixel_error_get(Object *ob)
   {
-    const IDProperty *prop = tessera_property_find(ob, "tessera_pixel_error");
+    if (!ob) {
+      return 1.0f;
+    }
+    const IDProperty *prop = tessera_property_find_safe(ob, "tessera_pixel_error");
     if (prop == nullptr) {
       return 1.0f;
     }
@@ -236,7 +270,10 @@ class Instance : public DrawEngine {
 
   static float tessera_culling_margin_get(Object *ob)
   {
-    const IDProperty *prop = tessera_property_find(ob, "tessera_culling_margin");
+    if (!ob) {
+      return 0.02f;
+    }
+    const IDProperty *prop = tessera_property_find_safe(ob, "tessera_culling_margin");
     if (prop == nullptr) {
       return 0.02f;
     }
@@ -257,19 +294,22 @@ class Instance : public DrawEngine {
   /** LOD view source: 0 = viewport view, 1 = the scene's active camera. */
   static int tessera_view_source_get(Object *ob)
   {
-    const IDProperty *prop = tessera_property_find(ob, "tessera_view_source");
-    if (prop == nullptr) {
+    if (!ob) {
       return 0;
     }
-    if (prop->type == IDP_INT) {
-      return IDP_int_get(prop);
+    const IDProperty *prop = tessera_property_find_safe(ob, "tessera_view_source");
+    if (prop == nullptr || prop->type != IDP_INT) {
+      return 0; /* Safe default (Viewport Mode). */
     }
-    return prop->data.val;
+    return IDP_int_get(prop);
   }
 
   static bool tessera_show_stats_get(Object *ob)
   {
-    const IDProperty *prop = tessera_property_find(ob, "tessera_show_stats");
+    if (!ob) {
+      return true;
+    }
+    const IDProperty *prop = tessera_property_find_safe(ob, "tessera_show_stats");
     if (prop == nullptr) {
       return true;
     }
@@ -281,7 +321,10 @@ class Instance : public DrawEngine {
 
   static bool tessera_log_console_get(Object *ob)
   {
-    const IDProperty *prop = tessera_property_find(ob, "tessera_log_console");
+    if (!ob) {
+      return false;
+    }
+    const IDProperty *prop = tessera_property_find_safe(ob, "tessera_log_console");
     if (prop == nullptr) {
       return false;
     }
@@ -293,7 +336,10 @@ class Instance : public DrawEngine {
 
   static bool tessera_show_fps_panel_get(Object *ob)
   {
-    const IDProperty *prop = tessera_property_find(ob, "tessera_show_fps_panel");
+    if (!ob) {
+      return false;
+    }
+    const IDProperty *prop = tessera_property_find_safe(ob, "tessera_show_fps_panel");
     if (prop == nullptr) {
       return false;
     }
@@ -305,7 +351,10 @@ class Instance : public DrawEngine {
 
   static bool tessera_show_fps_hud_get(Object *ob)
   {
-    const IDProperty *prop = tessera_property_find(ob, "tessera_show_fps_hud");
+    if (!ob) {
+      return false;
+    }
+    const IDProperty *prop = tessera_property_find_safe(ob, "tessera_show_fps_hud");
     if (prop == nullptr) {
       return false;
     }
@@ -317,7 +366,7 @@ class Instance : public DrawEngine {
 
   static void idp_int_replace(IDProperty *idgroup, const char *name, int value)
   {
-    if (idgroup == nullptr) {
+    if (idgroup == nullptr || idgroup->type != IDP_GROUP) {
       return;
     }
     if (IDProperty *prev = IDP_GetPropertyFromGroup(idgroup, name)) {
@@ -332,7 +381,7 @@ class Instance : public DrawEngine {
 
   static void idp_float_replace(IDProperty *idgroup, const char *name, float value)
   {
-    if (idgroup == nullptr) {
+    if (idgroup == nullptr || idgroup->type != IDP_GROUP) {
       return;
     }
     if (IDProperty *prev = IDP_GetPropertyFromGroup(idgroup, name)) {
@@ -444,6 +493,30 @@ class Instance : public DrawEngine {
   }
 
   /**
+   * Re-resolve the evaluated object for a recorded Tessera object by name.
+   * The pointer stored during sync may have been freed by the depsgraph in
+   * between frames (procedural instancers and scatter systems recreate their
+   * evaluated objects every frame), so it must never be dereferenced at draw
+   * time. Returns nullptr when the object no longer exists.
+   */
+  static Object *tessera_object_revalidate(const DRWContext *draw_ctx, const std::string &name)
+  {
+    if (draw_ctx == nullptr || draw_ctx->depsgraph == nullptr) {
+      return nullptr;
+    }
+    Main *bmain = DEG_get_bmain(draw_ctx->depsgraph);
+    if (bmain == nullptr) {
+      return nullptr;
+    }
+    Object *orig = static_cast<Object *>(
+        BLI_findstring(&bmain->objects, name.c_str(), offsetof(ID, name) + 2));
+    if (orig == nullptr) {
+      return nullptr;
+    }
+    return DEG_get_evaluated(draw_ctx->depsgraph, orig);
+  }
+
+  /**
    * Projection*view matrix of the scene's active camera, fitted to the target
    * resolution. Returns false when the scene has no usable camera.
    */
@@ -459,9 +532,8 @@ class Instance : public DrawEngine {
     }
     const Object *cam_ob = nullptr;
     if (state_ob != nullptr) {
-      IDProperty *group = IDP_GetProperties(const_cast<ID *>(&state_ob->id));
-      if (group != nullptr) {
-        IDProperty *cull_cam_prop = IDP_GetPropertyFromGroup(group, "tessera_cull_camera");
+      IDProperty *cull_cam_prop = tessera_property_find_safe(const_cast<Object *>(state_ob), "tessera_cull_camera");
+      if (cull_cam_prop != nullptr) {
         if (cull_cam_prop != nullptr && cull_cam_prop->type == IDP_STRING) {
           const char *cam_name = IDP_string_get(cull_cam_prop);
           if (cam_name != nullptr && cam_name[0] != '\0') {
@@ -510,6 +582,9 @@ class Instance : public DrawEngine {
    */
   bool tessera_record(Object *ob)
   {
+    if (!is_tessera_eligible_mesh(ob)) {
+      return false;
+    }
     if (!tessera_enabled_get(ob)) {
       return false;
     }
@@ -595,11 +670,29 @@ class Instance : public DrawEngine {
       if (!state.used || state.data.clusters.empty()) {
         continue;
       }
+      /* Never dereference the pointer stored at sync time: the depsgraph may
+       * have freed the evaluated object in between (procedural instancers and
+       * scatter systems recreate objects every frame). Re-resolve by name. */
+      Object *ob = (this->draw_ctx != nullptr) ?
+                       tessera_object_revalidate(this->draw_ctx, item.key) :
+                       nullptr;
+      if (ob == nullptr) {
+        if (this->draw_ctx != nullptr) {
+          /* The object no longer exists; retire its cached render state. */
+          state.used = false;
+          state.ob = nullptr;
+          state.pass.reset();
+        }
+        continue;
+      }
+      state.ob = ob;
+      if (!is_tessera_eligible_mesh(ob)) {
+        continue;
+      }
       /* Rasterization matrix: always projects to the active viewport framebuffer. */
       const float4x4 object_persmat = viewport_persmat * state.object_mat;
 
-      const int view_source = (state.ob != nullptr) ?
-          tessera_view_source_get(state.ob) : state.view_source;
+      const int view_source = tessera_view_source_get(ob);
       state.view_source = view_source;
 
       float4x4 cam_persmat;

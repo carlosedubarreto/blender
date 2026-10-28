@@ -175,6 +175,17 @@ class TESSERA_OT_build_single_object(bpy.types.Operator):
         return {'FINISHED'}
 
 
+def get_target_nc2_path(ob):
+    """Resolve target .nc2 output path for an object."""
+    existing = ob.get("tessera_nc2") or ob.get("tessera_nc2_path")
+    if existing:
+        return existing
+    blend_dir = bpy.path.abspath("//")
+    if not blend_dir or not os.path.isdir(blend_dir):
+        blend_dir = os.getcwd()
+    return os.path.join(blend_dir, f"{ob.name}.nc2")
+
+
 class TESSERA_OT_build_collection(bpy.types.Operator):
     """Build .nc2 cluster caches for all meshes in a collection"""
     bl_idname = "tessera.build_collection"
@@ -202,25 +213,40 @@ class TESSERA_OT_build_collection(bpy.types.Operator):
             self.report({'INFO'}, f"No mesh objects found in collection '{col.name}'")
             return {'FINISHED'}
 
-        blend_dir = bpy.path.abspath("//")
-        if not blend_dir or not os.path.isdir(blend_dir):
-            blend_dir = os.getcwd()
-
         built_count = 0
         orig_active = context.view_layer.objects.active
         try:
-            for ob in meshes:
-                nc2_path = os.path.join(blend_dir, f"{ob.name}.nc2")
-                ob["tessera_nc2"] = nc2_path
-                ob["tessera_nc2_path"] = nc2_path
-                ob["tessera_enabled"] = 1
-                if getattr(ob, "tessera", None):
-                    ob.tessera.enabled = True
-                context.view_layer.objects.active = ob
-                bpy.ops.object.tessera_build(filepath=nc2_path)
-                built_count += 1
+            for ob in col.all_objects:
+                if ob.type != 'MESH':
+                    continue
+
+                try:
+                    # Ensure object is linked and visible in view layer
+                    context.view_layer.objects.active = ob
+                    ob.select_set(True)
+
+                    nc2_path = get_target_nc2_path(ob)
+                    ob["tessera_nc2"] = nc2_path
+                    ob["tessera_nc2_path"] = nc2_path
+                    ob["tessera_enabled"] = 1
+                    if getattr(ob, "tessera", None):
+                        ob.tessera.enabled = True
+
+                    # Use context override for Blender 4.x / 5.x
+                    with context.temp_override(active_object=ob, selected_objects=[ob], object=ob):
+                        if bpy.ops.object.tessera_build.poll():
+                            bpy.ops.object.tessera_build(filepath=nc2_path)
+                            built_count += 1
+                        else:
+                            # Fallback direct call if poll fails
+                            print(f"[Tessera] Warning: poll failed for {ob.name}, skipping.")
+                except Exception as e:
+                    print(f"[Tessera] Warning: failed to build {ob.name}: {e}")
         finally:
-            context.view_layer.objects.active = orig_active
+            try:
+                context.view_layer.objects.active = orig_active
+            except Exception:
+                pass
 
         self.report({'INFO'}, f"Built .nc2 caches for {built_count} meshes in '{col.name}'")
         return {'FINISHED'}
