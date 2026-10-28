@@ -308,6 +308,10 @@ class TESSERA_PT_object(bpy.types.Panel):
 
             col = layout.column(align=True)
             col.operator("object.tessera_build", text="Rebuild Tessera Cache", icon='FILE_REFRESH')
+            if ob.get("tessera_is_proxy", 0):
+                col.operator("tessera.restore_mesh", text="Restore Original Mesh", icon='MESH_DATA')
+            else:
+                col.operator("tessera.convert_to_proxy", text="Convert Base Mesh to Lightweight Proxy (Keep .nc2)", icon='MESH_CUBE')
             col.operator("tessera.clear", text="Clear Tessera Data", icon='X')
 
             if is_enabled and tessera_props is not None:
@@ -566,6 +570,9 @@ class TESSERA_PT_scene_manager(bpy.types.Panel):
 
         box.prop(scene, "tessera_auto_build_missing", text="Auto-Build Missing Caches")
         box.operator("tessera.batch_build_all", text="Batch Build All Missing .nc2", icon='FILE_CACHE')
+        prow = box.row(align=True)
+        prow.operator("tessera.convert_to_proxy", text="Convert to Proxy (Keep .nc2)", icon='MESH_CUBE')
+        prow.operator("tessera.restore_mesh", text="Restore Original Mesh", icon='FILE_REFRESH')
 
         # Memory Budget & Streaming Box
         sbox = layout.box()

@@ -23,6 +23,7 @@
 #include "GPU_shader.hh"
 #include "GPU_storage_buffer.hh"
 
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <map>
@@ -127,6 +128,15 @@ public:
      */
     void draw_gbuffer(int viewportWidth, int viewportHeight, const float4x4 &object_model = float4x4::identity());
 
+    /**
+     * Direct single-pass forward rasterization pass for Solid Mode (Workbench).
+     */
+    void draw_forward(const float4x4 &model_mat,
+                      int viewportWidth,
+                      int viewportHeight,
+                      int lighting_type = 1,
+                      const float4 &base_color = float4(0.8f, 0.8f, 0.8f, 1.0f));
+
     size_t drawCount(uint32_t material_index = 0) const
     {
         if (mMaterialDrawCounts.size() > material_index) {
@@ -159,6 +169,10 @@ public:
 
     /** True when the GPU compute traversal is in use. */
     bool usesGpuTraversal() const { return mGpuTraversalActive; }
+
+    /** Viewport interactive navigation mode (skips blocking telemetry readbacks). */
+    void setNavigating(bool navigating) { mIsNavigating = navigating; }
+    bool isNavigating() const { return mIsNavigating; }
 
 private:
     bool mTelemetryEnabled = true;
@@ -204,8 +218,14 @@ private:
     gpu::StorageBuf *mErrorsBuf = nullptr;
     gpu::StorageBuf *mMetaBuf = nullptr;
     gpu::StorageBuf *mMaterialsBuf = nullptr;
-    // Shared atomic counter written by the compute shader, read back on CPU.
-    gpu::StorageBuf *mCounterBuf = nullptr;
+    // Double-buffered atomic counters for zero-stall asynchronous readback queue.
+    static constexpr int kCounterBufferCount = 2;
+    gpu::StorageBuf *mCounterBuf[kCounterBufferCount] = {nullptr, nullptr};
+    int mCurrentCounterIndex = 0;
+    int mAsyncReadCounterIndex = -1;
+    bool mHasValidCounterData = false;
+    bool mIsNavigating = false;
+    std::chrono::steady_clock::time_point mLastCounterReadTime{};
 
     TesseraGpuClusterData mGpuClusters;
 
@@ -251,7 +271,22 @@ private:
     bool mGpuTraversalActive = false;
     bool mGpuPathFailed = false;
 
-    // Constant host-side capacity. Granularity is kept to avoid reallocation.
+    // Dynamic draw buffer capacity
+    size_t mAllocatedCommandCapacity = 16384;
+
+    // Per-mesh cluster metadata cache to avoid looping on CPU every frame
+    const TesseraData *mCachedMetadataData = nullptr;
+    size_t mCachedClusterCount = 0;
+    uint32_t mCachedMaxMaterials = 1;
+    size_t mCachedIndexCount = 0;
+    float mCachedMaxParentError = -1.0f;
+
+    // Hardware GPU timer queries
+    uint32_t mQueryTraverse[2] = {0, 0};
+    uint32_t mQueryRaster[2] = {0, 0};
+    int mQueryIndex = 0;
+
+    // Constant host-side capacity fallback.
     static constexpr size_t kDrawCommandCapacity = 2000000;
 };
 

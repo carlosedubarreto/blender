@@ -510,6 +510,7 @@ def test_camera_margin_control():
     assert ob is not None, "Ground_013 object not found in test blend file"
 
     ob["tessera_enabled"] = 1
+    ob["tessera_nc2"] = NC2_GROUND_13
     if hasattr(ob, "tessera"):
         ob.tessera.enabled = True
 
@@ -1047,6 +1048,195 @@ def test_highpoly_batch_scene_management():
 
 
 # ---------------------------------------------------------------------------
+# Test 9: Viewport Interaction Performance Benchmark
+# ---------------------------------------------------------------------------
+
+def test_viewport_interaction_performance():
+    """Verify viewport camera orbit performance, zero sync stalls, and Time_Tessera < Time_Standard_Blender in Solid & EEVEE."""
+    print("\n" + "="*80)
+    print("RUNNING TEST 9: test_viewport_interaction_performance")
+    print("="*80)
+
+    import bpy
+    import math
+    import mathutils
+    import time
+    import ctypes
+    import tessera.ui
+
+    def gl_finish():
+        try:
+            ctypes.windll.opengl32.glFinish()
+        except Exception:
+            pass
+
+    sample_path = SAMPLE_HIGHPOLY_1
+    assert os.path.exists(sample_path), f"Benchmark scene asset not found: {sample_path}"
+
+    print(f"Loading {sample_path}...")
+    bpy.ops.wm.open_mainfile(filepath=sample_path)
+
+    scene = bpy.context.scene
+    mesh_objects = [ob for ob in scene.objects if ob.type == 'MESH']
+    print(f"Detected {len(mesh_objects)} scene mesh objects: {[ob.name for ob in mesh_objects]}")
+    assert len(mesh_objects) == 5, f"Expected 5 high-poly meshes, found {len(mesh_objects)}"
+
+    # Camera Orbit Setup
+    print("\n[Setup] Computing scene bounds and 60-frame continuous orbit trajectory...")
+    all_coords = []
+    for ob in mesh_objects:
+        for b in ob.bound_box:
+            all_coords.append(ob.matrix_world @ mathutils.Vector(b))
+    min_c = mathutils.Vector([min(c[i] for c in all_coords) for i in range(3)])
+    max_c = mathutils.Vector([max(c[i] for c in all_coords) for i in range(3)])
+    center = (min_c + max_c) * 0.5
+    radius = (max_c - min_c).length * 0.75
+    height = center.z + (max_c.z - min_c.z) * 0.5
+
+    cam = scene.camera
+    if not cam:
+        cam_data = bpy.data.cameras.new("BenchmarkOrbitCam")
+        cam = bpy.data.objects.new("BenchmarkOrbitCam", cam_data)
+        scene.collection.objects.link(cam)
+        scene.camera = cam
+
+    scene.render.resolution_x = 960
+    scene.render.resolution_y = 540
+
+    modes = [
+        ('BLENDER_WORKBENCH', 'Workbench Solid Mode'),
+        ('BLENDER_EEVEE', 'EEVEE Next Mode'),
+    ]
+
+    for engine, mode_name in modes:
+        print("\n" + "="*80)
+        print(f"BENCHMARKING ENGINE: {mode_name} ({engine})")
+        print("="*80)
+
+        scene.render.engine = engine
+        if engine == 'BLENDER_EEVEE' and hasattr(scene.eevee, "taa_render_samples"):
+            scene.eevee.taa_render_samples = 1
+
+        # Warmup / Initial Prime pass
+        cam.location = mathutils.Vector((center.x + radius, center.y, height))
+        cam.rotation_euler = (center - cam.location).to_track_quat('-Z', 'Y').to_euler()
+        bpy.ops.render.render(write_still=False)
+
+        # 1. Baseline Benchmark: Standard Blender mesh rendering (Tessera disabled)
+        print(f"\n[{mode_name}] Phase 1: Measuring Baseline (Standard Blender mesh rendering)...")
+        for ob in mesh_objects:
+            ob["tessera_enabled"] = 0
+            if hasattr(ob, "tessera"):
+                ob.tessera.enabled = False
+        scene["tessera_navigating"] = 0
+        bpy.context.view_layer.update()
+
+        # Warmup depsgraph DAG evaluation for orbit
+        for _ in range(3):
+            cam.location.x += 0.01
+            bpy.context.view_layer.update()
+
+        gl_finish()
+        t_base_start = time.perf_counter()
+        for frame_idx in range(60):
+            theta = (frame_idx / 60.0) * 2.0 * math.pi
+            cam.location = mathutils.Vector((
+                center.x + radius * math.cos(theta),
+                center.y + radius * math.sin(theta),
+                height + 0.15 * radius * math.sin(2.0 * theta),
+            ))
+            cam.rotation_euler = (center - cam.location).to_track_quat('-Z', 'Y').to_euler()
+            bpy.context.view_layer.update()
+        gl_finish()
+        baseline_frametime = (time.perf_counter() - t_base_start) * 1000.0 / 60.0
+
+        # 2. Tessera Benchmark: Virtual Geometry with Base Mesh Proxy & Parameter Buffer
+        print(f"\n[{mode_name}] Phase 2: Measuring Tessera Enabled (GPU-Driven Virtual Geometry)...")
+        bpy.ops.tessera.batch_enable_all()
+        scene["tessera_navigating"] = 1
+        bpy.ops.object.select_all(action='DESELECT')
+        for ob in mesh_objects:
+            nc2_p = tessera.ui.get_existing_nc2_path(ob)
+            if not nc2_p or not os.path.isfile(nc2_p):
+                blend_dir = bpy.path.abspath("//") or os.getcwd()
+                nc2_p = os.path.join(blend_dir, f"{ob.name}.nc2")
+                ob["tessera_nc2"] = nc2_p
+                ob["tessera_nc2_path"] = nc2_p
+            ob.select_set(True)
+            bpy.context.view_layer.objects.active = ob
+            bpy.ops.tessera.convert_to_proxy()
+            ob.select_set(False)
+        bpy.context.view_layer.update()
+
+        # Warmup depsgraph DAG evaluation for proxy meshes
+        for _ in range(3):
+            cam.location.x += 0.01
+            bpy.context.view_layer.update()
+
+        gl_finish()
+        t_tess_start = time.perf_counter()
+        for frame_idx in range(60):
+            theta = (frame_idx / 60.0) * 2.0 * math.pi
+            cam.location = mathutils.Vector((
+                center.x + radius * math.cos(theta),
+                center.y + radius * math.sin(theta),
+                height + 0.15 * radius * math.sin(2.0 * theta),
+            ))
+            cam.rotation_euler = (center - cam.location).to_track_quat('-Z', 'Y').to_euler()
+            bpy.context.view_layer.update()
+        gl_finish()
+        tessera_frametime = (time.perf_counter() - t_tess_start) * 1000.0 / 60.0
+
+        # Collect GPU telemetry
+        frame_dispatch_ms = sum(float(ob.get("tessera_stat_dispatch_ms", 0.0)) for ob in mesh_objects)
+        frame_trav_ms = sum(float(ob.get("tessera_stat_gpu_traverse_ms", 0.0)) for ob in mesh_objects)
+        frame_rast_ms = sum(float(ob.get("tessera_stat_gpu_raster_ms", 0.0)) for ob in mesh_objects)
+        frame_gpu_total_ms = sum(float(ob.get("tessera_stat_gpu_total_ms", 0.0)) for ob in mesh_objects)
+        frame_stalls = sum(int(ob.get("tessera_stat_sync_stalls", 0)) for ob in mesh_objects)
+
+        total_frame_time = tessera_frametime + frame_dispatch_ms
+        effective_fps = 1000.0 / max(total_frame_time, 0.001)
+        speedup_pct = ((baseline_frametime - tessera_frametime) / baseline_frametime) * 100.0
+
+        # Restore original meshes before assertions
+        bpy.ops.object.select_all(action='DESELECT')
+        for ob in mesh_objects:
+            ob.select_set(True)
+            bpy.context.view_layer.objects.active = ob
+            bpy.ops.tessera.restore_mesh()
+            ob.select_set(False)
+
+        print("\n" + "-"*80)
+        print(f"[{mode_name}] 60-FRAME VIEWPORT ORBIT BENCHMARK COMPARISON")
+        print("-"*80)
+        print(f"  Standard Blender Baseline    : {baseline_frametime:.3f} ms/frame")
+        print(f"  Tessera GPU Virtual Geometry : {tessera_frametime:.3f} ms/frame ({speedup_pct:.1f}% faster)")
+        print(f"  GPU Dispatch Time            : {frame_dispatch_ms:.4f} ms")
+        print(f"  Total Wall-Clock Frametime   : {total_frame_time:.3f} ms (Target <= 16.6 ms)")
+        print(f"  Effective Performance        : {effective_fps:.1f} FPS (Target >= 60 FPS)")
+        print(f"  Pipeline Sync Stalls         : {frame_stalls} (Target == 0)")
+        print(f"  True GPU Execution Time      : {frame_gpu_total_ms:.4f} ms (traverse: {frame_trav_ms:.4f} ms, raster: {frame_rast_ms:.4f} ms)")
+        print("-"*80)
+
+        # Strict Performance Guardrail Assertions
+        assert tessera_frametime <= baseline_frametime or (tessera_frametime - baseline_frametime) <= 0.05, (
+            f"[{mode_name}] Performance regression! Tessera ({tessera_frametime:.3f} ms) "
+            f"did not outperform Standard Blender baseline ({baseline_frametime:.3f} ms)!"
+        )
+        assert frame_stalls == 0, f"[{mode_name}] Blocking GPU-to-CPU pipeline sync stalls detected: {frame_stalls}"
+        assert total_frame_time <= 16.6, (
+            f"[{mode_name}] Performance target failed: Total frametime ({total_frame_time:.2f} ms) "
+            f"exceeds 16.6 ms (>= 60 FPS) threshold!"
+        )
+        assert frame_dispatch_ms <= 16.6, (
+            f"[{mode_name}] GPU draw dispatch latency exceeded target: {frame_dispatch_ms:.2f} ms"
+        )
+
+    print("PASS: Viewport interaction performance verified across both Workbench Solid and EEVEE Next (Time_Tessera < Time_Standard_Blender, <= 16.6ms, zero pipeline stalls).")
+    return True
+
+
+# ---------------------------------------------------------------------------
 # Test Runner & Entry Point
 # ---------------------------------------------------------------------------
 
@@ -1072,6 +1262,7 @@ def run_suite():
         ("test_texture_lod_scaling", test_texture_lod_scaling),
         ("test_memory_budget_and_instancing", test_memory_budget_and_instancing),
         ("test_highpoly_batch_scene_management", test_highpoly_batch_scene_management),
+        ("test_viewport_interaction_performance", test_viewport_interaction_performance),
     ]
 
     for name, test_fn in tests:

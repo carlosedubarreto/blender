@@ -135,6 +135,16 @@ public:
         return renderer_.getTelemetry();
     }
 
+    void setNavigating(bool navigating)
+    {
+        renderer_.setNavigating(navigating);
+    }
+
+    bool isNavigating() const
+    {
+        return renderer_.isNavigating();
+    }
+
     void getLevelCounts(const TesseraData &data,
                         const float4x4 &lodViewProj,
                         float projScaleY,
@@ -147,6 +157,11 @@ public:
     void draw(int viewportWidth, int viewportHeight) const;
     void draw_prepass(int viewportWidth, int viewportHeight) const;
     void draw_gbuffer(int viewportWidth, int viewportHeight, const float4x4 &object_model = float4x4::identity()) const;
+    void draw_forward(const float4x4 &model_mat,
+                      int viewportWidth,
+                      int viewportHeight,
+                      int lighting_type = 1,
+                      const float4 &base_color = float4(0.8f, 0.8f, 0.8f, 1.0f)) const;
 
     size_t drawCount(uint32_t material_index = 0) const;
     size_t totalDrawCount() const;

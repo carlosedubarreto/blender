@@ -256,6 +256,92 @@ class TESSERA_OT_toggle_collection(bpy.types.Operator):
         return {'FINISHED'}
 
 
+class TESSERA_OT_convert_to_proxy(bpy.types.Operator):
+    """Convert base mesh to lightweight proxy while retaining .nc2 virtual geometry"""
+    bl_idname = "tessera.convert_to_proxy"
+    bl_label = "Convert Base Mesh to Lightweight Proxy (Keep .nc2)"
+    bl_description = "Replaces the heavy Blender base mesh with an 8-vertex bounding box proxy in memory, eliminating depsgraph CPU evaluation while Tessera renders the full virtual geometry"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        from tessera.ui import get_existing_nc2_path
+        from tessera.render import _tag_tessera_redraw
+
+        targets = [ob for ob in context.selected_objects if ob.type == 'MESH']
+        if not targets and context.active_object and context.active_object.type == 'MESH':
+            targets = [context.active_object]
+
+        count = 0
+        for ob in targets:
+            nc2 = get_existing_nc2_path(ob)
+            if not nc2 or not os.path.exists(nc2):
+                continue
+            if ob.get("tessera_is_proxy", 0):
+                continue
+
+            orig_mesh = ob.data
+            ob["tessera_orig_mesh_name"] = orig_mesh.name
+            ob["tessera_nc2"] = nc2
+            ob["tessera_nc2_path"] = nc2
+            ob["tessera_enabled"] = 1
+            if getattr(ob, "tessera", None):
+                ob.tessera.enabled = True
+
+            bbox = [list(corner) for corner in ob.bound_box]
+            faces = [
+                (0, 1, 2, 3), (4, 7, 6, 5), (0, 4, 5, 1),
+                (1, 5, 6, 2), (2, 6, 7, 3), (4, 0, 3, 7)
+            ]
+
+            proxy_mesh = bpy.data.meshes.new(f"{orig_mesh.name}_Proxy")
+            proxy_mesh.from_pydata(bbox, [], faces)
+            proxy_mesh.update()
+
+            for mat in orig_mesh.materials:
+                proxy_mesh.materials.append(mat)
+
+            ob.data = proxy_mesh
+            ob["tessera_is_proxy"] = 1
+            count += 1
+            _tag_tessera_redraw(ob, context)
+
+        self.report({'INFO'}, f"Converted {count} meshes to lightweight proxies (kept .nc2)")
+        return {'FINISHED'}
+
+
+class TESSERA_OT_restore_mesh(bpy.types.Operator):
+    """Restore original heavy mesh from proxy representation"""
+    bl_idname = "tessera.restore_mesh"
+    bl_label = "Restore Original Mesh"
+    bl_description = "Restores the original full-resolution Blender base mesh from the proxy representation"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        from tessera.render import _tag_tessera_redraw
+
+        targets = [ob for ob in context.selected_objects if ob.type == 'MESH']
+        if not targets and context.active_object and context.active_object.type == 'MESH':
+            targets = [context.active_object]
+
+        count = 0
+        for ob in targets:
+            if not ob.get("tessera_is_proxy", 0):
+                continue
+            orig_name = ob.get("tessera_orig_mesh_name", "")
+            orig_mesh = bpy.data.meshes.get(orig_name)
+            if orig_mesh:
+                proxy_mesh = ob.data
+                ob.data = orig_mesh
+                ob["tessera_is_proxy"] = 0
+                if proxy_mesh and proxy_mesh.users == 0:
+                    bpy.data.meshes.remove(proxy_mesh)
+                count += 1
+                _tag_tessera_redraw(ob, context)
+
+        self.report({'INFO'}, f"Restored {count} original meshes")
+        return {'FINISHED'}
+
+
 classes = (
     TESSERA_OT_batch_enable_all,
     TESSERA_OT_batch_enable_selected,
@@ -264,6 +350,8 @@ classes = (
     TESSERA_OT_build_single_object,
     TESSERA_OT_build_collection,
     TESSERA_OT_toggle_collection,
+    TESSERA_OT_convert_to_proxy,
+    TESSERA_OT_restore_mesh,
 )
 
 

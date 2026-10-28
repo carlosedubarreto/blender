@@ -145,6 +145,21 @@ def get_effective_margin(ob, context=None):
     return max(0.0, float(ob.get("tessera_culling_margin", 0.02)))
 
 
+def get_effective_pixel_error(ob, context=None):
+    if ob is None:
+        return 1.0
+    base = float(ob.get("tessera_pixel_error", 1.0))
+    is_navigating = False
+    if context:
+        rv3d = getattr(context, "region_data", None)
+        if rv3d and (getattr(rv3d, "rflag", 0) & 1):
+            is_navigating = True
+        scene = getattr(context, "scene", None)
+        if scene and scene.get("tessera_navigating", 0):
+            is_navigating = True
+    return base * 2.5 if is_navigating else base
+
+
 def _view_source_update(self, context):
     val = (self.view_source == 'CAMERA')
     self.id_data["tessera_view_source"] = int(val)

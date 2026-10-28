@@ -90,7 +90,8 @@ class TesseraVisibilityPass
                 const float4x4 &object_model = float4x4::identity(),
                 bool reverse_z = false,
                 const std::vector<uint32_t> *material_counts = nullptr,
-                uint32_t max_commands_per_material = 0);
+                uint32_t max_commands_per_material = 0,
+                gpu::StorageBuf *counter_buf = nullptr);
 
     /**
      * Render depth-only prepass into the currently bound framebuffer.
@@ -102,7 +103,8 @@ class TesseraVisibilityPass
                              int viewport_height,
                              bool reverse_z = false,
                              const std::vector<uint32_t> *material_counts = nullptr,
-                             uint32_t max_commands_per_material = 0);
+                             uint32_t max_commands_per_material = 0,
+                             gpu::StorageBuf *counter_buf = nullptr);
 
     /**
      * Render G-Buffer pass into the currently bound EEVEE G-Buffer framebuffer.
@@ -116,7 +118,26 @@ class TesseraVisibilityPass
                         const float4x4 &object_model = float4x4::identity(),
                         bool reverse_z = true,
                         const std::vector<uint32_t> *material_counts = nullptr,
-                        uint32_t max_commands_per_material = 0);
+                        uint32_t max_commands_per_material = 0,
+                        gpu::StorageBuf *counter_buf = nullptr);
+
+    /**
+     * Direct single-pass forward rasterization for Solid Mode (Workbench).
+     * Bypasses the visibility buffer resolve entirely.
+     */
+    void render_forward(gpu::StorageBuf *command_buf,
+                        size_t draw_count,
+                        const float4x4 &viewProj,
+                        const float4x4 &model_mat,
+                        const float3 &cam_pos,
+                        int viewport_width,
+                        int viewport_height,
+                        int shading_mode = 0,
+                        int lighting_type = 1,
+                        const float4 &base_color = float4(0.8f, 0.8f, 0.8f, 1.0f),
+                        const std::vector<uint32_t> *material_counts = nullptr,
+                        uint32_t max_commands_per_material = 0,
+                        gpu::StorageBuf *counter_buf = nullptr);
 
     void set_material_textures(const std::vector<TesseraMaterialTextures> &materials)
     {
@@ -143,6 +164,7 @@ class TesseraVisibilityPass
     gpu::Shader *mMaterialShader = nullptr;
     gpu::Shader *mDepthPrepassShader = nullptr;
     gpu::Shader *mGbufferShader = nullptr;
+    gpu::Shader *mForwardShader = nullptr;
 
     // Visibility targets.
     gpu::Texture *mVisTexture = nullptr;
@@ -183,6 +205,8 @@ class TesseraVisibilityPass
     size_t mVertexCount = 0;
     size_t mIndexCount = 0;
     size_t mClusterCount = 0;
+    float mBoundsMin[3] = {0.0f, 0.0f, 0.0f};
+    float mBoundsMax[3] = {0.0f, 0.0f, 0.0f};
 };
 
 }  // namespace tessera

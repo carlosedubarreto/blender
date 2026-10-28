@@ -316,6 +316,69 @@ void GLBatch::multi_draw_indirect(gpu::StorageBuf *indirect_buf,
   glBindBuffer(GL_DRAW_INDIRECT_BUFFER, 0);
 }
 
+void GLBatch::multi_draw_indirect_count(gpu::StorageBuf *indirect_buf,
+                                        gpu::StorageBuf *counter_buf,
+                                        int max_count,
+                                        intptr_t indirect_offset,
+                                        intptr_t counter_offset,
+                                        intptr_t stride)
+{
+  GL_CHECK_RESOURCES("Batch");
+
+  this->bind();
+  dynamic_cast<GLStorageBuf *>(indirect_buf)->bind_as(GL_DRAW_INDIRECT_BUFFER);
+  dynamic_cast<GLStorageBuf *>(counter_buf)->bind_as(GL_PARAMETER_BUFFER);
+
+  GLenum gl_type = to_gl(prim_type);
+  if (glMultiDrawArraysIndirectCount != nullptr) {
+    if (elem) {
+      const GLIndexBuf *el = this->elem_();
+      GLenum index_type = to_gl(el->index_type_);
+      if (glMultiDrawElementsIndirectCount != nullptr) {
+        glMultiDrawElementsIndirectCount(gl_type,
+                                         index_type,
+                                         reinterpret_cast<GLvoid *>(indirect_offset),
+                                         (GLintptr)counter_offset,
+                                         max_count,
+                                         stride);
+      }
+      else {
+        glMultiDrawElementsIndirect(gl_type,
+                                    index_type,
+                                    reinterpret_cast<GLvoid *>(indirect_offset),
+                                    max_count,
+                                    stride);
+      }
+    }
+    else {
+      glMultiDrawArraysIndirectCount(gl_type,
+                                     reinterpret_cast<GLvoid *>(indirect_offset),
+                                     (GLintptr)counter_offset,
+                                     max_count,
+                                     stride);
+    }
+  }
+  else {
+    if (elem) {
+      const GLIndexBuf *el = this->elem_();
+      GLenum index_type = to_gl(el->index_type_);
+      glMultiDrawElementsIndirect(gl_type,
+                                  index_type,
+                                  reinterpret_cast<GLvoid *>(indirect_offset),
+                                  max_count,
+                                  stride);
+    }
+    else {
+      glMultiDrawArraysIndirect(
+          gl_type, reinterpret_cast<GLvoid *>(indirect_offset), max_count, stride);
+    }
+  }
+
+  /* Unbind. */
+  glBindBuffer(GL_PARAMETER_BUFFER, 0);
+  glBindBuffer(GL_DRAW_INDIRECT_BUFFER, 0);
+}
+
 /** \} */
 
 }  // namespace blender

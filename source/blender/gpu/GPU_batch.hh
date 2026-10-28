@@ -95,6 +95,15 @@ class Batch {
                                    int count,
                                    intptr_t offset,
                                    intptr_t stride) = 0;
+  virtual void multi_draw_indirect_count(gpu::StorageBuf * /*indirect_buf*/,
+                                         gpu::StorageBuf * /*counter_buf*/,
+                                         int /*max_count*/,
+                                         intptr_t /*indirect_offset*/,
+                                         intptr_t /*counter_offset*/,
+                                         intptr_t /*stride*/)
+  {
+  }
+
 
   uint32_t vertex_count_get() const
   {
@@ -371,6 +380,17 @@ void GPU_batch_draw_indirect(gpu::Batch *batch, gpu::StorageBuf *indirect_buf, i
  */
 void GPU_batch_multi_draw_indirect(
     gpu::Batch *batch, gpu::StorageBuf *indirect_buf, int count, intptr_t offset, intptr_t stride);
+
+/**
+ * Issue indirect draw calls with count read directly from a parameter/counter storage buffer.
+ */
+void GPU_batch_multi_draw_indirect_count(gpu::Batch *batch,
+                                         gpu::StorageBuf *indirect_buf,
+                                         gpu::StorageBuf *counter_buf,
+                                         int max_count,
+                                         intptr_t indirect_offset,
+                                         intptr_t counter_offset,
+                                         intptr_t stride);
 
 /**
  * Return indirect draw call parameters for this #gpu::Batch.

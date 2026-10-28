@@ -43,6 +43,11 @@ struct TesseraTelemetry {
     float tex_scale = 1.0f;
     int tex_res_x = 0;
     int tex_res_y = 0;
+    float dispatch_time_ms = 0.0f;
+    float gpu_traverse_ms = 0.0f;
+    float gpu_raster_ms = 0.0f;
+    float gpu_total_ms = 0.0f;
+    uint32_t sync_stalls = 0;
 };
 
 struct TesseraMaterialTextures {

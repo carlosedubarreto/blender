@@ -61,6 +61,7 @@ void TesseraModule::begin_sync()
   std::lock_guard lock(this->mutex_);
   for (auto item : objects_.items()) {
     item.value->used = false;
+    item.value->traversed_this_frame = false;
   }
 }
 
@@ -331,6 +332,11 @@ static void tessera_write_telemetry_to_object(Object *ob,
       idp_float_replace(group, "tessera_stat_tex_scale", telem.tex_scale);
       idp_int_replace(group, "tessera_stat_tex_res_x", telem.tex_res_x);
       idp_int_replace(group, "tessera_stat_tex_res_y", telem.tex_res_y);
+      idp_float_replace(group, "tessera_stat_dispatch_ms", telem.dispatch_time_ms);
+      idp_float_replace(group, "tessera_stat_gpu_traverse_ms", telem.gpu_traverse_ms);
+      idp_float_replace(group, "tessera_stat_gpu_raster_ms", telem.gpu_raster_ms);
+      idp_float_replace(group, "tessera_stat_gpu_total_ms", telem.gpu_total_ms);
+      idp_int_replace(group, "tessera_stat_sync_stalls", int(telem.sync_stalls));
       if (budget != nullptr) {
         idp_float_replace(group, "tessera_stat_vram_resident_mb", float(budget->current_resident_bytes) / (1024.0f * 1024.0f));
         idp_float_replace(group, "tessera_stat_vram_budget_mb", float(budget->max_vram_bytes) / (1024.0f * 1024.0f));
@@ -1154,7 +1160,41 @@ bool TesseraModule::record(Object *ob)
   state.view_source = tessera_view_source_get(ob);
   state.culling_margin = tessera_culling_margin_get(ob);
   state.object_mat = ob->object_to_world();
-  state.materials = tessera_extract_materials(ob);
+
+  /* Material extraction caching: re-extract only when materials or images are updated. */
+  const int totcol = std::max(1, int(ob->totcol));
+  bool materials_dirty = !state.materials_extracted || (state.cached_totcol != totcol);
+  if (!materials_dirty && state.cached_materials.size() == size_t(totcol)) {
+    for (int i = 0; i < totcol; ++i) {
+      void *ma = static_cast<void *>(BKE_object_material_get(ob, i + 1));
+      if (ma != state.cached_materials[i]) {
+        materials_dirty = true;
+        break;
+      }
+    }
+  }
+  else {
+    materials_dirty = true;
+  }
+
+  if (!materials_dirty && inst_.draw_ctx && inst_.draw_ctx->depsgraph) {
+    if (DEG_id_type_updated(inst_.draw_ctx->depsgraph, ID_MA) ||
+        DEG_id_type_updated(inst_.draw_ctx->depsgraph, ID_IM) ||
+        DEG_id_type_updated(inst_.draw_ctx->depsgraph, ID_NT))
+    {
+      materials_dirty = true;
+    }
+  }
+
+  if (materials_dirty) {
+    state.materials = tessera_extract_materials(ob);
+    state.cached_totcol = totcol;
+    state.cached_materials.resize(totcol);
+    for (int i = 0; i < totcol; ++i) {
+      state.cached_materials[i] = static_cast<void *>(BKE_object_material_get(ob, i + 1));
+    }
+    state.materials_extracted = true;
+  }
 
   const bool stale = (state.nc2_path != abs_path) ||
                      (state.file_mtime != file_mtime) ||
@@ -1188,6 +1228,31 @@ void TesseraModule::update_telemetry(ObjectState &state, const float3 &cam_pos)
   const bool show_fps_panel = state.show_fps_panel;
   const bool show_fps_hud = state.show_fps_hud;
 
+  const bool is_navigating = (inst_.rv3d != nullptr) &&
+                             (((inst_.rv3d->rflag & RV3D_NAVIGATING) != 0) || (inst_.rv3d->viewlock != 0));
+
+  bool allow_dna_write = false;
+  if (inst_.rv3d == nullptr) {
+    allow_dna_write = true;
+  }
+  else if (!is_navigating) {
+    auto now_dna = std::chrono::steady_clock::now();
+    if (state.was_navigating || state.last_dna_write_time.time_since_epoch().count() == 0) {
+      allow_dna_write = true;
+      state.last_dna_write_time = now_dna;
+    }
+    else {
+      auto elapsed_dna_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                now_dna - state.last_dna_write_time)
+                                .count();
+      if (elapsed_dna_ms >= 500) {
+        allow_dna_write = true;
+        state.last_dna_write_time = now_dna;
+      }
+    }
+  }
+  state.was_navigating = is_navigating;
+
   if (!show_stats && !log_console && !show_fps_panel && !show_fps_hud) {
     state.last_frame_time = {};
     state.smoothed_dt = 0.0f;
@@ -1195,7 +1260,7 @@ void TesseraModule::update_telemetry(ObjectState &state, const float3 &cam_pos)
   }
 
   /* Compute FPS / frame time metrics if requested. */
-  if (show_fps_panel || show_fps_hud) {
+  if (show_stats || show_fps_panel || show_fps_hud) {
     auto now = std::chrono::steady_clock::now();
     if (state.last_frame_time.time_since_epoch().count() == 0) {
       state.last_frame_time = now;
@@ -1213,7 +1278,7 @@ void TesseraModule::update_telemetry(ObjectState &state, const float3 &cam_pos)
     }
     float fps = (state.smoothed_dt > 1e-5f) ? (1.0f / state.smoothed_dt) : 0.0f;
     float frame_time_ms = state.smoothed_dt * 1000.0f;
-    if (state.ob != nullptr) {
+    if (allow_dna_write && state.ob != nullptr) {
       tessera_write_fps_to_object(state.ob, fps, frame_time_ms);
       if (show_fps_panel) {
         WM_main_add_notifier(NC_OBJECT | ND_DRAW, state.ob);
@@ -1289,7 +1354,7 @@ void TesseraModule::update_telemetry(ObjectState &state, const float3 &cam_pos)
   const int active_res_x = int(base_w * scale);
   const int active_res_y = int(base_h * scale);
 
-  if (state.ob != nullptr) {
+  if (allow_dna_write && state.ob != nullptr) {
     auto write_tex_props = [&](ID *id) {
       if (id == nullptr) return;
       if (IDProperty *group = IDP_EnsureProperties(id)) {
@@ -1312,7 +1377,8 @@ void TesseraModule::update_telemetry(ObjectState &state, const float3 &cam_pos)
     auto elapsed_ms = (state.last_stat_time.time_since_epoch().count() == 0) ?
                           60 :
                           duration_cast<milliseconds>(now - state.last_stat_time).count();
-    if (elapsed_ms >= 60) {
+    const int min_interval_ms = is_navigating ? 100 : 60;
+    if (elapsed_ms >= min_interval_ms) {
       state.last_stat_time = now;
 
       tessera::TesseraTelemetry telem = state.pass ? state.pass->getTelemetry() :
@@ -1356,9 +1422,11 @@ void TesseraModule::update_telemetry(ObjectState &state, const float3 &cam_pos)
       }
       budget = state.pass ? state.pass->getMemoryBudget() : budget;
 
-      if ((show_stats || show_fps_hud) && state.ob != nullptr) {
+      if (allow_dna_write && (show_stats || show_fps_hud) && state.ob != nullptr) {
         tessera_write_telemetry_to_object(state.ob, telem, &budget, total_instances, active_instances);
-        WM_main_add_notifier(NC_OBJECT | ND_DRAW, state.ob);
+        if (show_fps_panel) {
+          WM_main_add_notifier(NC_OBJECT | ND_DRAW, state.ob);
+        }
         if (inst_.scene != nullptr) {
           if (IDProperty *sgroup = IDP_EnsureProperties(&inst_.scene->id)) {
             idp_float_replace(sgroup, "tessera_stat_vram_resident_mb", float(budget.current_resident_bytes) / (1024.0f * 1024.0f));
@@ -1451,11 +1519,18 @@ void TesseraModule::draw_prepass(const draw::View &view,
     const float pixel_error = (state.ob != nullptr) ?
         tessera_pixel_error_get(state.ob) : state.pixel_error;
     state.pixel_error = pixel_error;
-    state.pass->setPixelError(pixel_error);
+    const bool is_navigating = ((inst_.rv3d != nullptr) && (((inst_.rv3d->rflag & RV3D_NAVIGATING) != 0) || inst_.rv3d->viewlock != 0)) ||
+                               ((inst_.scene != nullptr) && (tessera_property_find(reinterpret_cast<Object *>(&inst_.scene->id), "tessera_navigating") != nullptr));
+    float effective_pixel_error = pixel_error;
+    if (is_navigating) {
+      effective_pixel_error *= 2.5f;
+    }
+    state.pass->setPixelError(effective_pixel_error);
     const bool show_stats = state.show_stats;
     const bool log_console = state.log_console;
     const bool show_fps_panel = state.show_fps_panel;
     const bool show_fps_hud = state.show_fps_hud;
+    state.pass->setNavigating(is_navigating);
     state.pass->setTelemetryEnabled(show_stats || log_console || show_fps_panel || show_fps_hud);
     state.pass->update(state.data,
                        object_persmat,
@@ -1463,6 +1538,7 @@ void TesseraModule::draw_prepass(const draw::View &view,
                        float(resolution.y),
                        has_cam_lod ? &lod_object_persmat : nullptr,
                        has_cam_lod ? &lod_proj_scale_y : nullptr);
+    state.traversed_this_frame = true;
 
     if (state.pass->drawCount() != 0) {
       state.pass->draw_prepass(resolution.x, resolution.y);
@@ -1530,7 +1606,14 @@ void TesseraModule::draw(const draw::View &view,
     const float pixel_error = (state.ob != nullptr) ?
         tessera_pixel_error_get(state.ob) : state.pixel_error;
     state.pixel_error = pixel_error;
-    state.pass->setPixelError(pixel_error);
+    const bool is_navigating_draw = ((inst_.rv3d != nullptr) && (((inst_.rv3d->rflag & RV3D_NAVIGATING) != 0) || inst_.rv3d->viewlock != 0)) ||
+                                    ((inst_.scene != nullptr) && (tessera_property_find(reinterpret_cast<Object *>(&inst_.scene->id), "tessera_navigating") != nullptr));
+    float effective_pixel_error = pixel_error;
+    if (is_navigating_draw) {
+      effective_pixel_error *= 2.5f;
+    }
+    state.pass->setPixelError(effective_pixel_error);
+    state.pass->setNavigating(is_navigating_draw);
     tessera::TesseraShadingMode mode = tessera::TESSERA_SHADING_DIFFUSE;
     if (state.visualize_clusters == 1) {
       mode = tessera::TESSERA_SHADING_CLUSTERS;
@@ -1550,12 +1633,15 @@ void TesseraModule::draw(const draw::View &view,
     const bool show_fps_panel = state.show_fps_panel;
     const bool show_fps_hud = state.show_fps_hud;
     state.pass->setTelemetryEnabled(show_stats || log_console || show_fps_panel || show_fps_hud);
-    state.pass->update(state.data,
-                       object_persmat,
-                       viewport_proj_scale_y,
-                       float(resolution.y),
-                       has_cam_lod ? &lod_object_persmat : nullptr,
-                       has_cam_lod ? &lod_proj_scale_y : nullptr);
+    if (!state.traversed_this_frame) {
+      state.pass->update(state.data,
+                         object_persmat,
+                         viewport_proj_scale_y,
+                         float(resolution.y),
+                         has_cam_lod ? &lod_object_persmat : nullptr,
+                         has_cam_lod ? &lod_proj_scale_y : nullptr);
+      state.traversed_this_frame = true;
+    }
 
     update_telemetry(state, view.location());
 
@@ -1649,18 +1735,28 @@ void TesseraModule::draw_gbuffer(const draw::View &view,
     const float pixel_error = (state.ob != nullptr) ?
         tessera_pixel_error_get(state.ob) : state.pixel_error;
     state.pixel_error = pixel_error;
-    state.pass->setPixelError(pixel_error);
+    const bool is_navigating_gbuf = ((inst_.rv3d != nullptr) && (((inst_.rv3d->rflag & RV3D_NAVIGATING) != 0) || inst_.rv3d->viewlock != 0)) ||
+                                    ((inst_.scene != nullptr) && (tessera_property_find(reinterpret_cast<Object *>(&inst_.scene->id), "tessera_navigating") != nullptr));
+    float effective_pixel_error = pixel_error;
+    if (is_navigating_gbuf) {
+      effective_pixel_error *= 2.5f;
+    }
+    state.pass->setPixelError(effective_pixel_error);
+    state.pass->setNavigating(is_navigating_gbuf);
     const bool show_stats = state.show_stats;
     const bool log_console = state.log_console;
     const bool show_fps_panel = state.show_fps_panel;
     const bool show_fps_hud = state.show_fps_hud;
     state.pass->setTelemetryEnabled(show_stats || log_console || show_fps_panel || show_fps_hud);
-    state.pass->update(state.data,
-                       object_persmat,
-                       viewport_proj_scale_y,
-                       float(resolution.y),
-                       has_cam_lod ? &lod_object_persmat : nullptr,
-                       has_cam_lod ? &lod_proj_scale_y : nullptr);
+    if (!state.traversed_this_frame) {
+      state.pass->update(state.data,
+                         object_persmat,
+                         viewport_proj_scale_y,
+                         float(resolution.y),
+                         has_cam_lod ? &lod_object_persmat : nullptr,
+                         has_cam_lod ? &lod_proj_scale_y : nullptr);
+      state.traversed_this_frame = true;
+    }
 
     update_telemetry(state, view.location());
 

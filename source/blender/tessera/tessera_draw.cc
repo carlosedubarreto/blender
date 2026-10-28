@@ -109,7 +109,11 @@ void TesseraDrawPass::update(const TesseraData &data,
         }
     }
     else {
-        data_ = data;
+        if (&data_ != &data && (data_.clusters.size() != data.clusters.size() ||
+                                data_.indices.size() != data.indices.size() ||
+                                data_.positions.size() != data.positions.size())) {
+            data_ = data;
+        }
     }
 }
 
@@ -192,6 +196,15 @@ void TesseraDrawPass::draw_prepass(int viewportWidth, int viewportHeight) const
 void TesseraDrawPass::draw_gbuffer(int viewportWidth, int viewportHeight, const float4x4 &object_model) const
 {
     renderer_.draw_gbuffer(viewportWidth, viewportHeight, object_model);
+}
+
+void TesseraDrawPass::draw_forward(const float4x4 &model_mat,
+                                   int viewportWidth,
+                                   int viewportHeight,
+                                   int lighting_type,
+                                   const float4 &base_color) const
+{
+    renderer_.draw_forward(model_mat, viewportWidth, viewportHeight, lighting_type, base_color);
 }
 
 size_t TesseraDrawPass::drawCount(uint32_t material_index) const

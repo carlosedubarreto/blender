@@ -57,9 +57,15 @@ class TesseraModule {
     bool show_fps_hud = false;
     std::chrono::steady_clock::time_point last_frame_time{};
     std::chrono::steady_clock::time_point last_stat_time{};
+    std::chrono::steady_clock::time_point last_dna_write_time{};
+    bool was_navigating = false;
     float smoothed_dt = 0.0f;
     tessera::TesseraData data;
     std::vector<tessera::TesseraMaterialTextures> materials;
+    std::vector<void *> cached_materials;
+    int cached_totcol = -1;
+    bool materials_extracted = false;
+    bool traversed_this_frame = false;
     std::unique_ptr<tessera::TesseraDrawPass> pass;
     float current_tex_scale = 1.0f;
   };

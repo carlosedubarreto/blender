@@ -99,6 +99,8 @@ class Instance : public DrawEngine {
     bool show_fps_panel = false;
     bool show_fps_hud = false;
     std::chrono::steady_clock::time_point last_frame_time{};
+    std::chrono::steady_clock::time_point last_dna_write_time{};
+    bool was_navigating = false;
     float smoothed_dt = 0.0f;
     tessera::TesseraData data;
     std::unique_ptr<tessera::TesseraDrawPass> pass;
@@ -396,6 +398,11 @@ class Instance : public DrawEngine {
         idp_float_replace(group, "tessera_stat_tex_scale", telem.tex_scale);
         idp_int_replace(group, "tessera_stat_tex_res_x", telem.tex_res_x);
         idp_int_replace(group, "tessera_stat_tex_res_y", telem.tex_res_y);
+        idp_float_replace(group, "tessera_stat_dispatch_ms", telem.dispatch_time_ms);
+        idp_float_replace(group, "tessera_stat_gpu_traverse_ms", telem.gpu_traverse_ms);
+        idp_float_replace(group, "tessera_stat_gpu_raster_ms", telem.gpu_raster_ms);
+        idp_float_replace(group, "tessera_stat_gpu_total_ms", telem.gpu_total_ms);
+        idp_int_replace(group, "tessera_stat_sync_stalls", int(telem.sync_stalls));
         if (budget != nullptr) {
           idp_float_replace(group, "tessera_stat_vram_resident_mb", float(budget->current_resident_bytes) / (1024.0f * 1024.0f));
           idp_float_replace(group, "tessera_stat_vram_budget_mb", float(budget->max_vram_bytes) / (1024.0f * 1024.0f));
@@ -676,6 +683,49 @@ class Instance : public DrawEngine {
       const bool show_fps_panel = state.show_fps_panel;
       const bool show_fps_hud = state.show_fps_hud;
       state.pass->setTelemetryEnabled(show_stats || log_console || show_fps_hud || show_fps_panel);
+
+      bool is_navigating = false;
+      if (this->draw_ctx != nullptr && this->draw_ctx->rv3d != nullptr) {
+        is_navigating = ((this->draw_ctx->rv3d->rflag & RV3D_NAVIGATING) != 0) || (this->draw_ctx->rv3d->viewlock != 0);
+      }
+      if (scene_state_.scene != nullptr) {
+        if (IDProperty *sgroup = IDP_GetProperties(&scene_state_.scene->id)) {
+          if (IDProperty *prop = IDP_GetPropertyFromGroup(sgroup, "tessera_navigating")) {
+            if (prop->type == IDP_INT && IDP_int_get(prop) != 0) {
+              is_navigating = true;
+            }
+          }
+        }
+      }
+      bool allow_dna_write = false;
+      if (this->draw_ctx == nullptr || this->draw_ctx->rv3d == nullptr) {
+        allow_dna_write = true;
+      }
+      else if (!is_navigating) {
+        auto now_dna = std::chrono::steady_clock::now();
+        if (state.was_navigating || state.last_dna_write_time.time_since_epoch().count() == 0) {
+          allow_dna_write = true;
+          state.last_dna_write_time = now_dna;
+        }
+        else {
+          auto elapsed_dna_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                    now_dna - state.last_dna_write_time)
+                                    .count();
+          if (elapsed_dna_ms >= 500) {
+            allow_dna_write = true;
+            state.last_dna_write_time = now_dna;
+          }
+        }
+      }
+      state.was_navigating = is_navigating;
+
+      float effective_pixel_error = pixel_error;
+      if (is_navigating) {
+        effective_pixel_error *= 2.5f;
+      }
+      state.pass->setPixelError(effective_pixel_error);
+      state.pass->setNavigating(is_navigating);
+
       state.pass->update(state.data,
                          object_persmat,
                          viewport_proj_scale_y,
@@ -697,7 +747,7 @@ class Instance : public DrawEngine {
         }
         float fps = (state.smoothed_dt > 1e-5f) ? (1.0f / state.smoothed_dt) : 0.0f;
         float frame_time_ms = state.smoothed_dt * 1000.0f;
-        if (state.ob != nullptr) {
+        if (allow_dna_write && state.ob != nullptr) {
           tessera_write_fps_to_object(state.ob, fps, frame_time_ms);
         }
       }
@@ -761,9 +811,11 @@ class Instance : public DrawEngine {
           }
           budget = state.pass ? state.pass->getMemoryBudget() : budget;
 
-          if ((show_stats || show_fps_hud) && state.ob != nullptr) {
+          if (allow_dna_write && (show_stats || show_fps_hud) && state.ob != nullptr) {
             tessera_write_telemetry_to_object(state.ob, telem, &budget, total_instances, active_instances);
-            WM_main_add_notifier(NC_OBJECT | ND_DRAW, state.ob);
+            if (!is_navigating) {
+              WM_main_add_notifier(NC_OBJECT | ND_DRAW, state.ob);
+            }
             if (scene_state_.scene != nullptr) {
               if (IDProperty *sgroup = IDP_EnsureProperties(&scene_state_.scene->id)) {
                 idp_float_replace(sgroup, "tessera_stat_vram_resident_mb", float(budget.current_resident_bytes) / (1024.0f * 1024.0f));
@@ -793,7 +845,18 @@ class Instance : public DrawEngine {
       }
 
       if (state.pass->drawCount() != 0) {
-        state.pass->draw(resolution.x, resolution.y);
+        int lighting_type = (scene_state_.shading.light == V3D_LIGHTING_FLAT) ? 0 : 1;
+        float4 base_col(0.8f, 0.8f, 0.8f, 1.0f);
+        if (scene_state_.shading.color_type == V3D_SHADING_SINGLE_COLOR) {
+          base_col = float4(scene_state_.shading.single_color[0],
+                            scene_state_.shading.single_color[1],
+                            scene_state_.shading.single_color[2],
+                            1.0f);
+        }
+        else if (scene_state_.shading.color_type == V3D_SHADING_OBJECT_COLOR && state.ob != nullptr) {
+          base_col = float4(state.ob->color[0], state.ob->color[1], state.ob->color[2], 1.0f);
+        }
+        state.pass->draw_forward(state.object_mat, resolution.x, resolution.y, lighting_type, base_col);
       }
     }
   }

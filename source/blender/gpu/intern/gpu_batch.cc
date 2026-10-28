@@ -486,6 +486,28 @@ void GPU_batch_multi_draw_indirect(
   batch->multi_draw_indirect(indirect_buf, count, offset, stride);
 }
 
+void GPU_batch_multi_draw_indirect_count(Batch *batch,
+                                         gpu::StorageBuf *indirect_buf,
+                                         gpu::StorageBuf *counter_buf,
+                                         int max_count,
+                                         intptr_t indirect_offset,
+                                         intptr_t counter_offset,
+                                         intptr_t stride)
+{
+  BLI_assert(batch != nullptr);
+  BLI_assert(indirect_buf != nullptr);
+  BLI_assert(counter_buf != nullptr);
+  BLI_assert(Context::get()->shader != nullptr);
+  Context::get()->assert_framebuffer_shader_compatibility(Context::get()->shader);
+
+#ifndef NDEBUG
+  debug_validate_binding_image_format();
+#endif
+
+  batch->multi_draw_indirect_count(
+      indirect_buf, counter_buf, max_count, indirect_offset, counter_offset, stride);
+}
+
 /** \} */
 
 /* -------------------------------------------------------------------- */

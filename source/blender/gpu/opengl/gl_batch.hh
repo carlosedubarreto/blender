@@ -95,6 +95,12 @@ class GLBatch : public Batch {
                            int count,
                            intptr_t offset,
                            intptr_t stride) override;
+  void multi_draw_indirect_count(StorageBuf *indirect_buf,
+                                 StorageBuf *counter_buf,
+                                 int max_count,
+                                 intptr_t indirect_offset,
+                                 intptr_t counter_offset,
+                                 intptr_t stride) override;
   void bind();
 
   /* Convenience getters. */

@@ -22,11 +22,24 @@
 #include "GPU_vertex_buffer.hh"
 #include "GPU_vertex_format.hh"
 
+#include <BLI_math_matrix.hh>
+
 #include <cstdio>
 #include <cstring>
 
 namespace blender {
 namespace tessera {
+
+static float3x3 compute_normal_matrix(const float4x4 &model_mat)
+{
+    float3x3 m3(model_mat);
+    bool success = false;
+    float3x3 inv = math::invert(m3, success);
+    if (!success) {
+        return float3x3::identity();
+    }
+    return math::transpose(inv);
+}
 
 namespace {
 
@@ -56,12 +69,9 @@ void main()
   vec3 pos = vec3(positions[idx * 3u], positions[idx * 3u + 1u],
                   positions[idx * 3u + 2u]);
   gl_Position = view_proj * vec4(pos, 1.0);
-  if (reverse_z != 0) {
-    gl_Position.z = -gl_Position.z;
-  }
 
   bary = vec2(corner == 0u ? 1.0 : 0.0, corner == 1u ? 1.0 : 0.0);
-  tri_id = global_idx / 3u;
+  tri_id = (global_idx / 3u) + 1u;
 
   cluster_id = 0u;
   if (debug_clusters != 0) {
@@ -85,7 +95,7 @@ void main()
 
 /* ---------------------------------------------------------------------------
  * Material pass: fetch the visibility record, reconstruct the attributes and
- * shade. The background is encoded with tri_id == 0xFFFFFFFF.
+ * shade. The background is encoded with tri_id == 0 or 0xFFFFFFFF.
  * ------------------------------------------------------------------------- */
 
 static const char *MATERIAL_VERT_SOURCE = R"(
@@ -100,12 +110,12 @@ void main()
 {
   ivec2 px = ivec2(gl_FragCoord.xy);
   uvec4 vis = texelFetch(vis_texture, px, 0);
-  uint tri = vis.x;
-  if (tri == 0xFFFFFFFFu) {
-    /* No Tessera geometry here: leave the target pixel untouched so the pass
-     * can composite over an existing scene render (draw-manager path). */
+  if (vis.x == 0u || vis.x == 0xFFFFFFFFu) {
+    /* No Tessera geometry here: discard immediately to avoid running expensive
+     * fragment math, texture fetches, and depth reconstruction. */
     discard;
   }
+  uint tri = vis.x - 1u;
   float depth_val = texelFetch(depth_texture, px, 0).r;
   gl_FragDepth = depth_val;
   vec2 bary_xy = unpackHalf2x16(vis.y);
@@ -241,7 +251,7 @@ void main()
   float roughness = clamp(has_r ? tex_rough : rough_val, 0.001, 1.0);
 
   /* MikkTSpace normal perturbation in world space using vertex normal and 4D tangent */
-  mat3 norm_mat = transpose(inverse(mat3(model_mat)));
+  mat3 norm_mat = normal_mat;
   vec3 world_nor = normalize(norm_mat * nor);
 
   vec3 m_tan = mat3(model_mat) * tan_v.xyz;
@@ -337,10 +347,10 @@ void main()
 {
   ivec2 px = ivec2(gl_FragCoord.xy);
   uvec4 vis = texelFetch(vis_texture, px, 0);
-  uint tri = vis.x;
-  if (tri == 0xFFFFFFFFu) {
+  if (vis.x == 0u || vis.x == 0xFFFFFFFFu) {
     discard;
   }
+  uint tri = vis.x - 1u;
   float depth_val = texelFetch(depth_texture, px, 0).r;
   gl_FragDepth = depth_val;
   vec2 bary_xy = unpackHalf2x16(vis.y);
@@ -443,7 +453,7 @@ void main()
   vec4 albedo = has_d ? (tex_diff * vec4(base_col.rgb, 1.0)) : vec4(base_col.rgb, 1.0);
   float roughness = clamp(has_r ? tex_rough : rough_val, 0.001, 1.0);
 
-  mat3 norm_mat = transpose(inverse(mat3(model_mat)));
+  mat3 norm_mat = normal_mat;
   vec3 world_nor = normalize(norm_mat * nor);
 
   vec3 m_tan = mat3(model_mat) * tan_v.xyz;
@@ -503,9 +513,6 @@ void main()
   vec3 pos = vec3(positions[idx * 3u], positions[idx * 3u + 1u],
                   positions[idx * 3u + 2u]);
   gl_Position = view_proj * vec4(pos, 1.0);
-  if (reverse_z != 0) {
-    gl_Position.z = -gl_Position.z;
-  }
 }
 )";
 
@@ -598,6 +605,7 @@ gpu::Shader *createMaterialShader()
     info.sampler(13, ImageType::Float2D, "tex_rough_3");
 
     info.push_constant(Type::float4x4_t, "model_mat");
+    info.push_constant(Type::float3x3_t, "normal_mat");
     info.push_constant(Type::float3_t, "camera_pos");
     info.push_constant(Type::int_t, "shading_mode");
     info.push_constant(Type::int_t, "reverse_z");
@@ -681,8 +689,140 @@ gpu::Shader *createGbufferShader()
     info.sampler(13, ImageType::Float2D, "tex_rough_3");
 
     info.push_constant(Type::float4x4_t, "model_mat");
+    info.push_constant(Type::float3x3_t, "normal_mat");
     info.push_constant(Type::int_t, "reverse_z");
     info.push_constant(Type::float_t, "tex_scale_inv");
+
+    const GPUShaderCreateInfo *raw = reinterpret_cast<const GPUShaderCreateInfo *>(&info);
+    return GPU_shader_create_from_info_python(raw);
+}
+
+static const char *FORWARD_VERT_SOURCE = R"(
+void main()
+{
+  uint global_idx = vid;
+  uint idx = tri_indices[global_idx];
+  vec3 pos = vec3(positions[idx * 3u], positions[idx * 3u + 1u], positions[idx * 3u + 2u]);
+  vec3 nor = vec3(normals[idx * 3u], normals[idx * 3u + 1u], normals[idx * 3u + 2u]);
+
+  vec4 world_pos = model_mat * vec4(pos, 1.0);
+  gl_Position = view_proj * vec4(pos, 1.0);
+
+  mat3 norm_mat = normal_mat;
+  vec3 n = norm_mat * nor;
+  float len_n = length(n);
+  v_world_normal = (len_n > 1e-6) ? (n / len_n) : nor;
+  v_world_pos = world_pos.xyz;
+
+  v_cluster_id = 0u;
+  if (debug_clusters != 0) {
+    for (uint c = 0u; c < uint(cluster_count); ++c) {
+      uvec4 meta = cluster_meta[c];
+      if (global_idx >= meta.x && global_idx < meta.x + meta.y) {
+        v_cluster_id = c;
+        break;
+      }
+    }
+  }
+}
+)";
+
+static const char *FORWARD_FRAG_SOURCE = R"(
+void main()
+{
+  if (shading_mode == 1) { /* TESSERA_SHADING_CLUSTERS */
+    uint cid = v_cluster_id;
+    uint h = cid * 747796405u + 2891336453u;
+    h = ((h >> ((h >> 28u) + 4u)) ^ h) * 277803737u;
+    h = (h >> 22u) ^ h;
+    vec3 col = vec3(float((h >> 16u) & 0xFFu) / 255.0,
+                    float((h >> 8u) & 0xFFu) / 255.0,
+                    float(h & 0xFFu) / 255.0);
+    vec3 N = normalize(v_world_normal);
+    if (!gl_FrontFacing) {
+      N = -N;
+    }
+    vec3 L = normalize(camera_pos - v_world_pos);
+    float NdotL = clamp(dot(N, L), 0.0, 1.0);
+    out_color = vec4(col * (0.35 + 0.65 * NdotL), 1.0);
+    return;
+  }
+  if (shading_mode == 2) { /* TESSERA_SHADING_NORMALS */
+    vec3 N = normalize(v_world_normal);
+    if (!gl_FrontFacing) {
+      N = -N;
+    }
+    out_color = vec4(N * 0.5 + 0.5, 1.0);
+    return;
+  }
+  if (shading_mode == 3) { /* TESSERA_SHADING_TANGENTS */
+    out_color = vec4(0.5, 0.5, 1.0, 1.0);
+    return;
+  }
+  if (shading_mode == 4) { /* TESSERA_SHADING_UVS */
+    out_color = vec4(0.8, 0.8, 0.8, 1.0);
+    return;
+  }
+
+  /* Default Solid View (Workbench studio / flat shading) */
+  vec3 N = normalize(v_world_normal);
+  if (!gl_FrontFacing) {
+    N = -N;
+  }
+
+  if (lighting_type == 0) {
+    /* Flat shading */
+    out_color = base_color;
+  }
+  else {
+    /* Studio / Headlight shading */
+    vec3 L = normalize(camera_pos - v_world_pos);
+    float NdotL = clamp(dot(N, L), 0.0, 1.0);
+    vec3 H = normalize(L + vec3(0.2, 0.3, 0.1));
+    float NdotH = clamp(dot(N, H), 0.0, 1.0);
+    float spec = pow(NdotH, 32.0) * 0.25;
+    vec3 col = base_color.rgb * (0.25 + 0.75 * NdotL) + vec3(spec);
+    out_color = vec4(col, base_color.a);
+  }
+}
+)";
+
+/** Create the direct forward rasterization shader for Workbench Solid mode. */
+gpu::Shader *createForwardShader()
+{
+    using namespace blender::gpu::shader;
+
+    ShaderCreateInfo info("pyGPU_Shader");
+    info.builtins_ |= BuiltinBits::NO_BUFFER_TYPE_LINTING;
+
+    info.vertex_source("tessera_forward");
+    info.vertex_source_generated = FORWARD_VERT_SOURCE;
+    info.fragment_source("tessera_forward");
+    info.fragment_source_generated = FORWARD_FRAG_SOURCE;
+
+    info.vertex_in(0, Type::uint_t, "vid");
+    info.fragment_out(0, Type::float4_t, "out_color");
+
+    info.storage_buf(0, Qualifier::read, "uint", "tri_indices[]");
+    info.storage_buf(1, Qualifier::read, "float", "positions[]");
+    info.storage_buf(2, Qualifier::read, "float", "normals[]");
+    info.storage_buf(3, Qualifier::read, "uvec4", "cluster_meta[]");
+
+    info.push_constant(Type::float4x4_t, "view_proj");
+    info.push_constant(Type::float4x4_t, "model_mat");
+    info.push_constant(Type::float3x3_t, "normal_mat");
+    info.push_constant(Type::float3_t, "camera_pos");
+    info.push_constant(Type::float4_t, "base_color");
+    info.push_constant(Type::int_t, "shading_mode");
+    info.push_constant(Type::int_t, "lighting_type");
+    info.push_constant(Type::int_t, "cluster_count");
+    info.push_constant(Type::int_t, "debug_clusters");
+
+    StageInterfaceInfo iface("tessera_forward_iface", "");
+    iface.smooth(Type::float3_t, "v_world_pos");
+    iface.smooth(Type::float3_t, "v_world_normal");
+    iface.flat(Type::uint_t, "v_cluster_id");
+    info.vertex_out(iface);
 
     const GPUShaderCreateInfo *raw = reinterpret_cast<const GPUShaderCreateInfo *>(&info);
     return GPU_shader_create_from_info_python(raw);
@@ -766,6 +906,7 @@ void TesseraVisibilityPass::terminate()
     GPU_SHADER_FREE_SAFE(mMaterialShader);
     GPU_SHADER_FREE_SAFE(mDepthPrepassShader);
     GPU_SHADER_FREE_SAFE(mGbufferShader);
+    GPU_SHADER_FREE_SAFE(mForwardShader);
     if (mPositionsBuf != nullptr) { GPU_storagebuf_free(mPositionsBuf); mPositionsBuf = nullptr; }
     if (mNormalsBuf != nullptr) { GPU_storagebuf_free(mNormalsBuf); mNormalsBuf = nullptr; }
     if (mUvsBuf != nullptr) { GPU_storagebuf_free(mUvsBuf); mUvsBuf = nullptr; }
@@ -887,7 +1028,8 @@ void TesseraVisibilityPass::render(gpu::StorageBuf *command_buf,
                                   const float4x4 &object_model,
                                   bool reverse_z,
                                   const std::vector<uint32_t> *material_counts,
-                                  uint32_t max_commands_per_material)
+                                  uint32_t max_commands_per_material,
+                                  gpu::StorageBuf *counter_buf)
 {
     if (command_buf == nullptr || draw_count == 0 || mVisShader == nullptr ||
         mMaterialShader == nullptr || mPositionsBuf == nullptr ||
@@ -904,12 +1046,13 @@ void TesseraVisibilityPass::render(gpu::StorageBuf *command_buf,
 
     gpu::FrameBuffer *previous_fb = GPU_framebuffer_active_get();
 
-    /* Encode "no geometry" as tri_id == 0xFFFFFFFF. */
-    const uint32_t clear_value[4] = {0xFFFFFFFFu, 0u, 0u, 0u};
+    /* Encode "no geometry" as 0u (and 0xFFFFFFFF). */
+    const uint32_t clear_value[4] = {0u, 0u, 0u, 0u};
     GPU_texture_clear(
         mVisTexture, GPU_DATA_UINT, static_cast<const void *>(clear_value));
 
     (void)object_model;
+    (void)counter_buf;
 
     /* ---------------- Pass 1: visibility ---------------- */
     GPU_framebuffer_bind(mFrameBuffer);
@@ -1038,13 +1181,66 @@ void TesseraVisibilityPass::render(gpu::StorageBuf *command_buf,
     }
 
     GPU_shader_uniform_mat4(mMaterialShader, "model_mat", object_model.ptr());
+    float3x3 mat_norm = compute_normal_matrix(object_model);
+    GPU_shader_uniform_mat3(mMaterialShader, "normal_mat", reinterpret_cast<const float(*)[3]>(mat_norm.ptr()));
     GPU_shader_uniform_3f(
         mMaterialShader, "camera_pos", cam_pos.x, cam_pos.y, cam_pos.z);
     GPU_shader_uniform_1i(mMaterialShader, "shading_mode", shading_mode);
     GPU_shader_uniform_1i(mMaterialShader, "reverse_z", reverse_z ? 1 : 0);
     GPU_shader_uniform_1f(mMaterialShader, "tex_scale_inv", 1.0f / mTextureScale);
 
+    bool use_scissor = false;
+    int sc_x = 0, sc_y = 0, sc_w = viewport_width, sc_h = viewport_height;
+    float bmin[3] = {mBoundsMin[0], mBoundsMin[1], mBoundsMin[2]};
+    float bmax[3] = {mBoundsMax[0], mBoundsMax[1], mBoundsMax[2]};
+    if (bmin[0] < bmax[0] && bmin[1] < bmax[1] && bmin[2] < bmax[2]) {
+        float min_x = 1e9f, min_y = 1e9f;
+        float max_x = -1e9f, max_y = -1e9f;
+        bool all_front = true;
+        float4x4 mvp = viewProj;
+        for (int i = 0; i < 8; ++i) {
+            float4 corner(
+                (i & 1) ? bmax[0] : bmin[0],
+                (i & 2) ? bmax[1] : bmin[1],
+                (i & 4) ? bmax[2] : bmin[2],
+                1.0f
+            );
+            float4 clip = mvp * corner;
+            if (clip.w <= 0.001f) {
+                all_front = false;
+                break;
+            }
+            float inv_w = 1.0f / clip.w;
+            float sx = (clip.x * inv_w * 0.5f + 0.5f) * float(viewport_width);
+            float sy = (clip.y * inv_w * 0.5f + 0.5f) * float(viewport_height);
+            min_x = std::min(min_x, sx);
+            min_y = std::min(min_y, sy);
+            max_x = std::max(max_x, sx);
+            max_y = std::max(max_y, sy);
+        }
+        if (all_front && max_x > min_x && max_y > min_y) {
+            int px0 = std::clamp(int(std::floor(min_x)) - 2, 0, viewport_width);
+            int py0 = std::clamp(int(std::floor(min_y)) - 2, 0, viewport_height);
+            int px1 = std::clamp(int(std::ceil(max_x)) + 2, 0, viewport_width);
+            int py1 = std::clamp(int(std::ceil(max_y)) + 2, 0, viewport_height);
+            if (px1 > px0 && py1 > py0) {
+                sc_x = px0;
+                sc_y = py0;
+                sc_w = px1 - px0;
+                sc_h = py1 - py0;
+                use_scissor = true;
+            }
+        }
+    }
+
+    if (use_scissor) {
+        GPU_scissor_test(true);
+        GPU_scissor(sc_x, sc_y, sc_w, sc_h);
+    }
     GPU_batch_draw(mFullscreenBatch);
+    if (use_scissor) {
+        GPU_scissor_test(false);
+    }
 }
 
 void TesseraVisibilityPass::render_depth_prepass(gpu::StorageBuf *command_buf,
@@ -1054,7 +1250,8 @@ void TesseraVisibilityPass::render_depth_prepass(gpu::StorageBuf *command_buf,
                                                 int viewport_height,
                                                 bool reverse_z,
                                                 const std::vector<uint32_t> *material_counts,
-                                                uint32_t max_commands_per_material)
+                                                uint32_t max_commands_per_material,
+                                                gpu::StorageBuf *counter_buf)
 {
     if (command_buf == nullptr || draw_count == 0 || mMeshBatch == nullptr ||
         mPositionsBuf == nullptr || mIndicesBuf == nullptr)
@@ -1070,6 +1267,8 @@ void TesseraVisibilityPass::render_depth_prepass(gpu::StorageBuf *command_buf,
             return;
         }
     }
+
+    (void)counter_buf;
 
     GPU_clip_control_unit_range(reverse_z);
     GPU_depth_test(reverse_z ? GPU_DEPTH_GREATER_EQUAL : GPU_DEPTH_LESS_EQUAL);
@@ -1110,7 +1309,8 @@ void TesseraVisibilityPass::render_gbuffer(gpu::StorageBuf *command_buf,
                                           const float4x4 &object_model,
                                           bool reverse_z,
                                           const std::vector<uint32_t> *material_counts,
-                                          uint32_t max_commands_per_material)
+                                          uint32_t max_commands_per_material,
+                                          gpu::StorageBuf *counter_buf)
 {
     if (command_buf == nullptr || draw_count == 0 || mVisShader == nullptr ||
         mPositionsBuf == nullptr || mMeshBatch == nullptr)
@@ -1131,10 +1331,11 @@ void TesseraVisibilityPass::render_gbuffer(gpu::StorageBuf *command_buf,
     }
 
     (void)cam_pos;
+    (void)counter_buf;
     gpu::FrameBuffer *target_gbuffer_fb = GPU_framebuffer_active_get();
 
-    /* Encode "no geometry" as tri_id == 0xFFFFFFFF. */
-    const uint32_t clear_value[4] = {0xFFFFFFFFu, 0u, 0u, 0u};
+    /* Encode "no geometry" as 0u (and 0xFFFFFFFF). */
+    const uint32_t clear_value[4] = {0u, 0u, 0u, 0u};
     GPU_texture_clear(mVisTexture, GPU_DATA_UINT, static_cast<const void *>(clear_value));
 
     /* ---------------- Pass 1: visibility ---------------- */
@@ -1261,10 +1462,63 @@ void TesseraVisibilityPass::render_gbuffer(gpu::StorageBuf *command_buf,
     }
 
     GPU_shader_uniform_mat4(mGbufferShader, "model_mat", object_model.ptr());
+    float3x3 gbuf_norm = compute_normal_matrix(object_model);
+    GPU_shader_uniform_mat3(mGbufferShader, "normal_mat", reinterpret_cast<const float(*)[3]>(gbuf_norm.ptr()));
     GPU_shader_uniform_1i(mGbufferShader, "reverse_z", reverse_z ? 1 : 0);
     GPU_shader_uniform_1f(mGbufferShader, "tex_scale_inv", 1.0f / mTextureScale);
 
+    bool use_scissor = false;
+    int sc_x = 0, sc_y = 0, sc_w = viewport_width, sc_h = viewport_height;
+    float bmin[3] = {mBoundsMin[0], mBoundsMin[1], mBoundsMin[2]};
+    float bmax[3] = {mBoundsMax[0], mBoundsMax[1], mBoundsMax[2]};
+    if (bmin[0] < bmax[0] && bmin[1] < bmax[1] && bmin[2] < bmax[2]) {
+        float min_x = 1e9f, min_y = 1e9f;
+        float max_x = -1e9f, max_y = -1e9f;
+        bool all_front = true;
+        float4x4 mvp = viewProj;
+        for (int i = 0; i < 8; ++i) {
+            float4 corner(
+                (i & 1) ? bmax[0] : bmin[0],
+                (i & 2) ? bmax[1] : bmin[1],
+                (i & 4) ? bmax[2] : bmin[2],
+                1.0f
+            );
+            float4 clip = mvp * corner;
+            if (clip.w <= 0.001f) {
+                all_front = false;
+                break;
+            }
+            float inv_w = 1.0f / clip.w;
+            float sx = (clip.x * inv_w * 0.5f + 0.5f) * float(viewport_width);
+            float sy = (clip.y * inv_w * 0.5f + 0.5f) * float(viewport_height);
+            min_x = std::min(min_x, sx);
+            min_y = std::min(min_y, sy);
+            max_x = std::max(max_x, sx);
+            max_y = std::max(max_y, sy);
+        }
+        if (all_front && max_x > min_x && max_y > min_y) {
+            int px0 = std::clamp(int(std::floor(min_x)) - 2, 0, viewport_width);
+            int py0 = std::clamp(int(std::floor(min_y)) - 2, 0, viewport_height);
+            int px1 = std::clamp(int(std::ceil(max_x)) + 2, 0, viewport_width);
+            int py1 = std::clamp(int(std::ceil(max_y)) + 2, 0, viewport_height);
+            if (px1 > px0 && py1 > py0) {
+                sc_x = px0;
+                sc_y = py0;
+                sc_w = px1 - px0;
+                sc_h = py1 - py0;
+                use_scissor = true;
+            }
+        }
+    }
+
+    if (use_scissor) {
+        GPU_scissor_test(true);
+        GPU_scissor(sc_x, sc_y, sc_w, sc_h);
+    }
     GPU_batch_draw(mFullscreenBatch);
+    if (use_scissor) {
+        GPU_scissor_test(false);
+    }
 }
 
 
@@ -1273,6 +1527,13 @@ void TesseraVisibilityPass::set_data(const TesseraData &data)
     if (!gpu_available()) {
         return;
     }
+    mBoundsMin[0] = data.header.boundsMin[0];
+    mBoundsMin[1] = data.header.boundsMin[1];
+    mBoundsMin[2] = data.header.boundsMin[2];
+    mBoundsMax[0] = data.header.boundsMax[0];
+    mBoundsMax[1] = data.header.boundsMax[1];
+    mBoundsMax[2] = data.header.boundsMax[2];
+
     const size_t vertex_count = data.positions.size();
     const size_t index_count = data.indices.size();
     const size_t cluster_count = data.clusters.size();
@@ -1316,6 +1577,78 @@ void TesseraVisibilityPass::set_data(const TesseraData &data)
         "tessera_tri_materials");
 
     upload_dirty_data();
+}
+
+void TesseraVisibilityPass::render_forward(gpu::StorageBuf *command_buf,
+                                          size_t draw_count,
+                                          const float4x4 &viewProj,
+                                          const float4x4 &model_mat,
+                                          const float3 &cam_pos,
+                                          int viewport_width,
+                                          int viewport_height,
+                                          int shading_mode,
+                                          int lighting_type,
+                                          const float4 &base_color,
+                                          const std::vector<uint32_t> *material_counts,
+                                          uint32_t max_commands_per_material,
+                                          gpu::StorageBuf *counter_buf)
+{
+    if (command_buf == nullptr || draw_count == 0 || mMeshBatch == nullptr ||
+        mPositionsBuf == nullptr || mIndicesBuf == nullptr || mNormalsBuf == nullptr)
+    {
+        return;
+    }
+    if (viewport_width <= 0 || viewport_height <= 0) {
+        return;
+    }
+    if (mForwardShader == nullptr) {
+        mForwardShader = createForwardShader();
+        if (mForwardShader == nullptr) {
+            return;
+        }
+    }
+
+    (void)counter_buf;
+
+    GPU_clip_control_unit_range(false);
+    GPU_depth_test(GPU_DEPTH_LESS_EQUAL);
+    GPU_depth_mask(true);
+    GPU_color_mask(true, true, true, true);
+    GPU_face_culling(GPU_CULL_NONE);
+    GPU_blend(GPU_BLEND_NONE);
+
+    GPU_shader_bind(mForwardShader);
+    GPU_storagebuf_bind(mIndicesBuf, 0);
+    GPU_storagebuf_bind(mPositionsBuf, 1);
+    GPU_storagebuf_bind(mNormalsBuf, 2);
+    if (mClusterMetaBuf != nullptr) {
+        GPU_storagebuf_bind(mClusterMetaBuf, 3);
+    }
+
+    GPU_shader_uniform_mat4(mForwardShader, "view_proj", viewProj.ptr());
+    GPU_shader_uniform_mat4(mForwardShader, "model_mat", model_mat.ptr());
+    float3x3 fwd_norm = compute_normal_matrix(model_mat);
+    GPU_shader_uniform_mat3(mForwardShader, "normal_mat", reinterpret_cast<const float(*)[3]>(fwd_norm.ptr()));
+    GPU_shader_uniform_3f(mForwardShader, "camera_pos", cam_pos.x, cam_pos.y, cam_pos.z);
+    GPU_shader_uniform_4f(mForwardShader, "base_color", base_color.x, base_color.y, base_color.z, base_color.w);
+    GPU_shader_uniform_1i(mForwardShader, "shading_mode", shading_mode);
+    GPU_shader_uniform_1i(mForwardShader, "lighting_type", lighting_type);
+    GPU_shader_uniform_1i(mForwardShader, "cluster_count", int(mClusterCount));
+    GPU_shader_uniform_1i(mForwardShader, "debug_clusters", shading_mode == TESSERA_SHADING_CLUSTERS ? 1 : 0);
+
+    if (material_counts != nullptr && !material_counts->empty() && max_commands_per_material > 0) {
+        for (size_t mat = 0; mat < material_counts->size(); ++mat) {
+            uint32_t count = (*material_counts)[mat];
+            if (count == 0) continue;
+            intptr_t offset = intptr_t(mat) * max_commands_per_material * sizeof(uint32_t) * 4;
+            GPU_batch_multi_draw_indirect(
+                mMeshBatch, command_buf, int(count), offset, sizeof(uint32_t) * 4);
+        }
+    }
+    else {
+        GPU_batch_multi_draw_indirect(
+            mMeshBatch, command_buf, int(draw_count), 0, sizeof(uint32_t) * 4);
+    }
 }
 
 }  // namespace tessera

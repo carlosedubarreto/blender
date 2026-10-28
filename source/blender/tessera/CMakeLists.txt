@@ -56,6 +56,11 @@ set(LIB
   PRIVATE bf::intern::guardedalloc
 )
 
+if(WITH_OPENGL_BACKEND)
+  add_definitions(-DWITH_OPENGL_BACKEND)
+  list(APPEND LIB PRIVATE bf::dependencies::epoxy)
+endif()
+
 blender_add_lib(bf_tessera "${SRC}" "${INC}" "${INC_SYS}" "${LIB}")
 add_library(bf::tessera ALIAS bf_tessera)
 

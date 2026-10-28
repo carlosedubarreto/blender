@@ -28,10 +28,21 @@ void main()
     return;
   }
 
+  uint cluster_index = ci;
+  if (max_valid_clusters > 0 && cluster_index >= uint(max_valid_clusters)) {
+    return;
+  }
+
   uvec4 meta = cluster_meta[ci];
   uint index_count = meta.y;
   if (index_count == 0u) {
     return;
+  }
+
+  uint vertex_offset = meta.x;
+  uint vertex_count = meta.y;
+  if (max_valid_vertices > 0 && vertex_offset + vertex_count > uint(max_valid_vertices)) {
+    return; // Drop invalid command; avoid GPU memory fault
   }
 
   vec4 sphere = cluster_sphere[ci];
@@ -56,11 +67,17 @@ void main()
   float dist_c = max(distance(camera_pos, center) - radius, near_clip);
   float screen_err_c = (err_c <= 0.0) ? 0.0 : (err_c * proj_scale_y * (viewport_height * 0.5) / dist_c);
 
+  /* Early out: if cluster error exceeds pixel error, cluster is too coarse */
+  if (screen_err_c > pixel_error) {
+    return;
+  }
+
   vec4 parent_sphere = cluster_parent_sphere[ci];
   float dist_p = max(distance(camera_pos, parent_sphere.xyz) - parent_sphere.w, near_clip);
   float screen_err_p = (err_p >= 3.0e38) ? 1.0e39 : (err_p * proj_scale_y * (viewport_height * 0.5) / dist_p);
 
-  if (!(screen_err_c <= pixel_error && screen_err_p > pixel_error)) {
+  /* Early out: if parent error is below or equal to pixel error, parent is fine enough */
+  if (screen_err_p <= pixel_error) {
     return;
   }
 
@@ -71,6 +88,11 @@ void main()
     if (mat >= uint(max_materials)) {
       mat = 0u;
     }
+  }
+
+  if ((max_valid_clusters > 0 && cluster_index >= uint(max_valid_clusters)) ||
+      (max_valid_vertices > 0 && vertex_offset + vertex_count > uint(max_valid_vertices))) {
+    return; // Drop invalid command; avoid GPU memory fault
   }
 
   uint counter_val = draw_counters[mat];
@@ -136,6 +158,8 @@ void main()
     info.push_constant(gshader::Type::int_t, "max_materials");
     info.push_constant(gshader::Type::int_t, "max_commands_per_material");
     info.push_constant(gshader::Type::int_t, "record_telemetry");
+    info.push_constant(gshader::Type::int_t, "max_valid_clusters");
+    info.push_constant(gshader::Type::int_t, "max_valid_vertices");
     info.push_constant(gshader::Type::float4_t, "frustum_planes", 6);
 
     /* Runtime-created shader: register the raw source as "generated" content
@@ -177,11 +201,22 @@ void main()
     }
   }
 
+  uint cluster_index = ci;
+  if (max_valid_clusters > 0 && cluster_index >= uint(max_valid_clusters)) {
+    return;
+  }
+
   /* Stage 2: Cluster DAG LOD cut evaluation on surviving instances. */
   uvec4 meta = cluster_meta[ci];
   uint index_count = meta.y;
   if (index_count == 0u) {
     return;
+  }
+
+  uint vertex_offset = meta.x;
+  uint vertex_count = meta.y;
+  if (max_valid_vertices > 0 && vertex_offset + vertex_count > uint(max_valid_vertices)) {
+    return; // Drop invalid command; avoid GPU memory fault
   }
 
   vec4 sphere = cluster_sphere[ci];
@@ -203,13 +238,19 @@ void main()
   float dist_c = max(distance(camera_pos, center) - radius, near_clip);
   float screen_err_c = (err_c <= 0.0) ? 0.0 : (err_c * proj_scale_y * (viewport_height * 0.5) / dist_c);
 
+  /* Early out: if cluster error exceeds pixel error, cluster is too coarse */
+  if (screen_err_c > pixel_error) {
+    return;
+  }
+
   vec4 parent_sphere = cluster_parent_sphere[ci];
   vec3 parent_center = (inst.model_matrix * vec4(parent_sphere.xyz, 1.0)).xyz;
   float parent_radius = parent_sphere.w * max_scale;
   float dist_p = max(distance(camera_pos, parent_center) - parent_radius, near_clip);
   float screen_err_p = (err_p >= 3.0e38) ? 1.0e39 : (err_p * proj_scale_y * (viewport_height * 0.5) / dist_p);
 
-  if (!(screen_err_c <= pixel_error && screen_err_p > pixel_error)) {
+  /* Early out: if parent error is below or equal to pixel error, parent is fine enough */
+  if (screen_err_p <= pixel_error) {
     return;
   }
 
@@ -219,6 +260,11 @@ void main()
     if (mat >= uint(max_materials)) {
       mat = 0u;
     }
+  }
+
+  if ((max_valid_clusters > 0 && cluster_index >= uint(max_valid_clusters)) ||
+      (max_valid_vertices > 0 && vertex_offset + vertex_count > uint(max_valid_vertices))) {
+    return; // Drop invalid command; avoid GPU memory fault
   }
 
   uint counter_val = draw_counters[mat];
@@ -289,6 +335,8 @@ void main()
     info.push_constant(gshader::Type::int_t, "max_materials");
     info.push_constant(gshader::Type::int_t, "max_commands_per_material");
     info.push_constant(gshader::Type::int_t, "record_telemetry");
+    info.push_constant(gshader::Type::int_t, "max_valid_clusters");
+    info.push_constant(gshader::Type::int_t, "max_valid_vertices");
     info.push_constant(gshader::Type::float4_t, "frustum_planes", 6);
 
     info.compute_source("tessera_multi_instance_traverse.glsl");
