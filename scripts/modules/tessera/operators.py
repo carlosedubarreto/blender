@@ -252,6 +252,81 @@ class TESSERA_OT_build_collection(bpy.types.Operator):
         return {'FINISHED'}
 
 
+def _tag_all_3d_viewports(context):
+    """Tag every 3D viewport across all open windows for a redraw."""
+    wm = getattr(context, "window_manager", None)
+    if wm is None:
+        return
+    for window in wm.windows:
+        screen = getattr(window, "screen", None)
+        if screen is None:
+            continue
+        for area in screen.areas:
+            if area.type == 'VIEW_3D':
+                area.tag_redraw()
+
+
+class TESSERA_OT_collection_set_enabled(bpy.types.Operator):
+    """Enable or disable Tessera for all mesh objects inside a collection"""
+    bl_idname = "tessera.collection_set_enabled"
+    bl_label = "Collection Enable/Disable Tessera"
+    bl_description = ("Batch-enable or batch-disable Tessera virtual geometry "
+                      "for every mesh object inside this collection, with "
+                      "immediate viewport synchronization")
+    bl_options = {'REGISTER', 'UNDO'}
+
+    collection_name: bpy.props.StringProperty(
+        name="Collection Name",
+        description="Name of collection to enable/disable Tessera on",
+        default="",
+    )
+    enabled: bpy.props.BoolProperty(
+        name="Enable Tessera",
+        description="Enable Tessera for all member meshes when true, disable when false",
+        default=True,
+    )
+    recursive: bpy.props.BoolProperty(
+        name="Recursive",
+        description="Also affect meshes inside child collections",
+        default=True,
+    )
+
+    def execute(self, context):
+        col = bpy.data.collections.get(self.collection_name)
+        if not col and context.scene:
+            if not self.collection_name or self.collection_name == context.scene.collection.name:
+                col = context.scene.collection
+        if not col:
+            self.report({'WARNING'}, f"Collection '{self.collection_name}' not found")
+            return {'CANCELLED'}
+
+        target_objects = col.all_objects if self.recursive else col.objects
+
+        affected = 0
+        for ob in target_objects:
+            if ob.type != 'MESH' or ob.data is None:
+                continue
+            try:
+                if hasattr(ob, "tessera"):
+                    ob.tessera.enabled = self.enabled
+                ob["tessera_enabled"] = int(self.enabled)
+                affected += 1
+            except Exception:
+                # ScatterFlow / procedural assets may hold objects mid-evaluation
+                # whose PropertyGroup is not writable; the raw IDProperty fallback
+                # is always safe and is what the C++ draw code reads.
+                try:
+                    ob["tessera_enabled"] = int(self.enabled)
+                    affected += 1
+                except Exception:
+                    continue
+
+        _tag_all_3d_viewports(context)
+        state_str = "enabled" if self.enabled else "disabled"
+        self.report({'INFO'}, f"Tessera {state_str} for {affected} meshes in '{col.name}'")
+        return {'FINISHED'}
+
+
 class TESSERA_OT_toggle_collection(bpy.types.Operator):
     """Toggle expansion disclosure for collection in Tessera tree"""
     bl_idname = "tessera.toggle_collection"
@@ -375,6 +450,7 @@ classes = (
     TESSERA_OT_batch_build_all,
     TESSERA_OT_build_single_object,
     TESSERA_OT_build_collection,
+    TESSERA_OT_collection_set_enabled,
     TESSERA_OT_toggle_collection,
     TESSERA_OT_convert_to_proxy,
     TESSERA_OT_restore_mesh,

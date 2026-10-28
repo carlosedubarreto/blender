@@ -491,6 +491,24 @@ class TESSERA_PT_tree_view(bpy.types.Panel):
                 mesh_obs = [o for o in col.all_objects if o.type == 'MESH']
                 is_expanded = bool(col.get("tessera_tree_expanded", True))
 
+                # Aggregate Tessera state across member meshes (tri-state):
+                # all enabled / none enabled / mixed. The RNA PropertyGroup is
+                # authoritative when present; the raw IDProperty is the
+                # fallback read by the C++ draw code.
+                enabled_count = 0
+                for o in mesh_obs:
+                    if hasattr(o, "tessera"):
+                        if bool(o.tessera.enabled):
+                            enabled_count += 1
+                    elif int(o.get("tessera_enabled", 0)) != 0:
+                        enabled_count += 1
+                if mesh_obs and enabled_count == len(mesh_obs):
+                    state_icon = 'CHECKBOX_HLT'
+                elif enabled_count == 0:
+                    state_icon = 'CHECKBOX_DEHLT'
+                else:
+                    state_icon = 'QUESTION'  # mixed state
+
                 c_box = layout.box()
                 header_row = c_box.row(align=True)
                 arrow_icon = 'TRIA_DOWN' if is_expanded else 'TRIA_RIGHT'
@@ -500,6 +518,17 @@ class TESSERA_PT_tree_view(bpy.types.Panel):
                 header_row.label(text=f"{col.name} ({len(mesh_obs)})", icon='OUTLINER_COLLECTION')
                 op_build_col = header_row.operator("tessera.build_collection", text="", icon='MOD_BUILD')
                 op_build_col.collection_name = col.name
+
+                # Batch enable / disable switches for this collection.
+                op_enable_col = header_row.operator("tessera.collection_set_enabled", text="", icon='CHECKBOX_HLT')
+                op_enable_col.collection_name = col.name
+                op_enable_col.enabled = True
+                op_enable_col.recursive = True
+                op_disable_col = header_row.operator("tessera.collection_set_enabled", text="", icon='CHECKBOX_DEHLT')
+                op_disable_col.collection_name = col.name
+                op_disable_col.enabled = False
+                op_disable_col.recursive = True
+                header_row.label(text="", icon=state_icon)
 
                 if is_expanded and mesh_obs:
                     item_col = c_box.column(align=True)

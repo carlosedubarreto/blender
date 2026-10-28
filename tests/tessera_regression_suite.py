@@ -1412,6 +1412,134 @@ def test_scatterflow_instancer_isolation():
 
 
 # ---------------------------------------------------------------------------
+# Test 12: Collection Batch Enable/Disable Regression Test
+# ---------------------------------------------------------------------------
+
+def test_collection_batch_enable_disable():
+    """Regression Test 12: Batch enable/disable Tessera per collection.
+
+    Validates tessera.collection_set_enabled:
+      1. All 4 member meshes switch to enabled and both the RNA PropertyGroup
+         and the raw IDProperty (read by the C++ draw code) agree.
+      2. All 4 member meshes switch back to disabled synchronously.
+      3. Recursive mode reaches meshes inside child collections, while
+         non-recursive mode leaves child collections untouched.
+      4. A Workbench draw after toggling completes without errors.
+    """
+    print("\n" + "="*80)
+    print("RUNNING TEST 12: test_collection_batch_enable_disable")
+    print("="*80)
+
+    import bpy
+
+    sample_path = SAMPLE_GROUND_09
+    assert os.path.exists(sample_path), f"Sample blend missing: {sample_path}"
+    bpy.ops.wm.open_mainfile(filepath=sample_path)
+    scene = bpy.context.scene
+
+    # 1. Create a collection with 4 test cube meshes.
+    col = bpy.data.collections.new("BatchToggle_Collection")
+    scene.collection.children.link(col)
+
+    child = bpy.data.collections.new("BatchToggle_Child")
+    col.children.link(child)
+
+    def _make_cube(name, location):
+        mesh = bpy.data.meshes.new(f"{name}_Mesh")
+        verts = [
+            (-1, -1, -1), (1, -1, -1), (1, 1, -1), (-1, 1, -1),
+            (-1, -1, 1), (1, -1, 1), (1, 1, 1), (-1, 1, 1)
+        ]
+        faces = [
+            (0, 1, 2, 3), (4, 7, 6, 5), (0, 4, 5, 1),
+            (1, 5, 6, 2), (2, 6, 7, 3), (4, 0, 3, 7)
+        ]
+        mesh.from_pydata(verts, [], faces)
+        mesh.update()
+        ob = bpy.data.objects.new(name, mesh)
+        ob.location = location
+        return ob
+
+    cubes = []
+    for i in range(4):
+        ob = _make_cube(f"BatchCube_{i}", (i * 3.0, 0.0, 0.0))
+        col.objects.link(ob)
+        cubes.append(ob)
+
+    child_cube = _make_cube("BatchCube_Child", (15.0, 0.0, 0.0))
+    child.objects.link(child_cube)
+
+    bpy.context.view_layer.update()
+
+    # 2. Force a known starting state: every mesh disabled.
+    for ob in cubes + [child_cube]:
+        ob["tessera_enabled"] = 0
+        if hasattr(ob, "tessera"):
+            ob.tessera.enabled = False
+    bpy.context.view_layer.update()
+    for ob in cubes:
+        assert int(ob.get("tessera_enabled", 0)) == 0, \
+            f"{ob.name} must start disabled"
+        assert bool(ob.tessera.enabled) is False, \
+            f"{ob.name} RNA PropertyGroup must start disabled"
+    print("  ✓ All 5 meshes start disabled (IDProperty + RNA PropertyGroup).")
+
+    # 3. Enable the whole collection (non-recursive: parent meshes only).
+    res = bpy.ops.tessera.collection_set_enabled(collection_name=col.name, enabled=True, recursive=False)
+    assert res == {'FINISHED'}, f"Expected {{'FINISHED'}}, got {res}"
+
+    # 4. Assert: all 4 meshes enabled in BOTH the IDProperty and the PropertyGroup.
+    for ob in cubes:
+        assert int(ob.get("tessera_enabled", 0)) == 1, \
+            f"Assertion 1 FAILED: {ob.name} tessera_enabled != 1 after enable"
+        assert bool(ob.tessera.enabled) is True, \
+            f"Assertion 1 FAILED: {ob.name} tessera.enabled != True after enable"
+    print("  ✓ Enable All: 4/4 meshes enabled (IDProperty + PropertyGroup agree).")
+
+    # 5. Disable the whole collection again (non-recursive: parent meshes only).
+    res = bpy.ops.tessera.collection_set_enabled(collection_name=col.name, enabled=False, recursive=False)
+    assert res == {'FINISHED'}, f"Expected {{'FINISHED'}}, got {res}"
+
+    # 6. Assert: all 4 meshes back to disabled in BOTH stores.
+    for ob in cubes:
+        assert int(ob.get("tessera_enabled", 0)) == 0, \
+            f"Assertion 2 FAILED: {ob.name} tessera_enabled != 0 after disable"
+        assert bool(ob.tessera.enabled) is False, \
+            f"Assertion 2 FAILED: {ob.name} tessera.enabled != False after disable"
+    print("  ✓ Disable All: 4/4 meshes disabled (IDProperty + PropertyGroup agree).")
+
+    # 7. Recursive mode must also reach the child collection.
+    assert int(child_cube.get("tessera_enabled", 0)) == 0, \
+        "Child cube must still be disabled before recursive phase"
+    bpy.ops.tessera.collection_set_enabled(collection_name=col.name, enabled=True, recursive=True)
+    assert int(child_cube.get("tessera_enabled", 0)) == 1, \
+        "Assertion 3 FAILED: recursive=True must enable child collection meshes"
+    assert int(cubes[0].get("tessera_enabled", 0)) == 1, \
+        "Assertion 3 FAILED: recursive=True must keep parent meshes enabled"
+    print("  ✓ Recursive=True: child collection mesh enabled together with parent.")
+
+    # 8. Non-recursive mode must leave child collections untouched.
+    bpy.ops.tessera.collection_set_enabled(collection_name=col.name, enabled=False, recursive=False)
+    for ob in cubes:
+        assert int(ob.get("tessera_enabled", 0)) == 0, \
+            f"Assertion 4 FAILED: {ob.name} must be disabled by non-recursive disable"
+    assert int(child_cube.get("tessera_enabled", 0)) == 1, \
+        "Assertion 4 FAILED: non-recursive disable must NOT touch child collection"
+    print("  ✓ Recursive=False: child collection mesh left untouched.")
+
+    # 9. Workbench draw after toggling (viewport synchronization sanity).
+    scene.render.engine = 'BLENDER_WORKBENCH'
+    scene.render.resolution_x = 320
+    scene.render.resolution_y = 240
+    bpy.context.view_layer.update()
+    bpy.ops.render.render(write_still=False)
+    print("  ✓ Workbench draw after batch toggle completed cleanly.")
+
+    print("PASS: test_collection_batch_enable_disable passed successfully.")
+    return True
+
+
+# ---------------------------------------------------------------------------
 # Test Runner & Entry Point
 # ---------------------------------------------------------------------------
 
@@ -1440,6 +1568,7 @@ def run_suite():
         ("test_viewport_interaction_performance", test_viewport_interaction_performance),
         ("test_collection_build_without_active_object", test_collection_build_without_active_object),
         ("test_scatterflow_instancer_isolation", test_scatterflow_instancer_isolation),
+        ("test_collection_batch_enable_disable", test_collection_batch_enable_disable),
     ]
 
     for name, test_fn in tests:
