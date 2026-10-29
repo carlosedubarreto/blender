@@ -18,7 +18,9 @@ set(INC
   ${SRC_DIR}/../draw/intern
   ${SRC_DIR}/../blenkernel
   ${SRC_DIR}/../blenlib
+  ${SRC_DIR}/../depsgraph
   ${SRC_DIR}/../functions
+  ${SRC_DIR}/../makesdna
 )
 
 set(INC_SYS
@@ -26,6 +28,8 @@ set(INC_SYS
 
 set(SRC
   tessera.h
+  tessera_archetype.hh
+  tessera_archetype.cc
   tessera_cluster.hh
   tessera_cluster.cc
   tessera_cluster_serial.cc
@@ -51,8 +55,12 @@ set(SRC
 )
 
 set(LIB
+  PRIVATE bf_blenkernel
+  PRIVATE bf_blenlib
+  PRIVATE bf_depsgraph
   PRIVATE bf_gpu
   PRIVATE bf::blenlib
+  PRIVATE bf::dna
   PRIVATE bf::intern::guardedalloc
 )
 

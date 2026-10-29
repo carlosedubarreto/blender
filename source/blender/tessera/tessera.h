@@ -19,10 +19,10 @@
 #include <functional>
 #include <vector>
 
-// Forward declaration of Blender's Mesh type (defined in BKE_mesh.hh).
+namespace blender {
+
 struct Mesh;
 
-namespace blender {
 namespace gpu {
 class Texture;
 }

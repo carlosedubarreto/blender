@@ -161,6 +161,49 @@ bool sphere_in_frustum(const float planes[6][4], const float3 &center,
     return true;
 }
 
+bool mesh_bounds_sphere(const TesseraData &data, float3 &r_center, float &r_radius)
+{
+    if (data.clusters.empty()) {
+        return false;
+    }
+    float bmin[3] = {std::numeric_limits<float>::max(),
+                     std::numeric_limits<float>::max(),
+                     std::numeric_limits<float>::max()};
+    float bmax[3] = {std::numeric_limits<float>::lowest(),
+                     std::numeric_limits<float>::lowest(),
+                     std::numeric_limits<float>::lowest()};
+    for (const TesseraCluster &cluster : data.clusters) {
+        const float3 c(cluster.sphere[0], cluster.sphere[1], cluster.sphere[2]);
+        const float r = cluster.sphere[3];
+        for (int a = 0; a < 3; ++a) {
+            bmin[a] = std::min(bmin[a], c[a] - r);
+            bmax[a] = std::max(bmax[a], c[a] + r);
+        }
+    }
+    const float3 lo(bmin[0], bmin[1], bmin[2]);
+    const float3 hi(bmax[0], bmax[1], bmax[2]);
+    r_center = (lo + hi) * 0.5f;
+    r_radius = math::length(hi - lo) * 0.5f;
+    return r_radius > 0.0f;
+}
+
+bool instance_in_frustum(const TesseraViewInfo &view_info,
+                         const float4x4 &instance_mat,
+                         const float3 &mesh_center,
+                         float mesh_radius,
+                         float culling_margin)
+{
+    /* World-space center of the transformed bounding sphere. */
+    const float3 inst_center = (instance_mat * float4(mesh_center, 1.0f)).xyz();
+    /* Worst-case radius scale: the largest axis length of the instance matrix. */
+    const float inst_scale = std::max(math::length(instance_mat[0].xyz()),
+                                      std::max(math::length(instance_mat[1].xyz()),
+                                               math::length(instance_mat[2].xyz())));
+    const float inst_radius = mesh_radius * inst_scale;
+    return sphere_in_frustum(
+        view_info.planes, inst_center, inst_radius, culling_margin);
+}
+
 float projectedErrorPx(const float3 &center, float radius, float error,
                        const float3 &camPos, float viewportHeight,
                        float projScaleY, bool orthographic)

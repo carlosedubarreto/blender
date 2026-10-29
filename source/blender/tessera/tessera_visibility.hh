@@ -144,6 +144,28 @@ class TesseraVisibilityPass
         mMaterials = materials;
     }
 
+    /**
+     * Two-sided / foliage-card mode: the geometry consists of open
+     * single-sided leaf/grass cards that must show their back faces with
+     * flipped normals. Face culling stays disabled either way (occlusion is
+     * resolved by depth), and the solid forward path renders such meshes
+     * fully opaque.
+     */
+    void set_two_sided(bool two_sided)
+    {
+        mTwoSided = two_sided;
+    }
+
+    /**
+     * Alpha cutout: reject fragments whose base color texture alpha falls
+     * below the cutout threshold (foliage card surrounds). Only meaningful
+     * when diffuse textures are bound.
+     */
+    void set_alpha_mask(bool enabled)
+    {
+        mAlphaMask = enabled;
+    }
+
     void setTextureScale(float scale)
     {
         mTextureScale = std::clamp(scale, 0.05f, 1.0f);
@@ -156,6 +178,8 @@ class TesseraVisibilityPass
 
  private:
     float mTextureScale = 1.0f;
+    bool mTwoSided = false;
+    bool mAlphaMask = false;
     bool ensure_targets(int width, int height);
     bool upload_dirty_data();
 

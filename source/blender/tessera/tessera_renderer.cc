@@ -582,7 +582,9 @@ void TesseraRenderer::updateWithCpuTraversal(const TesseraData &data,
     GPU_storagebuf_update(mDrawBuffer, mCpuCommandStream.data());
 }
 
-void TesseraRenderer::draw(int viewportWidth, int viewportHeight)
+void TesseraRenderer::draw(int viewportWidth, int viewportHeight,
+                           const float4x4 *view_proj_override,
+                           const float4x4 *object_model_override)
 {
     if (mDrawBuffer == nullptr || mDrawCount == 0) {
         return;
@@ -606,12 +608,12 @@ void TesseraRenderer::draw(int viewportWidth, int viewportHeight)
 #endif
     mVisibilityPass.render(mDrawBuffer,
                            mDrawCount,
-                           mLastViewProj,
+                           view_proj_override ? *view_proj_override : mLastViewProj,
                            view.camPos,
                            viewportWidth,
                            viewportHeight,
                            int(mShadingMode),
-                           float4x4::identity(),
+                           object_model_override ? *object_model_override : float4x4::identity(),
                            mReverseZ,
                            &mMaterialDrawCounts,
                            mMaxCommandsPerMaterial,
@@ -624,7 +626,8 @@ void TesseraRenderer::draw(int viewportWidth, int viewportHeight)
 #endif
 }
 
-void TesseraRenderer::draw_prepass(int viewportWidth, int viewportHeight)
+void TesseraRenderer::draw_prepass(int viewportWidth, int viewportHeight,
+                                   const float4x4 *view_proj_override)
 {
     if (mDrawBuffer == nullptr || mDrawCount == 0) {
         return;
@@ -645,7 +648,7 @@ void TesseraRenderer::draw_prepass(int viewportWidth, int viewportHeight)
 #endif
     mVisibilityPass.render_depth_prepass(mDrawBuffer,
                                          mDrawCount,
-                                         mLastViewProj,
+                                         view_proj_override ? *view_proj_override : mLastViewProj,
                                          viewportWidth,
                                          viewportHeight,
                                          mReverseZ,
@@ -660,7 +663,8 @@ void TesseraRenderer::draw_prepass(int viewportWidth, int viewportHeight)
 #endif
 }
 
-void TesseraRenderer::draw_gbuffer(int viewportWidth, int viewportHeight, const float4x4 &object_model)
+void TesseraRenderer::draw_gbuffer(int viewportWidth, int viewportHeight, const float4x4 &object_model,
+                                   const float4x4 *view_proj_override)
 {
     if (mDrawBuffer == nullptr || mDrawCount == 0) {
         return;
@@ -682,7 +686,7 @@ void TesseraRenderer::draw_gbuffer(int viewportWidth, int viewportHeight, const 
 #endif
     mVisibilityPass.render_gbuffer(mDrawBuffer,
                                   mDrawCount,
-                                  mLastViewProj,
+                                  view_proj_override ? *view_proj_override : mLastViewProj,
                                   view.camPos,
                                   viewportWidth,
                                   viewportHeight,
@@ -703,7 +707,8 @@ void TesseraRenderer::draw_forward(const float4x4 &model_mat,
                                    int viewportWidth,
                                    int viewportHeight,
                                    int lighting_type,
-                                   const float4 &base_color)
+                                   const float4 &base_color,
+                                   const float4x4 *view_proj_override)
 {
     if (mDrawBuffer == nullptr || mDrawCount == 0) {
         return;
@@ -725,7 +730,7 @@ void TesseraRenderer::draw_forward(const float4x4 &model_mat,
 #endif
     mVisibilityPass.render_forward(mDrawBuffer,
                                    mDrawCount,
-                                   mLastViewProj,
+                                   view_proj_override ? *view_proj_override : mLastViewProj,
                                    model_mat,
                                    view.camPos,
                                    viewportWidth,

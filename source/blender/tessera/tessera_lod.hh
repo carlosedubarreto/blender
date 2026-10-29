@@ -58,6 +58,32 @@ bool sphere_in_frustum(const float planes[6][4], const float3 &center,
                        float radius, float margin = 0.0f);
 
 /**
+ * Mesh bounding sphere in object space: the union of the per-cluster
+ * bounding spheres. Returns false when no usable bounds exist (empty data
+ * or a degenerate zero-radius result), in which case callers must skip
+ * instance culling rather than reject everything.
+ */
+bool mesh_bounds_sphere(const TesseraData &data, float3 &r_center, float &r_radius);
+
+/**
+ * Instance-level frustum test for scattered duplicates (Geometry Nodes /
+ * ScatterFlow fields): transform the mesh bounding sphere by the instance
+ * matrix and test it against the view's world-space frustum planes
+ * (Gribb-Hartmann, a*x + b*y + c*z + d >= 0 inside):
+ *
+ *   dist(P_plane, M_instance * c_mesh_bounds) >= -(r_mesh_bounds * s_instance + margin)
+ *
+ * Instances failing the test must be dropped before dispatching any
+ * rasterization for them, so scattered foliage outside the camera view cone
+ * is culled even though the traversal only ran on the source archetype.
+ */
+bool instance_in_frustum(const TesseraViewInfo &view_info,
+                         const float4x4 &instance_mat,
+                         const float3 &mesh_center,
+                         float mesh_radius,
+                         float culling_margin);
+
+/**
  * Project a world-space error value to screen pixels, accounting for the
  * distance of the camera to the cluster (perspective-correct metric).
  */

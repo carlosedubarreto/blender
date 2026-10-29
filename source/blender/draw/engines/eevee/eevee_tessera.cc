@@ -11,6 +11,9 @@
 #include "eevee_tessera.hh"
 #include "eevee_instance.hh"
 
+#include "tessera_archetype.hh"
+#include "tessera_lod.hh"
+
 #include "DNA_camera_types.h"
 #include "DNA_ID.h"
 #include "DNA_object_types.h"
@@ -62,6 +65,8 @@ void TesseraModule::begin_sync()
   for (auto item : objects_.items()) {
     item.value->used = false;
     item.value->traversed_this_frame = false;
+    /* Instance matrices are re-collected on every sync round. */
+    item.value->instance_mats.clear();
   }
 }
 
@@ -106,6 +111,55 @@ static bool is_tessera_eligible_mesh(Object *ob)
     return false;
   }
   return true;
+}
+
+/**
+ * Detect two-sided / foliage-card geometry: explicit per-object IDProperty
+ * override (`tessera_two_sided`) wins. The visibility pipeline renders both
+ * faces with flipped backface normals either way; the flag additionally
+ * forces opaque solid shading for card-like foliage.
+ */
+static bool tessera_object_is_two_sided(Object *ob)
+{
+  if (ob == nullptr) {
+    return false;
+  }
+  const IDProperty *prop = tessera_property_find_safe(ob, "tessera_two_sided");
+  if (prop != nullptr && prop->type == IDP_INT) {
+    return IDP_int_get(prop) != 0;
+  }
+  return false;
+}
+
+/* Expand the traversal culling margin for scattered instance fields so the
+ * cluster selection is not gated by the base archetype transform: traversal
+ * only sees one instance matrix, and the baked instance can be arbitrarily
+ * far outside the frustum (e.g. behind the camera) while other instances are
+ * inside. The traversal planes live in the baked instance's local space — a
+ * space that can be scaled arbitrarily relative to the world — so the
+ * worst-case plane distance is bounded by the *local* camera-to-field
+ * distance. The per-instance frustum test performs the real visibility work
+ * for every scattered copy at draw time. */
+static void tessera_expand_traversal_margin(tessera::TesseraDrawPass &pass,
+                                            const tessera::TesseraData &data,
+                                            const float4x4 &object_mat,
+                                            const std::vector<float4x4> &instance_mats,
+                                            const tessera::TesseraViewInfo &cull_view,
+                                            float culling_margin)
+{
+  if (instance_mats.size() <= 1) {
+    return;
+  }
+  float3 field_bs_center(0.0f);
+  float field_bs_radius = 0.0f;
+  if (!tessera::mesh_bounds_sphere(data, field_bs_center, field_bs_radius)) {
+    return;
+  }
+  /* Camera position in the baked instance's local space. */
+  const float4x4 inv_object_mat = math::invert(object_mat);
+  const float3 cam_pos_local = (inv_object_mat * float4(cull_view.camPos, 1.0f)).xyz();
+  const float dist_cam_local = math::distance(cam_pos_local, field_bs_center);
+  pass.setCullingMargin(dist_cam_local + 2.0f * field_bs_radius + culling_margin);
 }
 
 static bool tessera_path_get(Object *ob, std::string &r_path)
@@ -1193,7 +1247,12 @@ bool TesseraModule::is_enabled(Object *ob) const
   return tessera_path_get(ob, dummy);
 }
 
-bool TesseraModule::record(Object *ob)
+bool TesseraModule::record(Object *ob,
+                           const float4x4 &object_mat,
+                           const float4x4 *instance_mats,
+                           int instance_count,
+                           const tessera::TesseraArchetype *archetype,
+                           bool is_instancer_base)
 {
   if (!is_tessera_eligible_mesh(ob)) {
     return false;
@@ -1205,26 +1264,34 @@ bool TesseraModule::record(Object *ob)
   if (!tessera_path_get(ob, idprop_path)) {
     return false;
   }
-
   char abs_path[FILE_MAX];
   BLI_strncpy(abs_path, idprop_path.c_str(), sizeof(abs_path));
-  BLI_path_abs(abs_path, BKE_main_blendfile_path_from_global());
+  const char *blend_path = BKE_main_blendfile_path_from_global();
+  if (blend_path != nullptr && blend_path[0] != '\0') {
+    BLI_path_abs(abs_path, blend_path);
+  }
 
-  BLI_stat_t file_info;
-  const bool stat_ok = (BLI_stat(abs_path, &file_info) == 0);
-  const int64_t file_mtime = stat_ok ? int64_t(file_info.st_mtime) : int64_t(-1);
-  const int64_t file_size = stat_ok ? int64_t(file_info.st_size) : int64_t(-1);
+  const bool arch_resolved = (archetype != nullptr && archetype->valid);
+
+  /* Build state key from emitter name + archetype so different plant
+   * varieties of the same scatter field get separate .nc2 data. */
+  std::string state_key(ob->id.name + 2);
+  if (arch_resolved && !archetype->source_name.empty()) {
+    state_key += "|";
+    state_key += archetype->source_name;
+  }
 
   std::lock_guard lock(this->mutex_);
-  std::unique_ptr<ObjectState> &entry = objects_.lookup_or_add_default(
-      std::string(ob->id.name + 2));
+  std::unique_ptr<ObjectState> &entry = objects_.lookup_or_add_default(state_key);
   if (entry == nullptr) {
     entry = std::make_unique<ObjectState>();
   }
   ObjectState &state = *entry;
 
+  const bool is_dupli = (ob->base_flag & BASE_FROM_DUPLI) != 0;
   state.used = true;
   state.ob = ob;
+  state.ob_name = std::string(ob->id.name + 2);
   state.show_stats = tessera_show_stats_get(ob);
   state.log_console = tessera_log_console_get(ob);
   state.show_fps_panel = tessera_show_fps_panel_get(ob);
@@ -1233,7 +1300,31 @@ bool TesseraModule::record(Object *ob)
   state.pixel_error = tessera_pixel_error_get(ob);
   state.view_source = tessera_view_source_get(ob);
   state.culling_margin = tessera_culling_margin_get(ob);
-  state.object_mat = ob->object_to_world();
+  state.object_mat = object_mat;
+  state.two_sided = tessera_object_is_two_sided(ob) || (arch_resolved && archetype->two_sided);
+  state.is_instancer_base = is_instancer_base;
+  if (arch_resolved && archetype->base_color_valid) {
+    state.base_color = archetype->base_color;
+    state.base_color_valid = true;
+  }
+  /* Geometry-Nodes / ScatterFlow instance fields: the caller extracted the
+   * full 4x4 matrix of every instance from the ObjectRef range. Each
+   * scattered copy is culled and rasterized individually at draw time. */
+  if (instance_mats != nullptr && instance_count > 0) {
+    const size_t room = (state.instance_mats.size() < 65536) ?
+                            (65536 - state.instance_mats.size()) :
+                            0;
+    const int to_copy = std::min(int(room), instance_count);
+    for (int i = 0; i < to_copy; ++i) {
+      state.instance_mats.push_back(instance_mats[i]);
+    }
+  }
+  else if (is_dupli) {
+    /* Legacy per-dupli sync path (one sync call per dupli). */
+    if (state.instance_mats.size() < 65536) {
+      state.instance_mats.push_back(state.object_mat);
+    }
+  }
 
   /* Material extraction caching: re-extract only when materials or images are updated. */
   const int totcol = std::max(1, int(ob->totcol));
@@ -1269,27 +1360,54 @@ bool TesseraModule::record(Object *ob)
     }
     state.materials_extracted = true;
   }
+  if (state.base_color_valid) {
+    /* Propagate the archetype's material base color into the first material
+     * so the GPU shader uses the correct foliage color. ScatterFlow emitter
+     * proxies carry no material slots — the color lives in the archetype. */
+    if (totcol >= 1 && state.materials.size() >= 1) {
+      state.materials[0].base_color = state.base_color;
+    }
+  }
 
-  const bool stale = (state.nc2_path != abs_path) ||
-                     (state.file_mtime != file_mtime) ||
-                     (state.file_size != file_size);
-  if (state.pass == nullptr || stale) {
-    if (stale || state.data.clusters.empty()) {
-      size_t data_size = 0;
-      if (void *file_data = BLI_file_read_binary_as_mem(abs_path, 0, &data_size)) {
-        tessera::TesseraData loaded;
-        if (tessera::deserializeFromMemory(
-                loaded, static_cast<const uint8_t *>(file_data), data_size) &&
-            !loaded.clusters.empty())
-        {
-          state.data = std::move(loaded);
-        }
-        MEM_delete_void(file_data);
-      }
-      state.file_mtime = file_mtime;
-      state.file_size = file_size;
-      state.nc2_path = abs_path;
+  if (arch_resolved && archetype->built_data != nullptr) {
+    if (state.data_source_key != archetype->source_name || state.data.clusters.empty()) {
+      state.data = *archetype->built_data;
       state.pass.reset();
+    }
+    state.data_source_key = archetype->source_name;
+    state.nc2_path = "";
+    state.file_mtime = 0;
+    state.file_size = 0;
+  }
+  else {
+    const std::string load_path = (arch_resolved && !archetype->nc2_path.empty()) ?
+                                      archetype->nc2_path :
+                                      std::string(abs_path);
+    BLI_stat_t load_info;
+    const bool stat_ok = (BLI_stat(load_path.c_str(), &load_info) == 0);
+    const int64_t load_mtime = stat_ok ? int64_t(load_info.st_mtime) : -1;
+    const int64_t load_size = stat_ok ? int64_t(load_info.st_size) : -1;
+    const bool stale = (state.nc2_path != load_path) || (state.file_mtime != load_mtime) ||
+                       (state.file_size != load_size);
+    if (state.pass == nullptr || stale) {
+      if (stale || state.data.clusters.empty()) {
+        size_t data_size = 0;
+        if (void *file_data = BLI_file_read_binary_as_mem(load_path.c_str(), 0, &data_size)) {
+          tessera::TesseraData loaded;
+          if (tessera::deserializeFromMemory(
+                  loaded, static_cast<const uint8_t *>(file_data), data_size) &&
+              !loaded.clusters.empty())
+          {
+            state.data = std::move(loaded);
+          }
+          MEM_delete_void(file_data);
+        }
+        state.file_mtime = load_mtime;
+        state.file_size = load_size;
+        state.nc2_path = load_path;
+        state.data_source_key = "";
+        state.pass.reset();
+      }
     }
   }
   return !state.data.clusters.empty();
@@ -1543,6 +1661,9 @@ void TesseraModule::draw_prepass(const draw::View &view,
   std::lock_guard lock(this->mutex_);
   const float4x4 viewport_persmat = view.persmat();
   const float viewport_proj_scale_y = std::abs(view.winmat()[1][1]);
+  /* World-space frustum planes for per-instance camera culling. */
+  const tessera::TesseraViewInfo tessera_cull_view = tessera::getViewInfo(
+      viewport_persmat, float(resolution.y), viewport_proj_scale_y);
 
   if (depth_fb != nullptr) {
     GPU_framebuffer_bind(depth_fb);
@@ -1550,14 +1671,14 @@ void TesseraModule::draw_prepass(const draw::View &view,
 
   for (auto item : objects_.items()) {
     ObjectState &state = *item.value;
-    if (!state.used || state.data.clusters.empty()) {
+    if (!state.used || state.data.clusters.empty() || state.is_instancer_base) {
       continue;
     }
     /* Never dereference the pointer stored at sync time: the depsgraph may
      * have freed the evaluated object in between (procedural instancers and
      * scatter systems recreate objects every frame). Re-resolve by name. */
     Object *ob = (inst_.draw_ctx != nullptr) ?
-                     tessera_object_revalidate(inst_.draw_ctx, item.key) :
+                     tessera_object_revalidate(inst_.draw_ctx, state.ob_name) :
                      nullptr;
     if (ob == nullptr) {
       if (inst_.draw_ctx != nullptr) {
@@ -1625,6 +1746,12 @@ void TesseraModule::draw_prepass(const draw::View &view,
     const bool show_fps_hud = state.show_fps_hud;
     state.pass->setNavigating(is_navigating);
     state.pass->setTelemetryEnabled(show_stats || log_console || show_fps_panel || show_fps_hud);
+    tessera_expand_traversal_margin(*state.pass,
+                                    state.data,
+                                    state.object_mat,
+                                    state.instance_mats,
+                                    tessera_cull_view,
+                                    state.culling_margin);
     state.pass->update(state.data,
                        object_persmat,
                        viewport_proj_scale_y,
@@ -1634,7 +1761,41 @@ void TesseraModule::draw_prepass(const draw::View &view,
     state.traversed_this_frame = true;
 
     if (state.pass->drawCount() != 0) {
-      state.pass->draw_prepass(resolution.x, resolution.y);
+      state.pass->set_two_sided(state.two_sided);
+      bool has_diffuse_tex = false;
+      for (const auto &m : state.materials) {
+        if (m.has_diffuse && m.diffuse != nullptr) {
+          has_diffuse_tex = true;
+          break;
+        }
+      }
+      state.pass->set_alpha_mask(has_diffuse_tex);
+      /* Mesh bounding sphere (object space) for per-instance culling. */
+      float3 tessera_bs_center(0.0f);
+      float tessera_bs_radius = 0.0f;
+      const bool tessera_have_bs = tessera::mesh_bounds_sphere(
+          state.data, tessera_bs_center, tessera_bs_radius);
+      if (state.instance_mats.size() > 1) {
+        /* Scattered dupli / Geometry-Nodes field: one depth prepass per
+         * instance matrix so every scattered copy occludes correctly.
+         * Instances failing the per-instance frustum test are culled. */
+        for (const float4x4 &inst_mat : state.instance_mats) {
+          if (tessera_have_bs &&
+              !tessera::instance_in_frustum(tessera_cull_view,
+                                            inst_mat,
+                                            tessera_bs_center,
+                                            tessera_bs_radius,
+                                            state.culling_margin))
+          {
+            continue; /* Cull instance. */
+          }
+          const float4x4 inst_vp = viewport_persmat * inst_mat;
+          state.pass->draw_prepass(resolution.x, resolution.y, &inst_vp);
+        }
+      }
+      else {
+        state.pass->draw_prepass(resolution.x, resolution.y);
+      }
     }
   }
 }
@@ -1649,6 +1810,9 @@ void TesseraModule::draw(const draw::View &view,
   std::lock_guard lock(this->mutex_);
   const float4x4 viewport_persmat = view.persmat();
   const float viewport_proj_scale_y = std::abs(view.winmat()[1][1]);
+  /* World-space frustum planes for per-instance camera culling. */
+  const tessera::TesseraViewInfo tessera_cull_view = tessera::getViewInfo(
+      viewport_persmat, float(resolution.y), viewport_proj_scale_y);
 
   if (target_fb != nullptr) {
     GPU_framebuffer_bind(target_fb);
@@ -1656,14 +1820,14 @@ void TesseraModule::draw(const draw::View &view,
 
   for (auto item : objects_.items()) {
     ObjectState &state = *item.value;
-    if (!state.used || state.data.clusters.empty()) {
+    if (!state.used || state.data.clusters.empty() || state.is_instancer_base) {
       continue;
     }
     /* Never dereference the pointer stored at sync time: the depsgraph may
      * have freed the evaluated object in between (procedural instancers and
      * scatter systems recreate objects every frame). Re-resolve by name. */
     Object *ob = (inst_.draw_ctx != nullptr) ?
-                     tessera_object_revalidate(inst_.draw_ctx, item.key) :
+                     tessera_object_revalidate(inst_.draw_ctx, state.ob_name) :
                      nullptr;
     if (ob == nullptr) {
       if (inst_.draw_ctx != nullptr) {
@@ -1746,6 +1910,12 @@ void TesseraModule::draw(const draw::View &view,
     const bool show_fps_hud = state.show_fps_hud;
     state.pass->setTelemetryEnabled(show_stats || log_console || show_fps_panel || show_fps_hud);
     if (!state.traversed_this_frame) {
+      tessera_expand_traversal_margin(*state.pass,
+                                      state.data,
+                                      state.object_mat,
+                                      state.instance_mats,
+                                      tessera_cull_view,
+                                      state.culling_margin);
       state.pass->update(state.data,
                          object_persmat,
                          viewport_proj_scale_y,
@@ -1760,7 +1930,33 @@ void TesseraModule::draw(const draw::View &view,
     state.pass->setTextureScale(state.current_tex_scale);
     state.pass->set_material_textures(state.materials);
     if (state.pass->drawCount() != 0) {
-      state.pass->draw(resolution.x, resolution.y);
+      state.pass->set_two_sided(state.two_sided);
+      /* Mesh bounding sphere (object space) for per-instance culling. */
+      float3 tessera_bs_center(0.0f);
+      float tessera_bs_radius = 0.0f;
+      const bool tessera_have_bs = tessera::mesh_bounds_sphere(
+          state.data, tessera_bs_center, tessera_bs_radius);
+      if (state.instance_mats.size() > 1) {
+        /* Scattered dupli / Geometry-Nodes field: one visibility-buffer
+         * compose per instance matrix (M_draw = P_view * M_instance).
+         * Instances failing the per-instance frustum test are culled. */
+        for (const float4x4 &inst_mat : state.instance_mats) {
+          if (tessera_have_bs &&
+              !tessera::instance_in_frustum(tessera_cull_view,
+                                            inst_mat,
+                                            tessera_bs_center,
+                                            tessera_bs_radius,
+                                            state.culling_margin))
+          {
+            continue; /* Cull instance. */
+          }
+          const float4x4 inst_vp = viewport_persmat * inst_mat;
+          state.pass->draw(resolution.x, resolution.y, &inst_vp, &inst_mat);
+        }
+      }
+      else {
+        state.pass->draw(resolution.x, resolution.y);
+      }
     }
   }
 }
@@ -1797,6 +1993,9 @@ void TesseraModule::draw_gbuffer(const draw::View &view,
   std::lock_guard lock(this->mutex_);
   const float4x4 viewport_persmat = view.persmat();
   const float viewport_proj_scale_y = std::abs(view.winmat()[1][1]);
+  /* World-space frustum planes for per-instance camera culling. */
+  const tessera::TesseraViewInfo tessera_cull_view = tessera::getViewInfo(
+      viewport_persmat, float(resolution.y), viewport_proj_scale_y);
 
   if (gbuffer_fb != nullptr) {
     GPU_framebuffer_bind(gbuffer_fb);
@@ -1804,14 +2003,14 @@ void TesseraModule::draw_gbuffer(const draw::View &view,
 
   for (auto item : objects_.items()) {
     ObjectState &state = *item.value;
-    if (!state.used || state.data.clusters.empty()) {
+    if (!state.used || state.data.clusters.empty() || state.is_instancer_base) {
       continue;
     }
     /* Never dereference the pointer stored at sync time: the depsgraph may
      * have freed the evaluated object in between (procedural instancers and
      * scatter systems recreate objects every frame). Re-resolve by name. */
     Object *ob = (inst_.draw_ctx != nullptr) ?
-                     tessera_object_revalidate(inst_.draw_ctx, item.key) :
+                     tessera_object_revalidate(inst_.draw_ctx, state.ob_name) :
                      nullptr;
     if (ob == nullptr) {
       if (inst_.draw_ctx != nullptr) {
@@ -1880,6 +2079,12 @@ void TesseraModule::draw_gbuffer(const draw::View &view,
     const bool show_fps_hud = state.show_fps_hud;
     state.pass->setTelemetryEnabled(show_stats || log_console || show_fps_panel || show_fps_hud);
     if (!state.traversed_this_frame) {
+      tessera_expand_traversal_margin(*state.pass,
+                                      state.data,
+                                      state.object_mat,
+                                      state.instance_mats,
+                                      tessera_cull_view,
+                                      state.culling_margin);
       state.pass->update(state.data,
                          object_persmat,
                          viewport_proj_scale_y,
@@ -1894,7 +2099,33 @@ void TesseraModule::draw_gbuffer(const draw::View &view,
     state.pass->setTextureScale(state.current_tex_scale);
     state.pass->set_material_textures(state.materials);
     if (state.pass->drawCount() != 0) {
-      state.pass->draw_gbuffer(resolution.x, resolution.y, state.object_mat);
+      state.pass->set_two_sided(state.two_sided);
+      /* Mesh bounding sphere (object space) for per-instance culling. */
+      float3 tessera_bs_center(0.0f);
+      float tessera_bs_radius = 0.0f;
+      const bool tessera_have_bs = tessera::mesh_bounds_sphere(
+          state.data, tessera_bs_center, tessera_bs_radius);
+      if (state.instance_mats.size() > 1) {
+        /* Scattered dupli / Geometry-Nodes field: one G-Buffer write per
+         * instance matrix (M_draw = P_view * M_instance). Instances failing
+         * the per-instance frustum test are culled. */
+        for (const float4x4 &inst_mat : state.instance_mats) {
+          if (tessera_have_bs &&
+              !tessera::instance_in_frustum(tessera_cull_view,
+                                            inst_mat,
+                                            tessera_bs_center,
+                                            tessera_bs_radius,
+                                            state.culling_margin))
+          {
+            continue; /* Cull instance. */
+          }
+          const float4x4 inst_vp = viewport_persmat * inst_mat;
+          state.pass->draw_gbuffer(resolution.x, resolution.y, inst_mat, &inst_vp);
+        }
+      }
+      else {
+        state.pass->draw_gbuffer(resolution.x, resolution.y, state.object_mat);
+      }
     }
   }
 }

@@ -58,7 +58,14 @@ void main()
   }
 
   /* Tessera DAG Cut Criterion:
-   * A cluster is rendered iff: E_cluster <= tau AND E_parent > tau */
+   * A cluster is rendered iff: E_cluster <= tau AND E_parent > tau
+   *
+   * NOTE: There is intentionally NO normal-cone backface rejection in the
+   * traversal. Foliage and other open, non-watertight card geometry is
+   * two-sided: a normal bounding cone on open cards has a spread close to
+   * pi, which would prematurely cull clusters facing away from the camera
+   * and leave only grazing silhouette edges visible. Occlusion is handled
+   * by the depth pre-pass instead. */
   vec2 errs = cluster_errors[ci];
   float err_c = errs.x;
   float err_p = errs.y;

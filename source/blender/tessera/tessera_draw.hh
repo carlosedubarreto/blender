@@ -154,14 +154,32 @@ public:
         renderer_.getLevelCounts(data, lodViewProj, projScaleY, viewportHeight, out_counts);
     }
 
-    void draw(int viewportWidth, int viewportHeight) const;
-    void draw_prepass(int viewportWidth, int viewportHeight) const;
-    void draw_gbuffer(int viewportWidth, int viewportHeight, const float4x4 &object_model = float4x4::identity()) const;
+    void draw(int viewportWidth, int viewportHeight,
+              const float4x4 *view_proj_override = nullptr,
+              const float4x4 *object_model_override = nullptr) const;
+    void draw_prepass(int viewportWidth, int viewportHeight,
+                      const float4x4 *view_proj_override = nullptr) const;
+    void draw_gbuffer(int viewportWidth, int viewportHeight,
+                      const float4x4 &object_model = float4x4::identity(),
+                      const float4x4 *view_proj_override = nullptr) const;
     void draw_forward(const float4x4 &model_mat,
                       int viewportWidth,
                       int viewportHeight,
                       int lighting_type = 1,
-                      const float4 &base_color = float4(0.8f, 0.8f, 0.8f, 1.0f)) const;
+                      const float4 &base_color = float4(0.8f, 0.8f, 0.8f, 1.0f),
+                      const float4x4 *view_proj_override = nullptr) const;
+
+    /** Two-sided / foliage-card mode (see TesseraVisibilityPass). */
+    void set_two_sided(bool two_sided)
+    {
+        renderer_.set_two_sided(two_sided);
+    }
+
+    /** Alpha cutout mode (see TesseraVisibilityPass). */
+    void set_alpha_mask(bool enabled)
+    {
+        renderer_.set_alpha_mask(enabled);
+    }
 
     size_t drawCount(uint32_t material_index = 0) const;
     size_t totalDrawCount() const;

@@ -183,28 +183,33 @@ void TesseraDrawPass::setShadingMode(TesseraShadingMode mode)
     renderer_.setShadingMode(mode);
 }
 
-void TesseraDrawPass::draw(int viewportWidth, int viewportHeight) const
+void TesseraDrawPass::draw(int viewportWidth, int viewportHeight,
+                           const float4x4 *view_proj_override,
+                           const float4x4 *object_model_override) const
 {
-    renderer_.draw(viewportWidth, viewportHeight);
+    renderer_.draw(viewportWidth, viewportHeight, view_proj_override, object_model_override);
 }
 
-void TesseraDrawPass::draw_prepass(int viewportWidth, int viewportHeight) const
+void TesseraDrawPass::draw_prepass(int viewportWidth, int viewportHeight,
+                                   const float4x4 *view_proj_override) const
 {
-    renderer_.draw_prepass(viewportWidth, viewportHeight);
+    renderer_.draw_prepass(viewportWidth, viewportHeight, view_proj_override);
 }
 
-void TesseraDrawPass::draw_gbuffer(int viewportWidth, int viewportHeight, const float4x4 &object_model) const
+void TesseraDrawPass::draw_gbuffer(int viewportWidth, int viewportHeight, const float4x4 &object_model,
+                                   const float4x4 *view_proj_override) const
 {
-    renderer_.draw_gbuffer(viewportWidth, viewportHeight, object_model);
+    renderer_.draw_gbuffer(viewportWidth, viewportHeight, object_model, view_proj_override);
 }
 
 void TesseraDrawPass::draw_forward(const float4x4 &model_mat,
                                    int viewportWidth,
                                    int viewportHeight,
                                    int lighting_type,
-                                   const float4 &base_color) const
+                                   const float4 &base_color,
+                                   const float4x4 *view_proj_override) const
 {
-    renderer_.draw_forward(model_mat, viewportWidth, viewportHeight, lighting_type, base_color);
+    renderer_.draw_forward(model_mat, viewportWidth, viewportHeight, lighting_type, base_color, view_proj_override);
 }
 
 size_t TesseraDrawPass::drawCount(uint32_t material_index) const

@@ -1540,6 +1540,200 @@ def test_collection_batch_enable_disable():
 
 
 # ---------------------------------------------------------------------------
+# Test 13: Foliage Scatter Two-Sided Rendering Regression Test
+# ---------------------------------------------------------------------------
+
+def test_foliage_scatter_two_sided_rendering():
+    """Regression Test 13: Foliage scatter field two-sided rendering.
+
+    Ground-truth A/B comparison against native Blender on the ScatterFlow
+    asset, where scattered Geometry-Nodes instances of the foliage variants
+    (e.g. DewBerry) previously collapsed to a single faint card at the origin.
+
+    Validates:
+      1. The scatter field really contains multiple foliage instances.
+      2. Solid Coverage Parity: Tessera foliage pixel coverage in the camera
+         frame matches the native baseline (P_tessera / P_baseline >= 0.80).
+      3. Per-instance camera frustum culling: instances beyond the frustum are
+         culled at culling_margin = 0.0, and expanding the margin to 20.0
+         admits more perimeter instances (drawn-instance count increases).
+    """
+    print("\n" + "="*80)
+    print("RUNNING TEST 13: test_foliage_scatter_two_sided_rendering")
+    print("="*80)
+
+    import bpy
+    import mathutils
+    import numpy as np
+
+    assert os.path.exists(SAMPLE_SCATTERFLOW), f"Scatterflow asset missing: {SAMPLE_SCATTERFLOW}"
+    bpy.ops.wm.open_mainfile(filepath=SAMPLE_SCATTERFLOW)
+    scene = bpy.context.scene
+
+    # 1. Locate the foliage target in the Scatter Systems collection.
+    scatter_col = bpy.data.collections.get("Scatter Systems")
+    assert scatter_col is not None, "Collection 'Scatter Systems' not found in asset"
+    dewberry = bpy.data.objects.get("DewBerry")
+    assert dewberry is not None, "Foliage proxy object 'DewBerry' not found"
+    assert any(m.type == 'NODES' for m in dewberry.modifiers), \
+        "'DewBerry' proxy must carry a Geometry Nodes scatter modifier"
+
+    # 2. Ground-truth A/B setup: Phase 1 renders a fully native Blender
+    #    baseline (Tessera disabled on every mesh object); Phase 2 renders the
+    #    same camera with Tessera active on the DewBerry scatter field at
+    #    culling_margin = 0.0.
+    scene.tessera.batch_enabled = False
+    for ob in bpy.data.objects:
+        if ob.type == 'MESH':
+            ob["tessera_enabled"] = 0
+            if hasattr(ob, "tessera"):
+                ob.tessera.enabled = False
+    print("  ✓ Phase 1 baseline: Tessera disabled on the whole scene.")
+
+    foliage_names = ("DewBerry", "DewBerry_V1", "DewBerry_V2", "DewBerry_V3",
+                     "DewBerry_V4", "DewBerry_V5", "DewBerry_V6")
+    scatter_proxies = [ob for ob in scatter_col.objects if ob.type == 'MESH']
+
+    def set_foliage_state(enabled, clusters, margin):
+        """Switch the whole scatter field between the Tessera pipeline (with
+        optional cluster visualization + culling margin) and off. Tessera is
+        enabled for every scatter proxy so the A/B comparison covers the full
+        Scatter Systems collection."""
+        for ob in scatter_proxies:
+            ob["tessera_enabled"] = int(enabled)
+            ob["tessera_visualize_clusters"] = int(clusters)
+            ob["tessera_culling_margin"] = float(margin)
+            nc2 = os.path.join(os.path.dirname(bpy.data.filepath),
+                               f"{ob.name}.nc2")
+            if os.path.exists(nc2):
+                ob["tessera_nc2"] = nc2
+                ob["tessera_nc2_path"] = nc2
+        for name in foliage_names:
+            ob = bpy.data.objects.get(name)
+            if ob is None:
+                continue
+            ob["tessera_enabled"] = int(enabled)
+            ob["tessera_visualize_clusters"] = int(clusters)
+            ob["tessera_culling_margin"] = float(margin)
+            nc2 = os.path.join(os.path.dirname(bpy.data.filepath), f"{name}.nc2")
+            if os.path.exists(nc2):
+                ob["tessera_nc2"] = nc2
+                ob["tessera_nc2_path"] = nc2
+        scene.tessera.batch_enabled = bool(enabled)
+        scene.tessera.batch_culling_margin = float(margin)
+        bpy.context.view_layer.update()
+
+    def set_proxies_hidden(hidden):
+        """Hide the scatter proxies: their Geometry Nodes modifiers stop
+        emitting the scattered instance field."""
+        for ob in scatter_proxies:
+            ob.hide_render = hidden
+        bpy.context.view_layer.update()
+
+    def render_to_array(tag):
+        temp_img = os.path.join(bpy.app.tempdir, f"tessera_foliage_{tag}.png")
+        if os.path.exists(temp_img):
+            try:
+                os.remove(temp_img)
+            except OSError:
+                pass
+        scene.render.filepath = temp_img
+        bpy.ops.render.render(write_still=True)
+        img = bpy.data.images.load(temp_img)
+        w, h = img.size
+        px = np.array(img.pixels[:], dtype=np.float32).reshape((h, w, 4))[:, :, :3]
+        bpy.data.images.remove(img)
+        return px
+
+    def foliage_pixel_count(full_px, empty_px):
+        """Visible foliage pixels: pixels that change when the scatter field
+        is removed (works for both the native and the Tessera pipeline)."""
+        diff = np.abs(full_px - empty_px).max(axis=-1)
+        return int((diff > 0.05).sum())
+
+    # 3. Verify the scatter field: collect instance matrices through the depsgraph.
+    bpy.context.view_layer.update()
+    depsgraph = bpy.context.evaluated_depsgraph_get()
+    inst_mats = []
+    centroid = mathutils.Vector((0.0, 0.0, 0.0))
+    for inst in depsgraph.object_instances:
+        if inst.is_instance and inst.object and inst.object.name.startswith("DewBerry"):
+            inst_mats.append(inst.matrix_world.copy())
+    assert len(inst_mats) >= 2, \
+        f"Expected a scattered DewBerry field (>=2 instances), got {len(inst_mats)}"
+    for m in inst_mats:
+        centroid += m.translation / len(inst_mats)
+    radius = max((m.translation - centroid).length for m in inst_mats)
+    print(f"  ✓ Scatter field verified: {len(inst_mats)} DewBerry instances, "
+          f"centroid={tuple(round(v, 2) for v in centroid)}, radius={radius:.2f}m")
+
+    # 4. Camera: reuse the shipped scene camera framing (foliage in the
+    #    foreground extending beyond the framing edge).
+    old_camera = scene.camera
+    assert old_camera is not None, "Scatterflow asset must ship with a scene camera"
+    scene.render.engine = 'BLENDER_WORKBENCH'
+    scene.render.resolution_x = 640
+    scene.render.resolution_y = 360
+    scene.render.resolution_percentage = 100
+
+
+    # 5. Phase 1 — Native Blender baseline (Tessera disabled everywhere).
+    base_full = render_to_array("base_full")
+    set_proxies_hidden(True)
+    base_empty = render_to_array("base_empty")
+    set_proxies_hidden(False)
+    p_baseline = foliage_pixel_count(base_full, base_empty)
+    print(f"  Phase 1 baseline: {p_baseline:,} native foliage pixels")
+
+    # 6. Phase 2 — Tessera enabled on the scatter field, culling_margin = 0.0.
+    set_foliage_state(enabled=1, clusters=1, margin=0.0)
+    tess_full = render_to_array("tess_full")
+    # The traversal/instance stat lands on the object that owns the Tessera
+    # component (the scatter proxy instanced by the Geometry-Nodes system).
+    stat_ob = bpy.data.objects.get("DewBerry") or bpy.data.objects.get("DewBerry_V1")
+    drawn_m0 = int(stat_ob.get("tessera_stat_drawn_instances", 0)) if stat_ob else 0
+    set_proxies_hidden(True)
+    tess_empty = render_to_array("tess_empty")
+    set_proxies_hidden(False)
+    p_tessera = foliage_pixel_count(tess_full, tess_empty)
+    print(f"  Phase 2 tessera: {p_tessera:,} tessera foliage pixels "
+          f"({drawn_m0:,} instances drawn at margin 0.0)")
+
+    # Assertion 1 (Solid Coverage Parity): the Tessera foliage coverage inside
+    # the camera frame must match the native baseline within tolerance.
+    ratio = p_tessera / max(p_baseline, 1)
+    print(f"  Coverage parity ratio: {ratio:.3f} (threshold >= 0.80)")
+    assert ratio >= 0.80, (
+        f"Assertion 1 FAILED: Tessera foliage coverage is {ratio:.3f}x the native "
+        f"baseline ({p_tessera:,} vs {p_baseline:,} pixels). Foliage is rendering "
+        f"as faint edges or missing quads.")
+
+    # 7. Phase 3 — Camera frustum culling on instances: expanding the
+    #    culling margin must let perimeter instances survive.
+    set_foliage_state(enabled=1, clusters=1, margin=20.0)
+    render_to_array("tess_m20")
+    stat_ob = bpy.data.objects.get("DewBerry") or bpy.data.objects.get("DewBerry_V1")
+    drawn_m20 = int(stat_ob.get("tessera_stat_drawn_instances", 0)) if stat_ob else 0
+    print(f"  Phase 3 margin 20.0: {drawn_m20:,} instances drawn "
+          f"(margin 0.0 drew {drawn_m0:,})")
+    assert drawn_m20 > drawn_m0, (
+        f"Assertion 2 FAILED: expanding the culling margin did not admit more "
+        f"perimeter instances ({drawn_m0} -> {drawn_m20}). Per-instance frustum "
+        f"culling is not respecting the margin.")
+    assert drawn_m0 > 0, (
+        f"Assertion 3 FAILED: no instances were drawn at margin 0.0 despite a "
+        f"{len(inst_mats)}-instance scatter field in front of the camera.")
+
+    # 8. Cleanup: restore the shipped state.
+    set_foliage_state(enabled=0, clusters=0, margin=0.02)
+    scene.tessera.batch_enabled = False
+    scene.camera = old_camera
+
+    print("PASS: test_foliage_scatter_two_sided_rendering passed successfully.")
+    return True
+
+
+# ---------------------------------------------------------------------------
 # Test Runner & Entry Point
 # ---------------------------------------------------------------------------
 
@@ -1569,6 +1763,7 @@ def run_suite():
         ("test_collection_build_without_active_object", test_collection_build_without_active_object),
         ("test_scatterflow_instancer_isolation", test_scatterflow_instancer_isolation),
         ("test_collection_batch_enable_disable", test_collection_batch_enable_disable),
+        ("test_foliage_scatter_two_sided_rendering", test_foliage_scatter_two_sided_rendering),
     ]
 
     for name, test_fn in tests:

@@ -15,6 +15,7 @@
 
 #include "BKE_camera.h"
 #include "BKE_editmesh.hh"
+#include "BKE_geometry_set.hh"
 #include "BKE_idprop.hh"
 #include "BKE_main.hh"
 #include "BKE_material.hh"
@@ -47,7 +48,9 @@
 #include "draw_view_data.hh"
 
 #include "tessera.h"
+#include "tessera_archetype.hh"
 #include "tessera_draw.hh"
+#include "tessera_lod.hh"
 
 #include "workbench_private.hh"
 
@@ -94,6 +97,27 @@ class Instance : public DrawEngine {
     int view_source = 0;
     bool used = false;
     Object *ob = nullptr;
+    /* Name of the emitter object this state belongs to (differs from the map
+     * key when a scatter field splits into per-archetype range states). */
+    std::string ob_name;
+    /* Per-instance world matrices for scattered duplicates (Geometry Nodes /
+     * ScatterFlow fields). Empty means a single draw with #object_mat. */
+    std::vector<float4x4> instance_mats;
+    /* Sync round token: the instance list restarts when the base re-syncs. */
+    uint32_t sync_round = 0;
+    /* Two-sided / foliage-card detection (drives opaque solid shading). */
+    bool two_sided = false;
+    /* True for the base (non-dupli) sync of a Geometry-Nodes instancer: the
+     * object's evaluated geometry is a pure instance cloud, so neither the
+     * native pipeline nor Tessera draws anything for the base itself. */
+    bool is_instancer_base = false;
+    /* Archetype material base color (Workbench material-color parity for
+     * scattered foliage whose emitter proxy carries no materials). */
+    float4 base_color = float4(0.8f, 0.8f, 0.8f, 1.0f);
+    bool base_color_valid = false;
+    /* Identity of the geometry source feeding #data ("base" for the regular
+     * .nc2 path, the archetype name for realized-geometry ranges). */
+    std::string data_source_key;
     bool show_stats = true;
     bool log_console = false;
     bool show_fps_panel = false;
@@ -106,10 +130,36 @@ class Instance : public DrawEngine {
     std::unique_ptr<tessera::TesseraDrawPass> pass;
   };
 
-  /** Tessera objects found during sync, keyed by object name. */
+  /** Tessera objects found during sync, keyed by "<emitter>|<geometry>". */
   Map<std::string, std::unique_ptr<TesseraObjectState>> tessera_objects_;
   /** Guards #tessera_objects_ (object_sync may run on extraction threads). */
   std::mutex tessera_mutex_;
+  /** Bumped every begin_sync; instance lists restart when the base re-syncs. */
+  uint32_t tessera_sync_round_ = 1;
+
+  /* Cap on collected per-object instance matrices (bounds per-frame cost of
+   * scattered Geometry-Nodes / ScatterFlow fields). Large scatter fields are
+   * common; 64k covers realistic point-cloud instancing output. */
+  static constexpr size_t kMaxTesseraInstancesPerObject = 65536;
+
+  /**
+   * Detect two-sided / foliage-card geometry: explicit per-object IDProperty
+   * override (`tessera_two_sided`) wins; without it the mesh is treated as
+   * two-sided when its materials drive opacity from textures (the classic
+   * alpha-cutout leaf-card setup). The visibility pipeline renders both
+   * faces with flipped backface normals either way.
+   */
+  static bool tessera_object_is_two_sided(Object *ob)
+  {
+    if (ob == nullptr) {
+      return false;
+    }
+    const IDProperty *prop = tessera_property_find_safe(ob, "tessera_two_sided");
+    if (prop != nullptr && prop->type == IDP_INT) {
+      return IDP_int_get(prop) != 0;
+    }
+    return false;
+  }
 
   /* Tessera data ownership helpers. */
 
@@ -492,6 +542,28 @@ class Instance : public DrawEngine {
     }
   }
 
+  /** Write an integer statistic to the object and its original datablock. */
+  static void tessera_stat_int_write(Object *ob, const char *prop_name, int value)
+  {
+    if (ob == nullptr) {
+      return;
+    }
+    auto write_props = [&](ID *id) {
+      if (id == nullptr) {
+        return;
+      }
+      if (IDProperty *group = IDP_EnsureProperties(id)) {
+        idp_int_replace(group, prop_name, value);
+      }
+    };
+
+    write_props(&ob->id);
+    const ID *orig_id = DEG_get_original_id(&ob->id);
+    if (orig_id != nullptr && orig_id != &ob->id) {
+      write_props(const_cast<ID *>(orig_id));
+    }
+  }
+
   /**
    * Re-resolve the evaluated object for a recorded Tessera object by name.
    * The pointer stored during sync may have been freed by the depsgraph in
@@ -580,8 +652,9 @@ class Instance : public DrawEngine {
    * \return true when the object is owned by the Tessera pipeline (the caller
    * must skip the regular Workbench mesh draw for it).
    */
-  bool tessera_record(Object *ob)
+  bool tessera_record(ObjectRef &ob_ref)
   {
+    Object *ob = ob_ref.object;
     if (!is_tessera_eligible_mesh(ob)) {
       return false;
     }
@@ -604,15 +677,52 @@ class Instance : public DrawEngine {
     const int64_t file_size = stat_ok ? int64_t(file_info.st_size) : int64_t(-1);
 
     std::lock_guard lock(this->tessera_mutex_);
+
+    const bool is_dupli = (ob->base_flag & BASE_FROM_DUPLI) != 0;
+    const bool is_range = ob_ref.is_range();
+
+    /* Realized-geometry archetype resolution: Geometry-Nodes scatter fields
+     * (ScatterFlow etc.) deliver their instanced plant meshes as duplis of
+     * the emitter whose #DupliObject.ob_data is the *realized source mesh*,
+     * one ObjectRef instance range per plant variety. Resolve each range's
+     * real geometry (the pre-built archetype .nc2, or a lazily built cluster
+     * DAG) so Tessera draws the same plants the native pipeline renders
+     * instead of the low-poly emitter proxy. */
+    tessera::TesseraArchetype arch;
+    bool arch_resolved = false;
+    Main *arch_bmain = (this->draw_ctx != nullptr && this->draw_ctx->depsgraph != nullptr) ?
+                           DEG_get_bmain(this->draw_ctx->depsgraph) :
+                           nullptr;
+    if (is_dupli || is_range) {
+      if (const ID *range_data = static_cast<const ID *>(ob->data)) {
+        arch = tessera::ArchetypeResolver::global().resolve(
+            arch_bmain, BKE_main_blendfile_path_from_global(), ob, range_data);
+        arch_resolved = arch.valid;
+      }
+    }
+
+    std::string state_key(ob->id.name + 2);
+    if (arch_resolved) {
+      state_key += "|";
+      state_key += arch.source_name;
+    }
     std::unique_ptr<TesseraObjectState> &entry = tessera_objects_.lookup_or_add_default(
-        std::string(ob->id.name + 2));
+        state_key);
     if (entry == nullptr) {
       entry = std::make_unique<TesseraObjectState>();
     }
     TesseraObjectState &state = *entry;
 
+    if (state.sync_round != this->tessera_sync_round_) {
+      /* First sync of this object in the current sync round: start a fresh
+       * instance list. */
+      state.sync_round = this->tessera_sync_round_;
+      state.instance_mats.clear();
+    }
+
     state.used = true;
     state.ob = ob;
+    state.ob_name = std::string(ob->id.name + 2);
     state.show_stats = tessera_show_stats_get(ob);
     state.log_console = tessera_log_console_get(ob);
     state.show_fps_panel = tessera_show_fps_panel_get(ob);
@@ -621,16 +731,86 @@ class Instance : public DrawEngine {
     state.pixel_error = tessera_pixel_error_get(ob);
     state.view_source = tessera_view_source_get(ob);
     state.culling_margin = tessera_culling_margin_get(ob);
-    state.object_mat = ob->object_to_world();
+    state.object_mat = ob_ref.is_range() ? ob_ref.object_to_world(0) : ob->object_to_world();
+    state.two_sided = tessera_object_is_two_sided(ob);
+    state.is_instancer_base = false;
+    if (arch_resolved) {
+      /* Shading parity with the native pipeline: the archetype's material
+       * color and two-sided foliage-card handling apply to every instance
+       * of this range (the emitter proxy itself carries no materials). */
+      if (arch.base_color_valid) {
+        state.base_color = arch.base_color;
+        state.base_color_valid = true;
+      }
+      if (!arch.matched_object_name.empty() && arch_bmain != nullptr) {
+        Object *arch_ob = static_cast<Object *>(BLI_findstring(&arch_bmain->objects,
+                                                               arch.matched_object_name.c_str(),
+                                                               offsetof(ID, name) + 2));
+        if (arch_ob != nullptr) {
+          state.two_sided = state.two_sided || tessera_object_is_two_sided(arch_ob);
+        }
+      }
+      state.two_sided = state.two_sided || arch.two_sided;
+    }
+    if (!is_dupli && !is_range) {
+      /* Base sync of a pure Geometry-Nodes instancer: the evaluated geometry
+       * is an instance cloud, so the native pipeline draws nothing for the
+       * base object itself — skip its Tessera draw to stay identical. */
+      if (ob->runtime && ob->runtime->geometry_set_eval &&
+          ob->runtime->geometry_set_eval->has_instances())
+      {
+        state.is_instancer_base = true;
+      }
+    }
+    /* ScatterFlow / Geometry-Nodes instances arrive as ObjectRef instance
+     * ranges: extract the full 4x4 matrix of every instance dynamically into
+     * the instance array (up to 64k entries). Each scattered copy is culled
+     * and rasterized individually at draw time — this is what restores the
+     * scattered foliage field that previously collapsed to a single card. */
+    if (ob_ref.is_range()) {
+      const int range_count = ob_ref.instances_count();
+      const size_t room = (state.instance_mats.size() < kMaxTesseraInstancesPerObject) ?
+                              (kMaxTesseraInstancesPerObject - state.instance_mats.size()) :
+                              0;
+      const int to_copy = std::min(int(room), range_count);
+      for (int i = 0; i < to_copy; ++i) {
+        state.instance_mats.push_back(ob_ref.object_to_world(i));
+      }
+    }
+    else if (is_dupli) {
+      /* Legacy per-dupli sync path (one object_sync call per dupli). */
+      if (state.instance_mats.size() < kMaxTesseraInstancesPerObject) {
+        state.instance_mats.push_back(state.object_mat);
+      }
+    }
 
-    /* (Re)load the cluster data when the file path, mtime, or size changed. */
-    const bool stale = (state.nc2_path != abs_path) ||
-                       (state.file_mtime != file_mtime) ||
-                       (state.file_size != file_size);
-    if (state.pass == nullptr || stale) {
+    /* (Re)load the cluster data when the resolved source changed. */
+    if (arch_resolved && arch.built_data != nullptr) {
+      /* Clusters were built directly from the realized geometry: adopt the
+       * cached data (reload only when the geometry identity changed). */
+      if (state.data_source_key != arch.source_name || state.data.clusters.empty()) {
+        state.data = *arch.built_data;
+        state.pass.reset();
+      }
+      state.data_source_key = arch.source_name;
+      state.nc2_path = "";
+      state.file_mtime = 0;
+      state.file_size = 0;
+    }
+    else {
+      const std::string load_path = arch_resolved ? arch.nc2_path : std::string(abs_path);
+      BLI_stat_t arch_info;
+      int64_t load_mtime = file_mtime;
+      int64_t load_size = file_size;
+      if (arch_resolved && BLI_stat(load_path.c_str(), &arch_info) == 0) {
+        load_mtime = int64_t(arch_info.st_mtime);
+        load_size = int64_t(arch_info.st_size);
+      }
+      const bool stale = (state.nc2_path != load_path) || (state.file_mtime != load_mtime) ||
+                         (state.file_size != load_size);
       if (stale || state.data.clusters.empty()) {
         size_t data_size = 0;
-        if (void *file_data = BLI_file_read_binary_as_mem(abs_path, 0, &data_size)) {
+        if (void *file_data = BLI_file_read_binary_as_mem(load_path.c_str(), 0, &data_size)) {
           tessera::TesseraData loaded;
           if (tessera::deserializeFromMemory(loaded,
                                             static_cast<const uint8_t *>(file_data),
@@ -641,9 +821,10 @@ class Instance : public DrawEngine {
           }
           MEM_delete_void(file_data);
         }
-        state.file_mtime = file_mtime;
-        state.file_size = file_size;
-        state.nc2_path = abs_path;
+        state.file_mtime = load_mtime;
+        state.file_size = load_size;
+        state.nc2_path = load_path;
+        state.data_source_key = arch_resolved ? arch.source_name : "base";
         /* Drop the pass so it is rebuilt with the new data on draw. */
         state.pass.reset();
       }
@@ -664,17 +845,30 @@ class Instance : public DrawEngine {
     /* Vertical projection scale from the pure projection matrix (not corrupted
      * by object rotation). For orthographic views winmat[1][1] == 2/height. */
     const float viewport_proj_scale_y = std::abs(default_view.winmat()[1][1]);
+    /* World-space frustum planes for per-instance camera culling, extracted
+     * from the pure view-projection (world -> clip) — never from an
+     * object-baked matrix. */
+    const tessera::TesseraViewInfo tessera_cull_view = tessera::getViewInfo(
+        viewport_persmat, float(resolution.y), viewport_proj_scale_y);
+
+    Map<std::string, int> drawn_instances_by_emitter;
 
     for (auto item : tessera_objects_.items()) {
       TesseraObjectState &state = *item.value;
       if (!state.used || state.data.clusters.empty()) {
         continue;
       }
+      /* Pure Geometry-Nodes instancer base: the native pipeline draws nothing
+       * for the base object (its evaluated geometry is an instance cloud),
+       * so Tessera must not draw it either. */
+      if (state.is_instancer_base) {
+        continue;
+      }
       /* Never dereference the pointer stored at sync time: the depsgraph may
        * have freed the evaluated object in between (procedural instancers and
        * scatter systems recreate objects every frame). Re-resolve by name. */
       Object *ob = (this->draw_ctx != nullptr) ?
-                       tessera_object_revalidate(this->draw_ctx, item.key) :
+                       tessera_object_revalidate(this->draw_ctx, state.ob_name) :
                        nullptr;
       if (ob == nullptr) {
         if (this->draw_ctx != nullptr) {
@@ -682,6 +876,7 @@ class Instance : public DrawEngine {
           state.used = false;
           state.ob = nullptr;
           state.pass.reset();
+          state.data = tessera::TesseraData{};
         }
         continue;
       }
@@ -757,6 +952,11 @@ class Instance : public DrawEngine {
         else if (scene_state_.shading.color_type == V3D_SHADING_OBJECT_COLOR && state.ob != nullptr) {
           mats[0].base_color = float4(state.ob->color[0], state.ob->color[1], state.ob->color[2], 1.0f);
         }
+        else if (state.base_color_valid) {
+          /* Material color of the instanced archetype: scattered foliage's
+           * emitter proxy carries no materials, the real plant does. */
+          mats[0].base_color = state.base_color;
+        }
         else {
           mats[0].base_color = float4(0.8f, 0.8f, 0.8f, 1.0f);
         }
@@ -818,6 +1018,27 @@ class Instance : public DrawEngine {
       }
       state.pass->setPixelError(effective_pixel_error);
       state.pass->setNavigating(is_navigating);
+
+      /* For scattered instance fields, expand the traversal culling margin so
+       * the cluster selection is not gated by the base archetype transform
+       * (traversal only sees one instance matrix). The traversal planes are
+       * transformed into the baked instance's local space — a space that can
+       * be scaled/rotated arbitrarily relative to the world — so the
+       * worst-case plane distance is bounded by the *local* camera-to-field
+       * distance. The per-instance frustum test below performs the real
+       * visibility work for every scattered copy at draw time. */
+      if (state.instance_mats.size() > 1) {
+        float3 field_bs_center(0.0f);
+        float field_bs_radius = 0.0f;
+        if (tessera::mesh_bounds_sphere(state.data, field_bs_center, field_bs_radius)) {
+          const float4x4 inv_object_mat = math::invert(state.object_mat);
+          const float3 cam_pos_local = (inv_object_mat *
+                                        float4(tessera_cull_view.camPos, 1.0f)).xyz();
+          const float dist_cam_local = math::distance(cam_pos_local, field_bs_center);
+          state.pass->setCullingMargin(dist_cam_local + 2.0f * field_bs_radius +
+                                       state.culling_margin);
+        }
+      }
 
       state.pass->update(state.data,
                          object_persmat,
@@ -949,7 +1170,72 @@ class Instance : public DrawEngine {
         else if (scene_state_.shading.color_type == V3D_SHADING_OBJECT_COLOR && state.ob != nullptr) {
           base_col = float4(state.ob->color[0], state.ob->color[1], state.ob->color[2], 1.0f);
         }
-        state.pass->draw_forward(state.object_mat, resolution.x, resolution.y, lighting_type, base_col);
+        else if (state.base_color_valid) {
+          base_col = state.base_color;
+        }
+        state.pass->set_two_sided(state.two_sided);
+        /* Mesh bounding sphere in object space (union of cluster spheres)
+         * used for the per-instance camera frustum test. */
+        float3 tessera_bs_center(0.0f);
+        float tessera_bs_radius = 0.0f;
+        const bool tessera_have_bs = tessera::mesh_bounds_sphere(
+            state.data, tessera_bs_center, tessera_bs_radius);
+        int drawn_instances = 0;
+        if (state.instance_mats.size() > 1) {
+          /* Scattered dupli / Geometry-Nodes field: one rasterization draw per
+           * instance matrix, reusing the recorded cluster selection. The
+           * instance transform enters both the projection
+           * (M_draw = P_view * M_instance) and the normal matrix. */
+          for (const float4x4 &inst_mat : state.instance_mats) {
+            /* Per-instance camera frustum culling: transform the mesh
+             * bounding sphere by the instance matrix and test it against the
+             * six world-space frustum planes. Instances failing the test are
+             * dropped before any rasterization dispatch, so scattered foliage
+             * outside the camera view cone (or beyond the user-configured
+             * culling margin) never reaches the GPU. */
+            if (tessera_have_bs &&
+                !tessera::instance_in_frustum(tessera_cull_view,
+                                              inst_mat,
+                                              tessera_bs_center,
+                                              tessera_bs_radius,
+                                              state.culling_margin))
+            {
+              continue; /* Cull instance. */
+            }
+            const float4x4 inst_view_proj = viewport_persmat * inst_mat;
+            state.pass->draw_forward(
+                inst_mat, resolution.x, resolution.y, lighting_type, base_col, &inst_view_proj);
+            drawn_instances += 1;
+          }
+        }
+        else {
+          state.pass->draw_forward(state.object_mat, resolution.x, resolution.y, lighting_type, base_col);
+          drawn_instances = 1;
+        }
+        /* Expose the number of instances that survived culling for tests and
+         * the debug UI (drives the camera-margin verification). Scatter
+         * fields split into per-archetype range states: accumulate per
+         * emitter and write the sum once below. */
+        if (state.instance_mats.size() > 1) {
+          drawn_instances_by_emitter.lookup_or_add(state.ob_name, 0) += drawn_instances;
+
+        }
+        else {
+          tessera_stat_int_write(state.ob, "tessera_stat_drawn_instances", drawn_instances);
+        }
+      }
+    }
+
+    /* Aggregated drawn-instance counts: one write per emitter object so the
+     * stat always reflects the whole scatter field across all archetypes. */
+    if (!drawn_instances_by_emitter.is_empty()) {
+      for (const auto emitter_item : drawn_instances_by_emitter.items()) {
+        Object *stat_ob = (this->draw_ctx != nullptr) ?
+                              tessera_object_revalidate(this->draw_ctx, emitter_item.key) :
+                              nullptr;
+        if (stat_ob != nullptr) {
+          tessera_stat_int_write(stat_ob, "tessera_stat_drawn_instances", emitter_item.value);
+        }
       }
     }
   }
@@ -1022,8 +1308,21 @@ class Instance : public DrawEngine {
   {
     {
       std::lock_guard lock(this->tessera_mutex_);
+      const uint32_t finished_round = this->tessera_sync_round_;
+      this->tessera_sync_round_ += 1;
+      Vector<std::string> stale_keys;
       for (auto item : tessera_objects_.items()) {
+        if (!item.value->used && item.value->sync_round < finished_round) {
+          /* Range state (per-archetype) that missed a whole sync round: the
+           * emitter stopped producing this archetype — drop it to bound
+           * memory. States touched this round have sync_round == finished_round. */
+          stale_keys.append(item.key);
+          continue;
+        }
         item.value->used = false;
+      }
+      for (const std::string &key : stale_keys) {
+        tessera_objects_.remove(key);
       }
     }
 
@@ -1083,7 +1382,7 @@ class Instance : public DrawEngine {
 
     if (this->tessera_is_enabled(ob)) {
       /* 1. Record object into Tessera's instance pipeline */
-      this->tessera_record(ob);
+      this->tessera_record(ob_ref);
 
       /* 2. CRITICAL: Completely bypass standard Workbench mesh submission!
        * DO NOT call:

@@ -250,6 +250,12 @@ void main()
   vec4 albedo = has_d ? (tex_diff * vec4(base_col.rgb, 1.0)) : vec4(base_col.rgb, 1.0);
   float roughness = clamp(has_r ? tex_rough : rough_val, 0.001, 1.0);
 
+  /* Alpha cutout: reject transparent texel borders of foliage cards so the
+   * shaded silhouette matches the leaf texture instead of the full quad. */
+  if (has_d && tex_diff.a < 0.33) {
+    discard;
+  }
+
   /* MikkTSpace normal perturbation in world space using vertex normal and 4D tangent */
   mat3 norm_mat = normal_mat;
   vec3 world_nor = normalize(norm_mat * nor);
@@ -453,6 +459,12 @@ void main()
   vec4 albedo = has_d ? (tex_diff * vec4(base_col.rgb, 1.0)) : vec4(base_col.rgb, 1.0);
   float roughness = clamp(has_r ? tex_rough : rough_val, 0.001, 1.0);
 
+  /* Alpha cutout: reject transparent texel borders of foliage cards so the
+   * deferred G-Buffer silhouette matches the leaf texture. */
+  if (has_d && tex_diff.a < 0.33) {
+    discard;
+  }
+
   mat3 norm_mat = normal_mat;
   vec3 world_nor = normalize(norm_mat * nor);
 
@@ -513,12 +525,36 @@ void main()
   vec3 pos = vec3(positions[idx * 3u], positions[idx * 3u + 1u],
                   positions[idx * 3u + 2u]);
   gl_Position = view_proj * vec4(pos, 1.0);
+
+  uint mat_idx = tri_materials[global_idx / 3u];
+  if (mat_idx >= 4u) {
+    mat_idx = 0u;
+  }
+  v_mat = mat_idx;
+  v_uv = vec2(uvs[idx * 2u], uvs[idx * 2u + 1u]);
 }
 )";
 
 static const char *DEPTH_FRAG_SOURCE = R"(
 void main()
 {
+  /* Alpha cutout: leaf / grass cards carry their silhouette in the base
+   * color texture alpha channel. Reject transparent texel borders so the
+   * depth pre-pass does not leave rectangular halos around foliage. */
+  if (has_alpha_mask != 0) {
+    float slot_has_d = (v_mat == 0u) ? has_tex_flags.x :
+                       (v_mat == 1u) ? has_tex_flags.y :
+                       (v_mat == 2u) ? has_tex_flags.z : has_tex_flags.w;
+    if (slot_has_d > 0.5) {
+      vec4 tex_col = (v_mat == 0u) ? texture(tex_diffuse_0, v_uv) :
+                     (v_mat == 1u) ? texture(tex_diffuse_1, v_uv) :
+                     (v_mat == 2u) ? texture(tex_diffuse_2, v_uv) :
+                                     texture(tex_diffuse_3, v_uv);
+      if (tex_col.a < 0.33) {
+        discard;
+      }
+    }
+  }
 }
 )";
 
@@ -632,9 +668,23 @@ gpu::Shader *createDepthPrepassShader()
     info.vertex_in(0, Type::uint_t, "vid");
     info.storage_buf(0, Qualifier::read, "uint", "tri_indices[]");
     info.storage_buf(1, Qualifier::read, "float", "positions[]");
+    info.storage_buf(2, Qualifier::read, "float", "uvs[]");
+    info.storage_buf(3, Qualifier::read, "uint", "tri_materials[]");
+
+    info.sampler(0, ImageType::Float2D, "tex_diffuse_0");
+    info.sampler(1, ImageType::Float2D, "tex_diffuse_1");
+    info.sampler(2, ImageType::Float2D, "tex_diffuse_2");
+    info.sampler(3, ImageType::Float2D, "tex_diffuse_3");
 
     info.push_constant(Type::float4x4_t, "view_proj");
     info.push_constant(Type::int_t, "reverse_z");
+    info.push_constant(Type::int_t, "has_alpha_mask");
+    info.push_constant(Type::float4_t, "has_tex_flags");
+
+    StageInterfaceInfo iface("tessera_depth_iface", "");
+    iface.smooth(Type::float2_t, "v_uv");
+    iface.flat(Type::uint_t, "v_mat");
+    info.vertex_out(iface);
 
     const GPUShaderCreateInfo *raw = reinterpret_cast<const GPUShaderCreateInfo *>(&info);
     return GPU_shader_create_from_info_python(raw);
@@ -714,6 +764,13 @@ void main()
   v_world_normal = (len_n > 1e-6) ? (n / len_n) : nor;
   v_world_pos = world_pos.xyz;
 
+  v_uv = vec2(uvs[idx * 2u], uvs[idx * 2u + 1u]);
+  uint mat_idx = tri_materials[global_idx / 3u];
+  if (mat_idx >= 4u) {
+    mat_idx = 0u;
+  }
+  v_mat = mat_idx;
+
   v_cluster_id = 0u;
   if (debug_clusters != 0) {
     for (uint c = 0u; c < uint(cluster_count); ++c) {
@@ -730,6 +787,25 @@ void main()
 static const char *FORWARD_FRAG_SOURCE = R"(
 void main()
 {
+  /* Alpha cutout: leaf / grass cards carry their silhouette in the base
+   * color texture alpha channel; reject transparent texel borders so foliage
+   * renders as solid, fully-shaped leaves instead of rectangular quads or
+   * faint outlines. */
+  if (has_alpha_mask != 0) {
+    float slot_has_d = (v_mat == 0u) ? has_tex_flags.x :
+                       (v_mat == 1u) ? has_tex_flags.y :
+                       (v_mat == 2u) ? has_tex_flags.z : has_tex_flags.w;
+    if (slot_has_d > 0.5) {
+      vec4 tex_col = (v_mat == 0u) ? texture(tex_diffuse_0, v_uv) :
+                     (v_mat == 1u) ? texture(tex_diffuse_1, v_uv) :
+                     (v_mat == 2u) ? texture(tex_diffuse_2, v_uv) :
+                                     texture(tex_diffuse_3, v_uv);
+      if (tex_col.a < 0.33) {
+        discard;
+      }
+    }
+  }
+
   if (shading_mode == 1) { /* TESSERA_SHADING_CLUSTERS */
     uint cid = v_cluster_id;
     uint h = cid * 747796405u + 2891336453u;
@@ -807,6 +883,13 @@ gpu::Shader *createForwardShader()
     info.storage_buf(1, Qualifier::read, "float", "positions[]");
     info.storage_buf(2, Qualifier::read, "float", "normals[]");
     info.storage_buf(3, Qualifier::read, "uvec4", "cluster_meta[]");
+    info.storage_buf(4, Qualifier::read, "float", "uvs[]");
+    info.storage_buf(5, Qualifier::read, "uint", "tri_materials[]");
+
+    info.sampler(0, ImageType::Float2D, "tex_diffuse_0");
+    info.sampler(1, ImageType::Float2D, "tex_diffuse_1");
+    info.sampler(2, ImageType::Float2D, "tex_diffuse_2");
+    info.sampler(3, ImageType::Float2D, "tex_diffuse_3");
 
     info.push_constant(Type::float4x4_t, "view_proj");
     info.push_constant(Type::float4x4_t, "model_mat");
@@ -817,10 +900,14 @@ gpu::Shader *createForwardShader()
     info.push_constant(Type::int_t, "lighting_type");
     info.push_constant(Type::int_t, "cluster_count");
     info.push_constant(Type::int_t, "debug_clusters");
+    info.push_constant(Type::int_t, "has_alpha_mask");
+    info.push_constant(Type::float4_t, "has_tex_flags");
 
     StageInterfaceInfo iface("tessera_forward_iface", "");
     iface.smooth(Type::float3_t, "v_world_pos");
     iface.smooth(Type::float3_t, "v_world_normal");
+    iface.smooth(Type::float2_t, "v_uv");
+    iface.flat(Type::uint_t, "v_mat");
     iface.flat(Type::uint_t, "v_cluster_id");
     info.vertex_out(iface);
 
@@ -1274,14 +1361,42 @@ void TesseraVisibilityPass::render_depth_prepass(gpu::StorageBuf *command_buf,
     GPU_depth_test(reverse_z ? GPU_DEPTH_GREATER_EQUAL : GPU_DEPTH_LESS_EQUAL);
     GPU_depth_mask(true);
     GPU_color_mask(false, false, false, false);
+    /* Face culling stays disabled: two-sided foliage cards must rasterize
+     * their back faces, and occlusion is resolved by depth. */
     GPU_face_culling(GPU_CULL_NONE);
     GPU_blend(GPU_BLEND_NONE);
 
     GPU_shader_bind(mDepthPrepassShader);
     GPU_storagebuf_bind(mIndicesBuf, 0);
     GPU_storagebuf_bind(mPositionsBuf, 1);
+    GPU_storagebuf_bind(mUvsBuf, 2);
+    GPU_storagebuf_bind(mTriMaterialsBuf, 3);
+
+    /* Alpha cutout state (kept in sync with the material/forward passes so
+     * the depth buffer matches the shaded silhouette). */
+    bool depth_alpha_active = false;
+    float4 depth_has_tex(0.0f);
+    for (int s = 0; s < 4; ++s) {
+        const bool slot_has_diffuse = (s < int(mMaterials.size())) &&
+                                      mMaterials[s].has_diffuse &&
+                                      (mMaterials[s].diffuse != nullptr);
+        gpu::Texture *diff = slot_has_diffuse ?
+                                 mMaterials[s].diffuse :
+                                 ((mDefaultWhiteTex != nullptr) ? mDefaultWhiteTex : nullptr);
+        if (diff != nullptr) {
+            GPU_texture_bind(diff, s);
+        }
+        if (slot_has_diffuse) {
+            depth_has_tex[s] = 1.0f;
+            depth_alpha_active = true;
+        }
+    }
+    depth_alpha_active = depth_alpha_active && mAlphaMask;
+
     GPU_shader_uniform_mat4(mDepthPrepassShader, "view_proj", viewProj.ptr());
     GPU_shader_uniform_1i(mDepthPrepassShader, "reverse_z", reverse_z ? 1 : 0);
+    GPU_shader_uniform_1i(mDepthPrepassShader, "has_alpha_mask", depth_alpha_active ? 1 : 0);
+    GPU_shader_uniform_4f(mDepthPrepassShader, "has_tex_flags", depth_has_tex.x, depth_has_tex.y, depth_has_tex.z, depth_has_tex.w);
 
     if (material_counts != nullptr && !material_counts->empty() && max_commands_per_material > 0) {
         for (size_t mat = 0; mat < material_counts->size(); ++mat) {
@@ -1614,6 +1729,10 @@ void TesseraVisibilityPass::render_forward(gpu::StorageBuf *command_buf,
     GPU_depth_test(GPU_DEPTH_LESS_EQUAL);
     GPU_depth_mask(true);
     GPU_color_mask(true, true, true, true);
+    /* Two-sided foliage / open-card meshes must show their back faces (the
+     * shader flips backfacing normals), and watertight geometry resolves
+     * occlusion through depth testing, so face culling stays disabled for
+     * the whole Tessera pipeline. */
     GPU_face_culling(GPU_CULL_NONE);
     GPU_blend(GPU_BLEND_NONE);
 
@@ -1624,17 +1743,47 @@ void TesseraVisibilityPass::render_forward(gpu::StorageBuf *command_buf,
     if (mClusterMetaBuf != nullptr) {
         GPU_storagebuf_bind(mClusterMetaBuf, 3);
     }
+    GPU_storagebuf_bind(mUvsBuf, 4);
+    GPU_storagebuf_bind(mTriMaterialsBuf, 5);
+
+    /* Alpha cutout state: active when any material slot carries a diffuse
+     * texture (foliage cards carry their silhouette in texture alpha). */
+    bool alpha_mask_active = false;
+    float4 has_tex_flags(0.0f);
+    for (int s = 0; s < 4; ++s) {
+        const bool slot_has_diffuse = (s < int(mMaterials.size())) &&
+                                      mMaterials[s].has_diffuse &&
+                                      (mMaterials[s].diffuse != nullptr);
+        gpu::Texture *diff = slot_has_diffuse ?
+                                 mMaterials[s].diffuse :
+                                 ((mDefaultWhiteTex != nullptr) ? mDefaultWhiteTex : nullptr);
+        if (diff != nullptr) {
+            GPU_texture_bind(diff, s);
+        }
+        if (slot_has_diffuse) {
+            has_tex_flags[s] = 1.0f;
+            alpha_mask_active = true;
+        }
+    }
+    alpha_mask_active = alpha_mask_active && mAlphaMask;
 
     GPU_shader_uniform_mat4(mForwardShader, "view_proj", viewProj.ptr());
     GPU_shader_uniform_mat4(mForwardShader, "model_mat", model_mat.ptr());
     float3x3 fwd_norm = compute_normal_matrix(model_mat);
     GPU_shader_uniform_mat3(mForwardShader, "normal_mat", reinterpret_cast<const float(*)[3]>(fwd_norm.ptr()));
     GPU_shader_uniform_3f(mForwardShader, "camera_pos", cam_pos.x, cam_pos.y, cam_pos.z);
-    GPU_shader_uniform_4f(mForwardShader, "base_color", base_color.x, base_color.y, base_color.z, base_color.w);
+    /* Two-sided (foliage card) meshes render fully opaque in solid view. */
+    float4 forward_base_color = base_color;
+    if (mTwoSided) {
+        forward_base_color.w = 1.0f;
+    }
+    GPU_shader_uniform_4f(mForwardShader, "base_color", forward_base_color.x, forward_base_color.y, forward_base_color.z, forward_base_color.w);
     GPU_shader_uniform_1i(mForwardShader, "shading_mode", shading_mode);
     GPU_shader_uniform_1i(mForwardShader, "lighting_type", lighting_type);
     GPU_shader_uniform_1i(mForwardShader, "cluster_count", int(mClusterCount));
     GPU_shader_uniform_1i(mForwardShader, "debug_clusters", shading_mode == TESSERA_SHADING_CLUSTERS ? 1 : 0);
+    GPU_shader_uniform_1i(mForwardShader, "has_alpha_mask", alpha_mask_active ? 1 : 0);
+    GPU_shader_uniform_4f(mForwardShader, "has_tex_flags", has_tex_flags.x, has_tex_flags.y, has_tex_flags.z, has_tex_flags.w);
 
     if (material_counts != nullptr && !material_counts->empty() && max_commands_per_material > 0) {
         for (size_t mat = 0; mat < material_counts->size(); ++mat) {
