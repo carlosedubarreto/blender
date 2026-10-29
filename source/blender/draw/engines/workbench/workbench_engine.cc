@@ -136,6 +136,9 @@ class Instance : public DrawEngine {
   std::mutex tessera_mutex_;
   /** Bumped every begin_sync; instance lists restart when the base re-syncs. */
   uint32_t tessera_sync_round_ = 1;
+  float4x4 tessera_last_view_persmat_ = float4x4::identity();
+  bool tessera_has_last_view_persmat_ = false;
+  std::chrono::steady_clock::time_point tessera_last_view_move_time_{};
 
   /* Cap on collected per-object instance matrices (bounds per-frame cost of
    * scattered Geometry-Nodes / ScatterFlow fields). Large scatter fields are
@@ -671,11 +674,6 @@ class Instance : public DrawEngine {
     BLI_strncpy(abs_path, idprop_path.c_str(), sizeof(abs_path));
     BLI_path_abs(abs_path, BKE_main_blendfile_path_from_global());
 
-    BLI_stat_t file_info;
-    const bool stat_ok = (BLI_stat(abs_path, &file_info) == 0);
-    const int64_t file_mtime = stat_ok ? int64_t(file_info.st_mtime) : int64_t(-1);
-    const int64_t file_size = stat_ok ? int64_t(file_info.st_size) : int64_t(-1);
-
     std::lock_guard lock(this->tessera_mutex_);
 
     const bool is_dupli = (ob->base_flag & BASE_FROM_DUPLI) != 0;
@@ -799,15 +797,23 @@ class Instance : public DrawEngine {
     }
     else {
       const std::string load_path = arch_resolved ? arch.nc2_path : std::string(abs_path);
-      BLI_stat_t arch_info;
-      int64_t load_mtime = file_mtime;
-      int64_t load_size = file_size;
-      if (arch_resolved && BLI_stat(load_path.c_str(), &arch_info) == 0) {
-        load_mtime = int64_t(arch_info.st_mtime);
-        load_size = int64_t(arch_info.st_size);
+      const bool in_interactive_viewport = (this->draw_ctx != nullptr &&
+                                            this->draw_ctx->rv3d != nullptr);
+      bool stale = (state.nc2_path != load_path) || state.data.clusters.empty();
+      int64_t load_mtime = state.file_mtime;
+      int64_t load_size = state.file_size;
+      if (stale || !in_interactive_viewport) {
+        BLI_stat_t load_info;
+        if (BLI_stat(load_path.c_str(), &load_info) == 0) {
+          load_mtime = int64_t(load_info.st_mtime);
+          load_size = int64_t(load_info.st_size);
+        }
+        else {
+          load_mtime = -1;
+          load_size = -1;
+        }
+        stale = stale || (state.file_mtime != load_mtime) || (state.file_size != load_size);
       }
-      const bool stale = (state.nc2_path != load_path) || (state.file_mtime != load_mtime) ||
-                         (state.file_size != load_size);
       if (stale || state.data.clusters.empty()) {
         size_t data_size = 0;
         if (void *file_data = BLI_file_read_binary_as_mem(load_path.c_str(), 0, &data_size)) {
@@ -841,6 +847,7 @@ class Instance : public DrawEngine {
     }
     std::lock_guard lock(this->tessera_mutex_);
     const draw::View &default_view = draw::View::default_get();
+    const float4x4 unjittered_persmat = default_view.persmat();
     const float4x4 viewport_persmat = view_.persmat();
     /* Vertical projection scale from the pure projection matrix (not corrupted
      * by object rotation). For orthographic views winmat[1][1] == 2/height. */
@@ -849,9 +856,37 @@ class Instance : public DrawEngine {
      * from the pure view-projection (world -> clip) — never from an
      * object-baked matrix. */
     const tessera::TesseraViewInfo tessera_cull_view = tessera::getViewInfo(
-        viewport_persmat, float(resolution.y), viewport_proj_scale_y);
+        unjittered_persmat, float(resolution.y), viewport_proj_scale_y);
+
+    auto now_frame = std::chrono::steady_clock::now();
+    bool view_moved = false;
+    if (this->draw_ctx != nullptr && this->draw_ctx->rv3d != nullptr) {
+      if (tessera_has_last_view_persmat_ && unjittered_persmat != tessera_last_view_persmat_) {
+        view_moved = true;
+        tessera_last_view_move_time_ = now_frame;
+      }
+      tessera_last_view_persmat_ = unjittered_persmat;
+      tessera_has_last_view_persmat_ = true;
+      if (!view_moved && tessera_last_view_move_time_.time_since_epoch().count() != 0) {
+        auto ms_since_move = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                 now_frame - tessera_last_view_move_time_)
+                                 .count();
+        if (ms_since_move < 200) {
+          view_moved = true;
+        }
+      }
+    }
 
     Map<std::string, int> drawn_instances_by_emitter;
+
+    /* Pass 1 records all compute traversals; pass 2 issues all indirect draws. Interleaving
+     * compute and graphics per object forced Vulkan to end/restart the rendering scope and
+     * insert compute->graphics barriers once per object. */
+    struct TesseraPendingDraw {
+      TesseraObjectState *state;
+      bool allow_dna_write;
+    };
+    Vector<TesseraPendingDraw> pending_draws;
 
     for (auto item : tessera_objects_.items()) {
       TesseraObjectState &state = *item.value;
@@ -886,15 +921,24 @@ class Instance : public DrawEngine {
       }
       /* Rasterization matrix: always projects to the active viewport framebuffer. */
       const float4x4 object_persmat = viewport_persmat * state.object_mat;
+      /* Unjittered viewport matrix for stable LOD & frustum culling across TAA samples. */
+      const float4x4 unjittered_object_persmat = unjittered_persmat * state.object_mat;
 
       const int view_source = tessera_view_source_get(ob);
       state.view_source = view_source;
 
       float4x4 cam_persmat;
       float cam_proj_scale_y = viewport_proj_scale_y;
-      const bool is_cam_view = (state.view_source != 0) ||
-                               (this->draw_ctx != nullptr && this->draw_ctx->rv3d != nullptr &&
-                                this->draw_ctx->rv3d->persp == RV3D_CAMOB);
+      const bool in_user_perspective = (this->draw_ctx != nullptr &&
+                                        this->draw_ctx->rv3d != nullptr &&
+                                        this->draw_ctx->rv3d->persp != RV3D_CAMOB);
+      const bool has_explicit_cull_cam = (tessera_property_find_safe(ob, "tessera_cull_camera") !=
+                                          nullptr);
+      const bool is_cam_view = in_user_perspective ?
+                                   has_explicit_cull_cam :
+                                   ((state.view_source != 0) ||
+                                    (this->draw_ctx != nullptr && this->draw_ctx->rv3d != nullptr &&
+                                     this->draw_ctx->rv3d->persp == RV3D_CAMOB));
       bool has_cam_lod = false;
       if (is_cam_view) {
         if (tessera_camera_persmat(
@@ -903,7 +947,7 @@ class Instance : public DrawEngine {
         }
       }
       const float4x4 lod_object_persmat = has_cam_lod ? (cam_persmat * state.object_mat) :
-                                                        object_persmat;
+                                                        unjittered_object_persmat;
       const float lod_proj_scale_y = has_cam_lod ? cam_proj_scale_y : viewport_proj_scale_y;
 
       if (state.pass == nullptr) {
@@ -916,11 +960,11 @@ class Instance : public DrawEngine {
       }
 
       state.pass->setReverseZ(false);
+      state.pass->setUseElementsIndirect(true);
       const float culling_margin = (state.ob != nullptr) ?
           tessera_culling_margin_get(state.ob) : state.culling_margin;
       state.culling_margin = culling_margin;
       state.pass->setCullingMargin(culling_margin);
-      tessera_stat_culling_margin_write(state.ob, culling_margin);
       const float pixel_error = (state.ob != nullptr) ?
           tessera_pixel_error_get(state.ob) : state.pixel_error;
       state.pixel_error = pixel_error;
@@ -975,11 +1019,15 @@ class Instance : public DrawEngine {
       const bool log_console = state.log_console;
       const bool show_fps_panel = state.show_fps_panel;
       const bool show_fps_hud = state.show_fps_hud;
-      state.pass->setTelemetryEnabled(show_stats || log_console || show_fps_hud || show_fps_panel);
 
-      bool is_navigating = false;
+      bool is_navigating = view_moved;
       if (this->draw_ctx != nullptr && this->draw_ctx->rv3d != nullptr) {
-        is_navigating = ((this->draw_ctx->rv3d->rflag & RV3D_NAVIGATING) != 0) || (this->draw_ctx->rv3d->viewlock != 0);
+        is_navigating = is_navigating || this->draw_ctx->is_navigating() ||
+                        this->draw_ctx->is_playback() ||
+                        ((this->draw_ctx->rv3d->rflag & RV3D_NAVIGATING) != 0) ||
+                        (this->draw_ctx->rv3d->viewlock != 0) ||
+                        (this->draw_ctx->rv3d->sms != nullptr) ||
+                        (this->draw_ctx->rv3d->smooth_timer != nullptr);
       }
       if (scene_state_.scene != nullptr) {
         if (IDProperty *sgroup = IDP_GetProperties(&scene_state_.scene->id)) {
@@ -991,33 +1039,40 @@ class Instance : public DrawEngine {
         }
       }
       bool allow_dna_write = false;
-      if (this->draw_ctx == nullptr || this->draw_ctx->rv3d == nullptr) {
-        allow_dna_write = true;
-      }
-      else if (!is_navigating) {
-        auto now_dna = std::chrono::steady_clock::now();
-        if (state.was_navigating || state.last_dna_write_time.time_since_epoch().count() == 0) {
+      if (!is_navigating) {
+        if (this->draw_ctx == nullptr || this->draw_ctx->rv3d == nullptr) {
           allow_dna_write = true;
-          state.last_dna_write_time = now_dna;
         }
         else {
-          auto elapsed_dna_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-                                    now_dna - state.last_dna_write_time)
-                                    .count();
-          if (elapsed_dna_ms >= 500) {
+          auto now_dna = std::chrono::steady_clock::now();
+          if (state.was_navigating || state.last_dna_write_time.time_since_epoch().count() == 0) {
             allow_dna_write = true;
             state.last_dna_write_time = now_dna;
+          }
+          else {
+            auto elapsed_dna_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                      now_dna - state.last_dna_write_time)
+                                      .count();
+            if (elapsed_dna_ms >= 500) {
+              allow_dna_write = true;
+              state.last_dna_write_time = now_dna;
+            }
           }
         }
       }
       state.was_navigating = is_navigating;
-
-      float effective_pixel_error = pixel_error;
-      if (is_navigating) {
-        effective_pixel_error *= 2.5f;
+      if (allow_dna_write && state.ob != nullptr) {
+        tessera_stat_culling_margin_write(state.ob, culling_margin);
       }
-      state.pass->setPixelError(effective_pixel_error);
+
+      /* Same LOD threshold while navigating and at rest: scaling it during navigation made the
+       * whole cluster cut pop (visible blinking) on every navigation start/stop. */
+      state.pass->setPixelError(pixel_error);
       state.pass->setNavigating(is_navigating);
+      /* GPU counter readbacks stall the CPU on the whole GPU queue (Vulkan timeline wait);
+       * only request them on still frames. */
+      state.pass->setTelemetryEnabled(!is_navigating && (show_stats || log_console ||
+                                                         show_fps_hud || show_fps_panel));
 
       /* For scattered instance fields, expand the traversal culling margin so
        * the cluster selection is not gated by the base archetype transform
@@ -1044,8 +1099,8 @@ class Instance : public DrawEngine {
                          object_persmat,
                          viewport_proj_scale_y,
                          float(resolution.y),
-                         has_cam_lod ? &lod_object_persmat : nullptr,
-                         has_cam_lod ? &lod_proj_scale_y : nullptr);
+                         &lod_object_persmat,
+                         &lod_proj_scale_y);
 
       if (show_fps_panel || show_fps_hud) {
         auto now = std::chrono::steady_clock::now();
@@ -1070,13 +1125,11 @@ class Instance : public DrawEngine {
         state.smoothed_dt = 0.0f;
       }
 
-      if (show_stats || log_console || show_fps_hud) {
-        using namespace std::chrono;
-        static auto last_stat_time = steady_clock::now();
-        auto now = steady_clock::now();
-        auto elapsed_ms = duration_cast<milliseconds>(now - last_stat_time).count();
-        if (elapsed_ms >= 60) {
-          last_stat_time = now;
+      /* A whole-mesh frustum-culled object has exact (zero) stats without any GPU readback, so
+       * publish them even during navigation. */
+      const bool tessera_culled_out = (state.pass->drawCount() == 0);
+      if ((!is_navigating || tessera_culled_out) && (show_stats || log_console || show_fps_hud)) {
+        if (allow_dna_write || log_console || tessera_culled_out) {
           const float3 cam_pos = default_view.location();
           const float3 bounds_min(state.data.header.boundsMin[0],
                                   state.data.header.boundsMin[1],
@@ -1125,11 +1178,10 @@ class Instance : public DrawEngine {
           }
           budget = state.pass ? state.pass->getMemoryBudget() : budget;
 
-          if (allow_dna_write && (show_stats || show_fps_hud) && state.ob != nullptr) {
+          if ((allow_dna_write || tessera_culled_out) && (show_stats || show_fps_hud) &&
+              state.ob != nullptr)
+          {
             tessera_write_telemetry_to_object(state.ob, telem, &budget, total_instances, active_instances);
-            if (!is_navigating) {
-              WM_main_add_notifier(NC_OBJECT | ND_DRAW, state.ob);
-            }
             if (scene_state_.scene != nullptr) {
               if (IDProperty *sgroup = IDP_EnsureProperties(&scene_state_.scene->id)) {
                 idp_float_replace(sgroup, "tessera_stat_vram_resident_mb", float(budget.current_resident_bytes) / (1024.0f * 1024.0f));
@@ -1159,6 +1211,14 @@ class Instance : public DrawEngine {
       }
 
       if (state.pass->drawCount() != 0) {
+        pending_draws.append({&state, allow_dna_write});
+      }
+    }
+
+    for (const TesseraPendingDraw &pending : pending_draws) {
+      TesseraObjectState &state = *pending.state;
+      const bool allow_dna_write = pending.allow_dna_write;
+      {
         int lighting_type = (scene_state_.shading.light == V3D_LIGHTING_FLAT) ? 0 : 1;
         float4 base_col(0.8f, 0.8f, 0.8f, 1.0f);
         if (scene_state_.shading.color_type == V3D_SHADING_SINGLE_COLOR) {
@@ -1174,14 +1234,14 @@ class Instance : public DrawEngine {
           base_col = state.base_color;
         }
         state.pass->set_two_sided(state.two_sided);
-        /* Mesh bounding sphere in object space (union of cluster spheres)
-         * used for the per-instance camera frustum test. */
-        float3 tessera_bs_center(0.0f);
-        float tessera_bs_radius = 0.0f;
-        const bool tessera_have_bs = tessera::mesh_bounds_sphere(
-            state.data, tessera_bs_center, tessera_bs_radius);
         int drawn_instances = 0;
         if (state.instance_mats.size() > 1) {
+          /* Mesh bounding sphere in object space (union of cluster spheres)
+           * used for the per-instance camera frustum test. */
+          float3 tessera_bs_center(0.0f);
+          float tessera_bs_radius = 0.0f;
+          const bool tessera_have_bs = tessera::mesh_bounds_sphere(
+              state.data, tessera_bs_center, tessera_bs_radius);
           /* Scattered dupli / Geometry-Nodes field: one rasterization draw per
            * instance matrix, reusing the recorded cluster selection. The
            * instance transform enters both the projection
@@ -1216,12 +1276,13 @@ class Instance : public DrawEngine {
          * the debug UI (drives the camera-margin verification). Scatter
          * fields split into per-archetype range states: accumulate per
          * emitter and write the sum once below. */
-        if (state.instance_mats.size() > 1) {
-          drawn_instances_by_emitter.lookup_or_add(state.ob_name, 0) += drawn_instances;
-
-        }
-        else {
-          tessera_stat_int_write(state.ob, "tessera_stat_drawn_instances", drawn_instances);
+        if (allow_dna_write) {
+          if (state.instance_mats.size() > 1) {
+            drawn_instances_by_emitter.lookup_or_add(state.ob_name, 0) += drawn_instances;
+          }
+          else {
+            tessera_stat_int_write(state.ob, "tessera_stat_drawn_instances", drawn_instances);
+          }
         }
       }
     }
@@ -1306,7 +1367,10 @@ class Instance : public DrawEngine {
 
   void begin_sync() final
   {
-    {
+    /* When TAA accumulation is finished, object_sync() returns early and never re-marks Tessera
+     * states as used. Sweeping here would then evict every resident Tessera mesh (forcing a full
+     * .nc2 reload + GPU re-upload and a visible blink on the next redraw), so skip the sweep. */
+    if (!scene_state_.render_finished) {
       std::lock_guard lock(this->tessera_mutex_);
       const uint32_t finished_round = this->tessera_sync_round_;
       this->tessera_sync_round_ += 1;

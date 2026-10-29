@@ -73,16 +73,8 @@ void main()
   bary = vec2(corner == 0u ? 1.0 : 0.0, corner == 1u ? 1.0 : 0.0);
   tri_id = (global_idx / 3u) + 1u;
 
-  cluster_id = 0u;
-  if (debug_clusters != 0) {
-    for (uint c = 0u; c < uint(cluster_count); ++c) {
-      uvec4 meta = cluster_meta[c];
-      if (global_idx >= meta.x && global_idx < meta.x + meta.y) {
-        cluster_id = c;
-        break;
-      }
-    }
-  }
+  /* Zero-search O(1) direct cluster lookup via gl_BaseInstanceARB (gpu_BaseInstance) */
+  cluster_id = uint(gpu_BaseInstance);
 }
 )";
 
@@ -579,7 +571,6 @@ gpu::Shader *createVisShader()
     info.fragment_out(0, Type::uint4_t, "out_vis");
     info.storage_buf(0, Qualifier::read, "uint", "tri_indices[]");
     info.storage_buf(1, Qualifier::read, "float", "positions[]");
-    info.storage_buf(2, Qualifier::read, "uvec4", "cluster_meta[]");
 
     info.push_constant(Type::float4x4_t, "view_proj");
     info.push_constant(Type::int_t, "debug_clusters");
@@ -750,10 +741,28 @@ gpu::Shader *createGbufferShader()
 static const char *FORWARD_VERT_SOURCE = R"(
 void main()
 {
-  uint global_idx = vid;
-  uint idx = tri_indices[global_idx];
-  vec3 pos = vec3(positions[idx * 3u], positions[idx * 3u + 1u], positions[idx * 3u + 2u]);
-  vec3 nor = vec3(normals[idx * 3u], normals[idx * 3u + 1u], normals[idx * 3u + 2u]);
+  /* Single Indirect Instanced Draw:
+   * - gpu_InstanceIndex is the slot in visible_clusters[] (0 .. instanceCount - 1)
+   * - in_vid is the local vertex index within the cluster (0 .. max_cluster_indices - 1) */
+  uint slot_idx = uint(gpu_InstanceIndex);
+  uint cluster_idx = visible_clusters[slot_idx];
+  uvec4 meta = cluster_meta[cluster_idx];
+  uint local_vid = in_vid;
+  if (local_vid >= meta.y) {
+    gl_Position = vec4(2.0, 2.0, 2.0, 0.0);
+    v_world_pos = vec3(0.0);
+    v_world_normal = vec3(0.0, 0.0, 1.0);
+    v_uv = vec2(0.0);
+    v_mat = 0u;
+    v_cluster_id = 0u;
+    return;
+  }
+
+  uint v_idx = tri_indices[meta.x + local_vid];
+  vec4 v0 = packed_verts[v_idx * 2u + 0u];
+  vec4 v1 = packed_verts[v_idx * 2u + 1u];
+  vec3 pos = v0.xyz;
+  vec3 nor = vec3(v0.w, v1.xy);
 
   vec4 world_pos = model_mat * vec4(pos, 1.0);
   gl_Position = view_proj * vec4(pos, 1.0);
@@ -763,23 +772,19 @@ void main()
   float len_n = length(n);
   v_world_normal = (len_n > 1e-6) ? (n / len_n) : nor;
   v_world_pos = world_pos.xyz;
+  v_cluster_id = cluster_idx;
 
-  v_uv = vec2(uvs[idx * 2u], uvs[idx * 2u + 1u]);
-  uint mat_idx = tri_materials[global_idx / 3u];
-  if (mat_idx >= 4u) {
-    mat_idx = 0u;
-  }
-  v_mat = mat_idx;
-
-  v_cluster_id = 0u;
-  if (debug_clusters != 0) {
-    for (uint c = 0u; c < uint(cluster_count); ++c) {
-      uvec4 meta = cluster_meta[c];
-      if (global_idx >= meta.x && global_idx < meta.x + meta.y) {
-        v_cluster_id = c;
-        break;
-      }
+  if (has_alpha_mask != 0) {
+    v_uv = v1.zw;
+    uint mat_idx = meta.w;
+    if (mat_idx >= 4u) {
+      mat_idx = 0u;
     }
+    v_mat = mat_idx;
+  }
+  else {
+    v_uv = vec2(0.0);
+    v_mat = 0u;
   }
 }
 )";
@@ -876,15 +881,13 @@ gpu::Shader *createForwardShader()
     info.fragment_source("tessera_forward");
     info.fragment_source_generated = FORWARD_FRAG_SOURCE;
 
-    info.vertex_in(0, Type::uint_t, "vid");
+    info.vertex_in(0, Type::uint_t, "in_vid");
     info.fragment_out(0, Type::float4_t, "out_color");
 
-    info.storage_buf(0, Qualifier::read, "uint", "tri_indices[]");
-    info.storage_buf(1, Qualifier::read, "float", "positions[]");
-    info.storage_buf(2, Qualifier::read, "float", "normals[]");
-    info.storage_buf(3, Qualifier::read, "uvec4", "cluster_meta[]");
-    info.storage_buf(4, Qualifier::read, "float", "uvs[]");
-    info.storage_buf(5, Qualifier::read, "uint", "tri_materials[]");
+    info.storage_buf(0, Qualifier::read, "uint", "visible_clusters[]");
+    info.storage_buf(1, Qualifier::read, "uvec4", "cluster_meta[]");
+    info.storage_buf(2, Qualifier::read, "uint", "tri_indices[]");
+    info.storage_buf(3, Qualifier::read, "vec4", "packed_verts[]");
 
     info.sampler(0, ImageType::Float2D, "tex_diffuse_0");
     info.sampler(1, ImageType::Float2D, "tex_diffuse_1");
@@ -924,38 +927,12 @@ TesseraVisibilityPass::~TesseraVisibilityPass()
 
 bool TesseraVisibilityPass::init()
 {
-    if (mVisShader != nullptr) {
+    if (mDefaultWhiteTex != nullptr) {
         return true;
     }
     if (!gpu_available()) {
         return false;
     }
-    mVisShader = createVisShader();
-    mMaterialShader = createMaterialShader();
-    if (mVisShader == nullptr || mMaterialShader == nullptr) {
-        return false;
-    }
-
-    /* Full-screen triangle covering NDC. */
-    GPUVertFormat fs_format = {};
-    uint fs_pos = GPU_vertformat_attr_add(
-        &fs_format, "pos", gpu::VertAttrType::SFLOAT_32_32_32);
-    mFullscreenVbo = GPU_vertbuf_create_with_format(fs_format);
-    GPU_vertbuf_data_alloc(*mFullscreenVbo, 3);
-    const float corners[3][3] = {{-1.0f, -1.0f, 0.0f}, {3.0f, -1.0f, 0.0f},
-                                 {-1.0f, 3.0f, 0.0f}};
-    GPU_vertbuf_attr_fill(mFullscreenVbo, fs_pos, corners);
-    mFullscreenBatch = GPU_batch_create_ex(
-        GPU_PRIM_TRIS, mFullscreenVbo, nullptr, GPU_BATCH_OWNS_VBO);
-
-    /* Vertex-pulling batch: a dummy attribute buffer with one entry per
-     * index-buffer position (values are never read; gl_VertexID drives the
-     * fetch). Sized when the mesh data is staged. */
-    GPUVertFormat idx_format = {};
-    GPU_vertformat_attr_add(&idx_format, "vid", gpu::VertAttrType::UINT_32);
-    mIndexVbo = GPU_vertbuf_create_with_format(idx_format);
-    mMeshBatch = GPU_batch_create_ex(
-        GPU_PRIM_TRIS, mIndexVbo, nullptr, GPU_BATCH_OWNS_VBO);
 
     /* Create fallback 1x1 textures for unused material texture slots. */
     float white[4] = {1.0f, 1.0f, 1.0f, 1.0f};
@@ -974,7 +951,49 @@ bool TesseraVisibilityPass::init()
                                              GPU_TEXTURE_USAGE_SHADER_READ,
                                              rough);
 
-    return true;
+    return mDefaultWhiteTex != nullptr;
+}
+
+bool TesseraVisibilityPass::ensure_vis_resources()
+{
+    if (!gpu_available()) {
+        return false;
+    }
+    if (mVisShader == nullptr) {
+        mVisShader = createVisShader();
+    }
+    if (mMaterialShader == nullptr) {
+        mMaterialShader = createMaterialShader();
+    }
+    if (mVisShader == nullptr || mMaterialShader == nullptr) {
+        return false;
+    }
+    if (mFullscreenBatch == nullptr) {
+        GPUVertFormat fs_format = {};
+        uint fs_pos = GPU_vertformat_attr_add(
+            &fs_format, "pos", gpu::VertAttrType::SFLOAT_32_32_32);
+        mFullscreenVbo = GPU_vertbuf_create_with_format(fs_format);
+        GPU_vertbuf_data_alloc(*mFullscreenVbo, 3);
+        const float corners[3][3] = {{-1.0f, -1.0f, 0.0f}, {3.0f, -1.0f, 0.0f},
+                                     {-1.0f, 3.0f, 0.0f}};
+        GPU_vertbuf_attr_fill(mFullscreenVbo, fs_pos, corners);
+        mFullscreenBatch = GPU_batch_create_ex(
+            GPU_PRIM_TRIS, mFullscreenVbo, nullptr, GPU_BATCH_OWNS_VBO);
+    }
+    if (mMeshBatch == nullptr) {
+        GPUVertFormat idx_format = {};
+        GPU_vertformat_attr_add(&idx_format, "vid", gpu::VertAttrType::UINT_32);
+        mIndexVbo = GPU_vertbuf_create_with_format(idx_format);
+        mMeshBatch = GPU_batch_create_ex(
+            GPU_PRIM_TRIS, mIndexVbo, nullptr, GPU_BATCH_OWNS_VBO);
+    }
+    if (mVisResourcesDirty && mCachedVisData != nullptr) {
+        if (!upload_dirty_data()) {
+            return false;
+        }
+        mVisResourcesDirty = false;
+    }
+    return mPositionsBuf != nullptr && mMeshBatch != nullptr;
 }
 
 void TesseraVisibilityPass::terminate()
@@ -985,23 +1004,33 @@ void TesseraVisibilityPass::terminate()
     GPU_TEXTURE_FREE_SAFE(mDefaultWhiteTex);
     GPU_TEXTURE_FREE_SAFE(mDefaultNormalTex);
     GPU_TEXTURE_FREE_SAFE(mDefaultRoughTex);
-    /* The batches own their vertex buffers (GPU_BATCH_OWNS_VBO); discarding
-     * the batch frees the VBO — discarding it again would double-free. */
+    /* The batches own their vertex/index buffers; discarding
+     * the batch frees the VBO/IBO — discarding it again would double-free. */
     GPU_BATCH_DISCARD_SAFE(mFullscreenBatch);
     GPU_BATCH_DISCARD_SAFE(mMeshBatch);
+    GPU_BATCH_DISCARD_SAFE(mForwardBatch);
+    mFullscreenVbo = nullptr;
+    mIndexVbo = nullptr;
+    mForwardVbo = nullptr;
+    mForwardIbo = nullptr;
     GPU_SHADER_FREE_SAFE(mVisShader);
     GPU_SHADER_FREE_SAFE(mMaterialShader);
     GPU_SHADER_FREE_SAFE(mDepthPrepassShader);
     GPU_SHADER_FREE_SAFE(mGbufferShader);
     GPU_SHADER_FREE_SAFE(mForwardShader);
+    if (mPackedVertsBuf != nullptr) { GPU_storagebuf_free(mPackedVertsBuf); mPackedVertsBuf = nullptr; }
     if (mPositionsBuf != nullptr) { GPU_storagebuf_free(mPositionsBuf); mPositionsBuf = nullptr; }
     if (mNormalsBuf != nullptr) { GPU_storagebuf_free(mNormalsBuf); mNormalsBuf = nullptr; }
     if (mUvsBuf != nullptr) { GPU_storagebuf_free(mUvsBuf); mUvsBuf = nullptr; }
     if (mTangentsBuf != nullptr) { GPU_storagebuf_free(mTangentsBuf); mTangentsBuf = nullptr; }
     if (mIndicesBuf != nullptr) { GPU_storagebuf_free(mIndicesBuf); mIndicesBuf = nullptr; }
     if (mClusterMetaBuf != nullptr) { GPU_storagebuf_free(mClusterMetaBuf); mClusterMetaBuf = nullptr; }
+    if (mClusterMaterialsBuf != nullptr) { GPU_storagebuf_free(mClusterMaterialsBuf); mClusterMaterialsBuf = nullptr; }
     if (mTriMaterialsBuf != nullptr) { GPU_storagebuf_free(mTriMaterialsBuf); mTriMaterialsBuf = nullptr; }
     if (mMaterialParamsBuf != nullptr) { GPU_storagebuf_free(mMaterialParamsBuf); mMaterialParamsBuf = nullptr; }
+    mCachedVisData = nullptr;
+    mVisResourcesDirty = false;
+    mMaxClusterIndices = 384;
     mVertexData = TesseraGpuVertexData();
     mVertexCount = 0;
     mIndexCount = 0;
@@ -1047,61 +1076,84 @@ bool TesseraVisibilityPass::ensure_targets(int width, int height)
 
 bool TesseraVisibilityPass::upload_dirty_data()
 {
+    /* Lazily build the visibility-buffer resources (positions/normals/uvs/tangents SSBOs, tri
+     * materials, vertex-pulling identity VBO). Only needed by render(), render_depth_prepass()
+     * and render_gbuffer(); the Workbench forward path never pays this memory/upload cost. */
+    if (mCachedVisData == nullptr) {
+        return false;
+    }
+    const TesseraData &data = *mCachedVisData;
+    flattenVertexDataForGpu(data, mVertexData);
     const size_t index_count = mVertexData.indices.size();
     if (index_count == 0) {
         return false;
     }
-    if (mIndicesBuf == nullptr || index_count != mIndexCount ||
-        mVertexData.vertex_count != mVertexCount)
+    if (mPositionsBuf != nullptr) { GPU_storagebuf_free(mPositionsBuf); mPositionsBuf = nullptr; }
+    if (mNormalsBuf != nullptr) { GPU_storagebuf_free(mNormalsBuf); mNormalsBuf = nullptr; }
+    if (mUvsBuf != nullptr) { GPU_storagebuf_free(mUvsBuf); mUvsBuf = nullptr; }
+    if (mTangentsBuf != nullptr) { GPU_storagebuf_free(mTangentsBuf); mTangentsBuf = nullptr; }
+    if (mTriMaterialsBuf != nullptr) { GPU_storagebuf_free(mTriMaterialsBuf); mTriMaterialsBuf = nullptr; }
+    mPositionsBuf = GPU_storagebuf_create_ex(
+        std::max<size_t>(16, mVertexData.positions.size() * sizeof(float)),
+        nullptr,
+        GPU_USAGE_STATIC,
+        "tessera_positions");
+    mNormalsBuf = GPU_storagebuf_create_ex(
+        std::max<size_t>(16, mVertexData.normals.size() * sizeof(float)),
+        nullptr,
+        GPU_USAGE_STATIC,
+        "tessera_normals");
+    mUvsBuf = GPU_storagebuf_create_ex(std::max<size_t>(16, mVertexData.uvs.size() * sizeof(float)),
+                                       nullptr,
+                                       GPU_USAGE_STATIC,
+                                       "tessera_uvs");
+    mTangentsBuf = GPU_storagebuf_create_ex(
+        std::max<size_t>(16, mVertexData.tangents.size() * sizeof(float)),
+        nullptr,
+        GPU_USAGE_STATIC,
+        "tessera_tangents");
+    if (mPositionsBuf == nullptr || mNormalsBuf == nullptr || mUvsBuf == nullptr ||
+        mTangentsBuf == nullptr || mIndicesBuf == nullptr)
     {
-        if (mPositionsBuf != nullptr) { GPU_storagebuf_free(mPositionsBuf); mPositionsBuf = nullptr; }
-        if (mNormalsBuf != nullptr) { GPU_storagebuf_free(mNormalsBuf); mNormalsBuf = nullptr; }
-        if (mUvsBuf != nullptr) { GPU_storagebuf_free(mUvsBuf); mUvsBuf = nullptr; }
-        if (mTangentsBuf != nullptr) { GPU_storagebuf_free(mTangentsBuf); mTangentsBuf = nullptr; }
-        if (mIndicesBuf != nullptr) { GPU_storagebuf_free(mIndicesBuf); mIndicesBuf = nullptr; }
-        mPositionsBuf = GPU_storagebuf_create_ex(
-            mVertexData.positions.size() * sizeof(float),
-            nullptr,
-            GPU_USAGE_DYNAMIC,
-            "tessera_positions");
-        mNormalsBuf = GPU_storagebuf_create_ex(mVertexData.normals.size() *
-                                                   sizeof(float),
-                                               nullptr,
-                                               GPU_USAGE_DYNAMIC,
-                                               "tessera_normals");
-        mUvsBuf = GPU_storagebuf_create_ex(mVertexData.uvs.size() * sizeof(float),
-                                           nullptr,
-                                           GPU_USAGE_DYNAMIC,
-                                           "tessera_uvs");
-        mTangentsBuf = GPU_storagebuf_create_ex(mVertexData.tangents.size() * sizeof(float),
-                                               nullptr,
-                                               GPU_USAGE_DYNAMIC,
-                                               "tessera_tangents");
-        mIndicesBuf = GPU_storagebuf_create_ex(index_count * sizeof(uint32_t),
-                                               nullptr,
-                                               GPU_USAGE_DYNAMIC,
-                                               "tessera_tri_indices");
-        if (mPositionsBuf == nullptr || mNormalsBuf == nullptr ||
-            mUvsBuf == nullptr || mTangentsBuf == nullptr || mIndicesBuf == nullptr)
-        {
-            return false;
-        }
-        mVertexCount = mVertexData.vertex_count;
-        mIndexCount = index_count;
-
-        /* Grow the vertex-pulling batch (one dummy attribute per corner). */
-        GPU_vertbuf_data_alloc(*mIndexVbo, uint(index_count));
-        std::vector<uint32_t> identity(index_count);
-        for (size_t i = 0; i < index_count; ++i) {
-            identity[i] = uint32_t(i);
-        }
-        GPU_vertbuf_attr_fill(mIndexVbo, 0, identity.data());
+        return false;
     }
-    GPU_storagebuf_update(mPositionsBuf, mVertexData.positions.data());
-    GPU_storagebuf_update(mNormalsBuf, mVertexData.normals.data());
-    GPU_storagebuf_update(mUvsBuf, mVertexData.uvs.data());
-    GPU_storagebuf_update(mTangentsBuf, mVertexData.tangents.data());
-    GPU_storagebuf_update(mIndicesBuf, mVertexData.indices.data());
+    if (!mVertexData.positions.empty()) {
+        GPU_storagebuf_update(mPositionsBuf, mVertexData.positions.data());
+    }
+    if (!mVertexData.normals.empty()) {
+        GPU_storagebuf_update(mNormalsBuf, mVertexData.normals.data());
+    }
+    if (!mVertexData.uvs.empty()) {
+        GPU_storagebuf_update(mUvsBuf, mVertexData.uvs.data());
+    }
+    if (!mVertexData.tangents.empty()) {
+        GPU_storagebuf_update(mTangentsBuf, mVertexData.tangents.data());
+    }
+
+    const size_t num_tris = index_count / 3;
+    std::vector<uint32_t> tri_materials(std::max(size_t(1), num_tris), 0);
+    for (const auto &nc : data.clusters) {
+        uint32_t start_tri = nc.firstIndex / 3;
+        uint32_t count_tri = nc.indexCount / 3;
+        for (uint32_t k = 0; k < count_tri && (start_tri + k) < num_tris; ++k) {
+            tri_materials[start_tri + k] = uint32_t(nc.materialIndex);
+        }
+    }
+    mTriMaterialsBuf = GPU_storagebuf_create_ex(tri_materials.size() * sizeof(uint32_t),
+                                                tri_materials.data(),
+                                                GPU_USAGE_STATIC,
+                                                "tessera_tri_materials");
+
+    /* Grow the vertex-pulling batch (one dummy attribute per corner). */
+    GPU_vertbuf_data_alloc(*mIndexVbo, uint(index_count));
+    std::vector<uint32_t> identity(index_count);
+    for (size_t i = 0; i < index_count; ++i) {
+        identity[i] = uint32_t(i);
+    }
+    GPU_vertbuf_attr_fill(mIndexVbo, 0, identity.data());
+
+    /* Release the CPU-side staging copy; the data now lives in VRAM. */
+    mVertexData = TesseraGpuVertexData();
     return true;
 }
 
@@ -1118,6 +1170,9 @@ void TesseraVisibilityPass::render(gpu::StorageBuf *command_buf,
                                   uint32_t max_commands_per_material,
                                   gpu::StorageBuf *counter_buf)
 {
+    if (command_buf == nullptr || draw_count == 0 || !ensure_vis_resources()) {
+        return;
+    }
     if (command_buf == nullptr || draw_count == 0 || mVisShader == nullptr ||
         mMaterialShader == nullptr || mPositionsBuf == nullptr ||
         mMeshBatch == nullptr)
@@ -1138,9 +1193,6 @@ void TesseraVisibilityPass::render(gpu::StorageBuf *command_buf,
     GPU_texture_clear(
         mVisTexture, GPU_DATA_UINT, static_cast<const void *>(clear_value));
 
-    (void)object_model;
-    (void)counter_buf;
-
     /* ---------------- Pass 1: visibility ---------------- */
     GPU_framebuffer_bind(mFrameBuffer);
     GPU_framebuffer_clear_depth(mFrameBuffer, reverse_z ? 0.0f : 1.0f);
@@ -1154,9 +1206,6 @@ void TesseraVisibilityPass::render(gpu::StorageBuf *command_buf,
     GPU_shader_bind(mVisShader);
     GPU_storagebuf_bind(mIndicesBuf, 0);
     GPU_storagebuf_bind(mPositionsBuf, 1);
-    if (mClusterMetaBuf != nullptr) {
-        GPU_storagebuf_bind(mClusterMetaBuf, 2);
-    }
     GPU_shader_uniform_mat4(mVisShader, "view_proj", viewProj.ptr());
     GPU_shader_uniform_1i(
         mVisShader,
@@ -1165,18 +1214,32 @@ void TesseraVisibilityPass::render(gpu::StorageBuf *command_buf,
     GPU_shader_uniform_1i(mVisShader, "cluster_count", int(mClusterCount));
     GPU_shader_uniform_1i(mVisShader, "reverse_z", reverse_z ? 1 : 0);
 
-    if (material_counts != nullptr && !material_counts->empty() && max_commands_per_material > 0) {
+    const intptr_t cmd_stride = sizeof(uint32_t) * 4;
+    if (counter_buf != nullptr && max_commands_per_material > 0) {
+        GPU_storagebuf_sync_as_indirect_buffer(counter_buf);
+        const size_t num_mats = (material_counts != nullptr && !material_counts->empty()) ?
+                                    material_counts->size() :
+                                    1;
+        const int max_cnt = int(std::min<size_t>(mClusterCount, max_commands_per_material));
+        for (size_t mat = 0; mat < num_mats; ++mat) {
+            intptr_t ind_offset = intptr_t(mat) * max_commands_per_material * cmd_stride;
+            intptr_t cnt_offset = intptr_t(mat) * sizeof(uint32_t);
+            GPU_batch_multi_draw_indirect_count(
+                mMeshBatch, command_buf, counter_buf, max_cnt, ind_offset, cnt_offset, cmd_stride);
+        }
+    }
+    else if (material_counts != nullptr && !material_counts->empty() && max_commands_per_material > 0) {
         for (size_t mat = 0; mat < material_counts->size(); ++mat) {
             uint32_t count = (*material_counts)[mat];
             if (count == 0) continue;
-            intptr_t offset = intptr_t(mat) * max_commands_per_material * sizeof(uint32_t) * 4;
+            intptr_t offset = intptr_t(mat) * max_commands_per_material * cmd_stride;
             GPU_batch_multi_draw_indirect(
-                mMeshBatch, command_buf, int(count), offset, sizeof(uint32_t) * 4);
+                mMeshBatch, command_buf, int(count), offset, cmd_stride);
         }
     }
     else {
         GPU_batch_multi_draw_indirect(
-            mMeshBatch, command_buf, int(draw_count), 0, sizeof(uint32_t) * 4);
+            mMeshBatch, command_buf, int(draw_count), 0, cmd_stride);
     }
 
     GPU_color_mask(true, true, true, true);
@@ -1340,6 +1403,9 @@ void TesseraVisibilityPass::render_depth_prepass(gpu::StorageBuf *command_buf,
                                                 uint32_t max_commands_per_material,
                                                 gpu::StorageBuf *counter_buf)
 {
+    if (command_buf == nullptr || draw_count == 0 || !ensure_vis_resources()) {
+        return;
+    }
     if (command_buf == nullptr || draw_count == 0 || mMeshBatch == nullptr ||
         mPositionsBuf == nullptr || mIndicesBuf == nullptr)
     {
@@ -1354,8 +1420,6 @@ void TesseraVisibilityPass::render_depth_prepass(gpu::StorageBuf *command_buf,
             return;
         }
     }
-
-    (void)counter_buf;
 
     GPU_clip_control_unit_range(reverse_z);
     GPU_depth_test(reverse_z ? GPU_DEPTH_GREATER_EQUAL : GPU_DEPTH_LESS_EQUAL);
@@ -1398,18 +1462,32 @@ void TesseraVisibilityPass::render_depth_prepass(gpu::StorageBuf *command_buf,
     GPU_shader_uniform_1i(mDepthPrepassShader, "has_alpha_mask", depth_alpha_active ? 1 : 0);
     GPU_shader_uniform_4f(mDepthPrepassShader, "has_tex_flags", depth_has_tex.x, depth_has_tex.y, depth_has_tex.z, depth_has_tex.w);
 
-    if (material_counts != nullptr && !material_counts->empty() && max_commands_per_material > 0) {
+    const intptr_t cmd_stride = sizeof(uint32_t) * 4;
+    if (counter_buf != nullptr && max_commands_per_material > 0) {
+        GPU_storagebuf_sync_as_indirect_buffer(counter_buf);
+        const size_t num_mats = (material_counts != nullptr && !material_counts->empty()) ?
+                                    material_counts->size() :
+                                    1;
+        const int max_cnt = int(std::min<size_t>(mClusterCount, max_commands_per_material));
+        for (size_t mat = 0; mat < num_mats; ++mat) {
+            intptr_t ind_offset = intptr_t(mat) * max_commands_per_material * cmd_stride;
+            intptr_t cnt_offset = intptr_t(mat) * sizeof(uint32_t);
+            GPU_batch_multi_draw_indirect_count(
+                mMeshBatch, command_buf, counter_buf, max_cnt, ind_offset, cnt_offset, cmd_stride);
+        }
+    }
+    else if (material_counts != nullptr && !material_counts->empty() && max_commands_per_material > 0) {
         for (size_t mat = 0; mat < material_counts->size(); ++mat) {
             uint32_t count = (*material_counts)[mat];
             if (count == 0) continue;
-            intptr_t offset = intptr_t(mat) * max_commands_per_material * sizeof(uint32_t) * 4;
+            intptr_t offset = intptr_t(mat) * max_commands_per_material * cmd_stride;
             GPU_batch_multi_draw_indirect(
-                mMeshBatch, command_buf, int(count), offset, sizeof(uint32_t) * 4);
+                mMeshBatch, command_buf, int(count), offset, cmd_stride);
         }
     }
     else {
         GPU_batch_multi_draw_indirect(
-            mMeshBatch, command_buf, int(draw_count), 0, sizeof(uint32_t) * 4);
+            mMeshBatch, command_buf, int(draw_count), 0, cmd_stride);
     }
 
     GPU_color_mask(true, true, true, true);
@@ -1427,6 +1505,9 @@ void TesseraVisibilityPass::render_gbuffer(gpu::StorageBuf *command_buf,
                                           uint32_t max_commands_per_material,
                                           gpu::StorageBuf *counter_buf)
 {
+    if (command_buf == nullptr || draw_count == 0 || !ensure_vis_resources()) {
+        return;
+    }
     if (command_buf == nullptr || draw_count == 0 || mVisShader == nullptr ||
         mPositionsBuf == nullptr || mMeshBatch == nullptr)
     {
@@ -1446,7 +1527,6 @@ void TesseraVisibilityPass::render_gbuffer(gpu::StorageBuf *command_buf,
     }
 
     (void)cam_pos;
-    (void)counter_buf;
     gpu::FrameBuffer *target_gbuffer_fb = GPU_framebuffer_active_get();
 
     /* Encode "no geometry" as 0u (and 0xFFFFFFFF). */
@@ -1466,26 +1546,37 @@ void TesseraVisibilityPass::render_gbuffer(gpu::StorageBuf *command_buf,
     GPU_shader_bind(mVisShader);
     GPU_storagebuf_bind(mIndicesBuf, 0);
     GPU_storagebuf_bind(mPositionsBuf, 1);
-    if (mClusterMetaBuf != nullptr) {
-        GPU_storagebuf_bind(mClusterMetaBuf, 2);
-    }
     GPU_shader_uniform_mat4(mVisShader, "view_proj", viewProj.ptr());
     GPU_shader_uniform_1i(mVisShader, "debug_clusters", 0);
     GPU_shader_uniform_1i(mVisShader, "cluster_count", int(mClusterCount));
     GPU_shader_uniform_1i(mVisShader, "reverse_z", reverse_z ? 1 : 0);
 
-    if (material_counts != nullptr && !material_counts->empty() && max_commands_per_material > 0) {
+    const intptr_t cmd_stride = sizeof(uint32_t) * 4;
+    if (counter_buf != nullptr && max_commands_per_material > 0) {
+        GPU_storagebuf_sync_as_indirect_buffer(counter_buf);
+        const size_t num_mats = (material_counts != nullptr && !material_counts->empty()) ?
+                                    material_counts->size() :
+                                    1;
+        const int max_cnt = int(std::min<size_t>(mClusterCount, max_commands_per_material));
+        for (size_t mat = 0; mat < num_mats; ++mat) {
+            intptr_t ind_offset = intptr_t(mat) * max_commands_per_material * cmd_stride;
+            intptr_t cnt_offset = intptr_t(mat) * sizeof(uint32_t);
+            GPU_batch_multi_draw_indirect_count(
+                mMeshBatch, command_buf, counter_buf, max_cnt, ind_offset, cnt_offset, cmd_stride);
+        }
+    }
+    else if (material_counts != nullptr && !material_counts->empty() && max_commands_per_material > 0) {
         for (size_t mat = 0; mat < material_counts->size(); ++mat) {
             uint32_t count = (*material_counts)[mat];
             if (count == 0) continue;
-            intptr_t offset = intptr_t(mat) * max_commands_per_material * sizeof(uint32_t) * 4;
+            intptr_t offset = intptr_t(mat) * max_commands_per_material * cmd_stride;
             GPU_batch_multi_draw_indirect(
-                mMeshBatch, command_buf, int(count), offset, sizeof(uint32_t) * 4);
+                mMeshBatch, command_buf, int(count), offset, cmd_stride);
         }
     }
     else {
         GPU_batch_multi_draw_indirect(
-            mMeshBatch, command_buf, int(draw_count), 0, sizeof(uint32_t) * 4);
+            mMeshBatch, command_buf, int(draw_count), 0, cmd_stride);
     }
 
     GPU_color_mask(true, true, true, true);
@@ -1642,6 +1733,18 @@ void TesseraVisibilityPass::set_data(const TesseraData &data)
     if (!gpu_available()) {
         return;
     }
+    const size_t vertex_count = data.positions.size();
+    const size_t index_count = data.indices.size();
+    const size_t cluster_count = data.clusters.size();
+    if (vertex_count == 0 || index_count == 0 || cluster_count == 0) {
+        return;
+    }
+    mCachedVisData = &data;
+    if (vertex_count == mVertexCount && index_count == mIndexCount &&
+        cluster_count == mClusterCount && mForwardBatch != nullptr)
+    {
+        return;
+    }
     mBoundsMin[0] = data.header.boundsMin[0];
     mBoundsMin[1] = data.header.boundsMin[1];
     mBoundsMin[2] = data.header.boundsMin[2];
@@ -1649,49 +1752,93 @@ void TesseraVisibilityPass::set_data(const TesseraData &data)
     mBoundsMax[1] = data.header.boundsMax[1];
     mBoundsMax[2] = data.header.boundsMax[2];
 
-    const size_t vertex_count = data.positions.size();
-    const size_t index_count = data.indices.size();
-    const size_t cluster_count = data.clusters.size();
-    if (vertex_count == mVertexCount && index_count == mIndexCount &&
-        cluster_count == mClusterCount)
-    {
-        return;
-    }
     mVertexCount = vertex_count;
     mIndexCount = index_count;
     mClusterCount = cluster_count;
+    mVisResourcesDirty = true;
 
-    flattenVertexDataForGpu(data, mVertexData);
+    /* ---- Persistent, upload-once forward resources (all GPU_USAGE_STATIC) ---- */
 
-    if (mClusterMetaBuf != nullptr) { GPU_storagebuf_free(mClusterMetaBuf); mClusterMetaBuf = nullptr; }
-    TesseraGpuClusterData cluster_data;
-    flattenClustersForGpu(data, cluster_data);
-    mClusterMetaBuf = GPU_storagebuf_create_ex(cluster_data.meta.size() *
-                                                   sizeof(uint32_t),
-                                               cluster_data.meta.data(),
-                                               GPU_USAGE_DYNAMIC,
-                                               "tessera_cluster_meta");
+    /* Packed vertices: 2 x vec4 per vertex = (px, py, pz, nx), (ny, nz, u, v). */
+    const bool has_nor = data.normals.size() >= vertex_count;
+    const bool has_uv = data.uvs.size() >= vertex_count;
+    std::vector<float> packed(vertex_count * 8);
+    for (size_t i = 0; i < vertex_count; ++i) {
+        const float3 &p = data.positions[i];
+        const float3 n = has_nor ? data.normals[i] : float3(0.0f, 0.0f, 1.0f);
+        const float2 uv = has_uv ? data.uvs[i] : float2(0.0f);
+        float *dst = &packed[i * 8];
+        dst[0] = p.x;
+        dst[1] = p.y;
+        dst[2] = p.z;
+        dst[3] = n.x;
+        dst[4] = n.y;
+        dst[5] = n.z;
+        dst[6] = uv.x;
+        dst[7] = uv.y;
+    }
+    if (mPackedVertsBuf != nullptr) {
+        GPU_storagebuf_free(mPackedVertsBuf);
+    }
+    mPackedVertsBuf = GPU_storagebuf_create_ex(
+        packed.size() * sizeof(float), packed.data(), GPU_USAGE_STATIC, "tessera_packed_verts");
 
-    const size_t num_tris = data.indices.size() / 3;
-    std::vector<uint32_t> tri_materials(std::max(size_t(1), num_tris), 0);
-    for (const auto &nc : data.clusters) {
-        uint32_t start_tri = nc.firstIndex / 3;
-        uint32_t count_tri = nc.indexCount / 3;
-        for (uint32_t k = 0; k < count_tri && (start_tri + k) < num_tris; ++k) {
-            tri_materials[start_tri + k] = uint32_t(nc.materialIndex);
+    if (mIndicesBuf != nullptr) {
+        GPU_storagebuf_free(mIndicesBuf);
+    }
+    mIndicesBuf = GPU_storagebuf_create_ex(index_count * sizeof(uint32_t),
+                                           data.indices.data(),
+                                           GPU_USAGE_STATIC,
+                                           "tessera_tri_indices");
+
+    /* Cluster metadata: uvec4(firstIndex, indexCount, level, materialIndex). */
+    uint32_t max_cluster_idx = 384;
+    std::vector<uint32_t> meta(cluster_count * 4);
+    std::vector<uint32_t> cluster_materials(cluster_count, 0);
+    for (size_t c = 0; c < cluster_count; ++c) {
+        const TesseraCluster &cl = data.clusters[c];
+        uint32_t count = cl.indexCount;
+        if (size_t(cl.firstIndex) + count > index_count) {
+            count = (cl.firstIndex < index_count) ? uint32_t(index_count - cl.firstIndex) : 0u;
+            count -= count % 3;
         }
+        meta[c * 4 + 0] = cl.firstIndex;
+        meta[c * 4 + 1] = count;
+        meta[c * 4 + 2] = cl.level;
+        meta[c * 4 + 3] = uint32_t(cl.materialIndex);
+        cluster_materials[c] = uint32_t(cl.materialIndex);
+        max_cluster_idx = std::max(max_cluster_idx, cl.indexCount);
     }
-    if (mTriMaterialsBuf != nullptr) {
-        GPU_storagebuf_free(mTriMaterialsBuf);
-        mTriMaterialsBuf = nullptr;
+    mMaxClusterIndices = ((max_cluster_idx + 2) / 3) * 3;
+    if (mClusterMetaBuf != nullptr) {
+        GPU_storagebuf_free(mClusterMetaBuf);
     }
-    mTriMaterialsBuf = GPU_storagebuf_create_ex(
-        tri_materials.size() * sizeof(uint32_t),
-        tri_materials.data(),
-        GPU_USAGE_DYNAMIC,
-        "tessera_tri_materials");
+    mClusterMetaBuf = GPU_storagebuf_create_ex(
+        meta.size() * sizeof(uint32_t), meta.data(), GPU_USAGE_STATIC, "tessera_vis_cluster_meta");
+    if (mClusterMaterialsBuf != nullptr) {
+        GPU_storagebuf_free(mClusterMaterialsBuf);
+    }
+    mClusterMaterialsBuf = GPU_storagebuf_create_ex(cluster_materials.size() * sizeof(uint32_t),
+                                                    cluster_materials.data(),
+                                                    GPU_USAGE_STATIC,
+                                                    "tessera_vis_cluster_materials");
 
-    upload_dirty_data();
+    /* Instanced vertex-pulling batch: in_vid = 0 .. mMaxClusterIndices - 1 (local corner index
+     * inside one cluster). One instance per visible cluster. */
+    GPU_BATCH_DISCARD_SAFE(mForwardBatch);
+    mForwardVbo = nullptr;
+    mForwardIbo = nullptr;
+    GPUVertFormat fwd_format = {};
+    GPU_vertformat_attr_add(&fwd_format, "in_vid", gpu::VertAttrType::UINT_32);
+    mForwardVbo = GPU_vertbuf_create_with_format_ex(fwd_format, GPU_USAGE_STATIC);
+    GPU_vertbuf_data_alloc(*mForwardVbo, mMaxClusterIndices);
+    std::vector<uint32_t> local_ids(mMaxClusterIndices);
+    for (uint32_t i = 0; i < mMaxClusterIndices; ++i) {
+        local_ids[i] = i;
+    }
+    GPU_vertbuf_attr_fill(mForwardVbo, 0, local_ids.data());
+    mForwardBatch = GPU_batch_create_ex(
+        GPU_PRIM_TRIS, mForwardVbo, nullptr, GPU_BATCH_OWNS_VBO);
 }
 
 void TesseraVisibilityPass::render_forward(gpu::StorageBuf *command_buf,
@@ -1708,8 +1855,9 @@ void TesseraVisibilityPass::render_forward(gpu::StorageBuf *command_buf,
                                           uint32_t max_commands_per_material,
                                           gpu::StorageBuf *counter_buf)
 {
-    if (command_buf == nullptr || draw_count == 0 || mMeshBatch == nullptr ||
-        mPositionsBuf == nullptr || mIndicesBuf == nullptr || mNormalsBuf == nullptr)
+    if (command_buf == nullptr || counter_buf == nullptr || draw_count == 0 ||
+        mForwardBatch == nullptr || mPackedVertsBuf == nullptr || mIndicesBuf == nullptr ||
+        mClusterMetaBuf == nullptr)
     {
         return;
     }
@@ -1723,8 +1871,6 @@ void TesseraVisibilityPass::render_forward(gpu::StorageBuf *command_buf,
         }
     }
 
-    (void)counter_buf;
-
     GPU_clip_control_unit_range(false);
     GPU_depth_test(GPU_DEPTH_LESS_EQUAL);
     GPU_depth_mask(true);
@@ -1736,36 +1882,40 @@ void TesseraVisibilityPass::render_forward(gpu::StorageBuf *command_buf,
     GPU_face_culling(GPU_CULL_NONE);
     GPU_blend(GPU_BLEND_NONE);
 
-    GPU_shader_bind(mForwardShader);
-    GPU_storagebuf_bind(mIndicesBuf, 0);
-    GPU_storagebuf_bind(mPositionsBuf, 1);
-    GPU_storagebuf_bind(mNormalsBuf, 2);
-    if (mClusterMetaBuf != nullptr) {
-        GPU_storagebuf_bind(mClusterMetaBuf, 3);
-    }
-    GPU_storagebuf_bind(mUvsBuf, 4);
-    GPU_storagebuf_bind(mTriMaterialsBuf, 5);
-
     /* Alpha cutout state: active when any material slot carries a diffuse
-     * texture (foliage cards carry their silhouette in texture alpha). */
+     * texture and mAlphaMask is enabled (foliage cards carry their silhouette in texture alpha). */
     bool alpha_mask_active = false;
     float4 has_tex_flags(0.0f);
-    for (int s = 0; s < 4; ++s) {
-        const bool slot_has_diffuse = (s < int(mMaterials.size())) &&
-                                      mMaterials[s].has_diffuse &&
-                                      (mMaterials[s].diffuse != nullptr);
-        gpu::Texture *diff = slot_has_diffuse ?
-                                 mMaterials[s].diffuse :
-                                 ((mDefaultWhiteTex != nullptr) ? mDefaultWhiteTex : nullptr);
-        if (diff != nullptr) {
-            GPU_texture_bind(diff, s);
-        }
-        if (slot_has_diffuse) {
-            has_tex_flags[s] = 1.0f;
-            alpha_mask_active = true;
+    if (mAlphaMask) {
+        for (int s = 0; s < 4; ++s) {
+            const bool slot_has_diffuse = (s < int(mMaterials.size())) &&
+                                          mMaterials[s].has_diffuse &&
+                                          (mMaterials[s].diffuse != nullptr);
+            if (slot_has_diffuse) {
+                has_tex_flags[s] = 1.0f;
+                alpha_mask_active = true;
+            }
         }
     }
-    alpha_mask_active = alpha_mask_active && mAlphaMask;
+
+    GPU_shader_bind(mForwardShader);
+    GPU_storagebuf_bind(command_buf, 0);
+    GPU_storagebuf_bind(mClusterMetaBuf, 1);
+    GPU_storagebuf_bind(mIndicesBuf, 2);
+    GPU_storagebuf_bind(mPackedVertsBuf, 3);
+    if (alpha_mask_active) {
+        for (int s = 0; s < 4; ++s) {
+            const bool slot_has_diffuse = (s < int(mMaterials.size())) &&
+                                          mMaterials[s].has_diffuse &&
+                                          (mMaterials[s].diffuse != nullptr);
+            gpu::Texture *diff = slot_has_diffuse ?
+                                     mMaterials[s].diffuse :
+                                     ((mDefaultWhiteTex != nullptr) ? mDefaultWhiteTex : nullptr);
+            if (diff != nullptr) {
+                GPU_texture_bind(diff, s);
+            }
+        }
+    }
 
     GPU_shader_uniform_mat4(mForwardShader, "view_proj", viewProj.ptr());
     GPU_shader_uniform_mat4(mForwardShader, "model_mat", model_mat.ptr());
@@ -1785,21 +1935,16 @@ void TesseraVisibilityPass::render_forward(gpu::StorageBuf *command_buf,
     GPU_shader_uniform_1i(mForwardShader, "has_alpha_mask", alpha_mask_active ? 1 : 0);
     GPU_shader_uniform_4f(mForwardShader, "has_tex_flags", has_tex_flags.x, has_tex_flags.y, has_tex_flags.z, has_tex_flags.w);
 
-    if (material_counts != nullptr && !material_counts->empty() && max_commands_per_material > 0) {
-        for (size_t mat = 0; mat < material_counts->size(); ++mat) {
-            uint32_t count = (*material_counts)[mat];
-            if (count == 0) continue;
-            intptr_t offset = intptr_t(mat) * max_commands_per_material * sizeof(uint32_t) * 4;
-            GPU_batch_multi_draw_indirect(
-                mMeshBatch, command_buf, int(count), offset, sizeof(uint32_t) * 4);
-        }
-    }
-    else {
-        GPU_batch_multi_draw_indirect(
-            mMeshBatch, command_buf, int(draw_count), 0, sizeof(uint32_t) * 4);
-    }
+    /* Single indirect instanced draw: counter_buf[72..75] holds one DrawArraysIndirectCommand
+     * {max_cluster_indices, visible_cluster_count, 0, 0} written entirely on the GPU by the
+     * traversal compute shader; command_buf holds the visible cluster indices. No CPU readback,
+     * no multi-draw-indirect-count dependency (VKBatch does not implement it). */
+    (void)material_counts;
+    (void)max_commands_per_material;
+    GPU_storagebuf_sync_as_indirect_buffer(counter_buf);
+    GPU_batch_set_shader(mForwardBatch, mForwardShader);
+    GPU_batch_draw_indirect(mForwardBatch, counter_buf, intptr_t(72 * sizeof(uint32_t)));
 }
 
 }  // namespace tessera
 }  // namespace blender
-

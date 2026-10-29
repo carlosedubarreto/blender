@@ -198,6 +198,11 @@ class TESSERA_OT_build_collection(bpy.types.Operator):
         description="Name of collection to build caches for",
         default="",
     )
+    force_rebuild: bpy.props.BoolProperty(
+        name="Force Rebuild",
+        description="Rebuild .nc2 caches even if up-to-date caches already exist on disk",
+        default=False,
+    )
 
     def execute(self, context):
         col = bpy.data.collections.get(self.collection_name)
@@ -235,7 +240,8 @@ class TESSERA_OT_build_collection(bpy.types.Operator):
                     # Use context override for Blender 4.x / 5.x
                     with context.temp_override(active_object=ob, selected_objects=[ob], object=ob):
                         if bpy.ops.object.tessera_build.poll():
-                            bpy.ops.object.tessera_build(filepath=nc2_path)
+                            if self.force_rebuild or not (os.path.isfile(nc2_path) and os.path.getsize(nc2_path) >= 88):
+                                bpy.ops.object.tessera_build(filepath=nc2_path)
                             built_count += 1
                         else:
                             # Fallback direct call if poll fails

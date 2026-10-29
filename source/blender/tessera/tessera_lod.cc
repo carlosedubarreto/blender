@@ -166,6 +166,16 @@ bool mesh_bounds_sphere(const TesseraData &data, float3 &r_center, float &r_radi
     if (data.clusters.empty()) {
         return false;
     }
+    /* O(1) fast path using precomputed header bounding box. */
+    const float3 hmin(data.header.boundsMin[0], data.header.boundsMin[1], data.header.boundsMin[2]);
+    const float3 hmax(data.header.boundsMax[0], data.header.boundsMax[1], data.header.boundsMax[2]);
+    if (hmax.x > hmin.x || hmax.y > hmin.y || hmax.z > hmin.z) {
+        r_center = (hmin + hmax) * 0.5f;
+        r_radius = math::length(hmax - hmin) * 0.5f;
+        if (r_radius > 0.0f) {
+            return true;
+        }
+    }
     float bmin[3] = {std::numeric_limits<float>::max(),
                      std::numeric_limits<float>::max(),
                      std::numeric_limits<float>::max()};
@@ -458,7 +468,7 @@ std::size_t selectClustersFlat(const TesseraData &data,
             cmd.instanceCount = 1;
             cmd.firstIndex = cluster.firstIndex;
             cmd.vertexOffset = 0;
-            cmd.firstInstance = 0;
+            cmd.firstInstance = ci;
             out.push_back(cmd);
             emitted++;
         }

@@ -33,9 +33,11 @@
 
 #include "GPU_batch.hh"
 #include "GPU_framebuffer.hh"
+#include "GPU_index_buffer.hh"
 #include "GPU_shader.hh"
 #include "GPU_storage_buffer.hh"
 #include "GPU_texture.hh"
+#include "GPU_vertex_buffer.hh"
 
 #include <cstddef>
 #include <cstdint>
@@ -123,7 +125,8 @@ class TesseraVisibilityPass
 
     /**
      * Direct single-pass forward rasterization for Solid Mode (Workbench).
-     * Bypasses the visibility buffer resolve entirely.
+     * Bypasses the visibility buffer resolve entirely and uses hardware
+     * indexed drawing (GL_ELEMENT_ARRAY_BUFFER).
      */
     void render_forward(gpu::StorageBuf *command_buf,
                         size_t draw_count,
@@ -182,6 +185,7 @@ class TesseraVisibilityPass
     bool mAlphaMask = false;
     bool ensure_targets(int width, int height);
     bool upload_dirty_data();
+    bool ensure_vis_resources();
 
     // Shaders (created lazily with an active context).
     gpu::Shader *mVisShader = nullptr;
@@ -208,13 +212,20 @@ class TesseraVisibilityPass
     gpu::VertBuf *mIndexVbo = nullptr;
     gpu::Batch *mMeshBatch = nullptr;
 
+    // Instanced vertex-pulling batch for Solid Mode forward rasterization.
+    gpu::VertBuf *mForwardVbo = nullptr;
+    gpu::IndexBuf *mForwardIbo = nullptr;
+    gpu::Batch *mForwardBatch = nullptr;
+
     // Vertex/index data buffers (uploaded when the data changes).
+    gpu::StorageBuf *mPackedVertsBuf = nullptr;
     gpu::StorageBuf *mPositionsBuf = nullptr;
     gpu::StorageBuf *mNormalsBuf = nullptr;
     gpu::StorageBuf *mUvsBuf = nullptr;
     gpu::StorageBuf *mTangentsBuf = nullptr;
     gpu::StorageBuf *mIndicesBuf = nullptr;
     gpu::StorageBuf *mClusterMetaBuf = nullptr;
+    gpu::StorageBuf *mClusterMaterialsBuf = nullptr;
     gpu::StorageBuf *mTriMaterialsBuf = nullptr;
     gpu::StorageBuf *mMaterialParamsBuf = nullptr;
 
@@ -225,6 +236,9 @@ class TesseraVisibilityPass
 
     std::vector<TesseraMaterialTextures> mMaterials;
 
+    const TesseraData *mCachedVisData = nullptr;
+    bool mVisResourcesDirty = false;
+    uint32_t mMaxClusterIndices = 384;
     TesseraGpuVertexData mVertexData;
     size_t mVertexCount = 0;
     size_t mIndexCount = 0;

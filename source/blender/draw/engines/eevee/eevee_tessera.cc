@@ -1420,11 +1420,20 @@ void TesseraModule::update_telemetry(ObjectState &state, const float3 &cam_pos)
   const bool show_fps_panel = state.show_fps_panel;
   const bool show_fps_hud = state.show_fps_hud;
 
-  const bool is_navigating = (inst_.rv3d != nullptr) &&
-                             (((inst_.rv3d->rflag & RV3D_NAVIGATING) != 0) || (inst_.rv3d->viewlock != 0));
+  bool is_navigating = (inst_.rv3d != nullptr) &&
+                       (((inst_.rv3d->rflag & RV3D_NAVIGATING) != 0) || (inst_.rv3d->viewlock != 0));
+  if (inst_.scene != nullptr) {
+    if (IDProperty *sgroup = IDP_GetProperties(&inst_.scene->id)) {
+      if (IDProperty *prop = IDP_GetPropertyFromGroup(sgroup, "tessera_navigating")) {
+        if (prop->type == IDP_INT && IDP_int_get(prop) != 0) {
+          is_navigating = true;
+        }
+      }
+    }
+  }
 
   bool allow_dna_write = false;
-  if (inst_.rv3d == nullptr) {
+  if (!is_navigating && inst_.rv3d == nullptr) {
     allow_dna_write = true;
   }
   else if (!is_navigating) {
@@ -1562,16 +1571,10 @@ void TesseraModule::update_telemetry(ObjectState &state, const float3 &cam_pos)
     }
   }
 
-  /* Extract telemetry counters and update object properties. */
-  if (show_stats || log_console || show_fps_hud) {
-    using namespace std::chrono;
-    auto now = steady_clock::now();
-    auto elapsed_ms = (state.last_stat_time.time_since_epoch().count() == 0) ?
-                          60 :
-                          duration_cast<milliseconds>(now - state.last_stat_time).count();
-    const int min_interval_ms = is_navigating ? 100 : 60;
-    if (elapsed_ms >= min_interval_ms) {
-      state.last_stat_time = now;
+  /* Extract telemetry counters and update object properties (skipped completely while navigating). */
+  if (!is_navigating && (show_stats || log_console || show_fps_hud)) {
+    if (allow_dna_write || log_console) {
+      state.last_stat_time = std::chrono::steady_clock::now();
 
       tessera::TesseraTelemetry telem = state.pass ? state.pass->getTelemetry() :
                                                      tessera::TesseraTelemetry{};
@@ -1729,12 +1732,22 @@ void TesseraModule::draw_prepass(const draw::View &view,
         tessera_culling_margin_get(state.ob) : state.culling_margin;
     state.culling_margin = culling_margin;
     state.pass->setCullingMargin(culling_margin);
-    tessera_stat_culling_margin_write(state.ob, culling_margin);
     const float pixel_error = (state.ob != nullptr) ?
         tessera_pixel_error_get(state.ob) : state.pixel_error;
     state.pixel_error = pixel_error;
-    const bool is_navigating = ((inst_.rv3d != nullptr) && (((inst_.rv3d->rflag & RV3D_NAVIGATING) != 0) || inst_.rv3d->viewlock != 0)) ||
-                               ((inst_.scene != nullptr) && (tessera_property_find(reinterpret_cast<Object *>(&inst_.scene->id), "tessera_navigating") != nullptr));
+    bool is_navigating = (inst_.rv3d != nullptr) && (((inst_.rv3d->rflag & RV3D_NAVIGATING) != 0) || inst_.rv3d->viewlock != 0);
+    if (inst_.scene != nullptr) {
+      if (IDProperty *sgroup = IDP_GetProperties(&inst_.scene->id)) {
+        if (IDProperty *prop = IDP_GetPropertyFromGroup(sgroup, "tessera_navigating")) {
+          if (prop->type == IDP_INT && IDP_int_get(prop) != 0) {
+            is_navigating = true;
+          }
+        }
+      }
+    }
+    if (!is_navigating && inst_.rv3d == nullptr) {
+      tessera_stat_culling_margin_write(state.ob, culling_margin);
+    }
     float effective_pixel_error = pixel_error;
     if (is_navigating) {
       effective_pixel_error *= 2.5f;
@@ -1878,12 +1891,22 @@ void TesseraModule::draw(const draw::View &view,
         tessera_culling_margin_get(state.ob) : state.culling_margin;
     state.culling_margin = culling_margin;
     state.pass->setCullingMargin(culling_margin);
-    tessera_stat_culling_margin_write(state.ob, culling_margin);
     const float pixel_error = (state.ob != nullptr) ?
         tessera_pixel_error_get(state.ob) : state.pixel_error;
     state.pixel_error = pixel_error;
-    const bool is_navigating_draw = ((inst_.rv3d != nullptr) && (((inst_.rv3d->rflag & RV3D_NAVIGATING) != 0) || inst_.rv3d->viewlock != 0)) ||
-                                    ((inst_.scene != nullptr) && (tessera_property_find(reinterpret_cast<Object *>(&inst_.scene->id), "tessera_navigating") != nullptr));
+    bool is_navigating_draw = (inst_.rv3d != nullptr) && (((inst_.rv3d->rflag & RV3D_NAVIGATING) != 0) || inst_.rv3d->viewlock != 0);
+    if (inst_.scene != nullptr) {
+      if (IDProperty *sgroup = IDP_GetProperties(&inst_.scene->id)) {
+        if (IDProperty *prop = IDP_GetPropertyFromGroup(sgroup, "tessera_navigating")) {
+          if (prop->type == IDP_INT && IDP_int_get(prop) != 0) {
+            is_navigating_draw = true;
+          }
+        }
+      }
+    }
+    if (!is_navigating_draw && inst_.rv3d == nullptr) {
+      tessera_stat_culling_margin_write(state.ob, culling_margin);
+    }
     float effective_pixel_error = pixel_error;
     if (is_navigating_draw) {
       effective_pixel_error *= 2.5f;
@@ -2061,12 +2084,22 @@ void TesseraModule::draw_gbuffer(const draw::View &view,
         tessera_culling_margin_get(state.ob) : state.culling_margin;
     state.culling_margin = culling_margin;
     state.pass->setCullingMargin(culling_margin);
-    tessera_stat_culling_margin_write(state.ob, culling_margin);
     const float pixel_error = (state.ob != nullptr) ?
         tessera_pixel_error_get(state.ob) : state.pixel_error;
     state.pixel_error = pixel_error;
-    const bool is_navigating_gbuf = ((inst_.rv3d != nullptr) && (((inst_.rv3d->rflag & RV3D_NAVIGATING) != 0) || inst_.rv3d->viewlock != 0)) ||
-                                    ((inst_.scene != nullptr) && (tessera_property_find(reinterpret_cast<Object *>(&inst_.scene->id), "tessera_navigating") != nullptr));
+    bool is_navigating_gbuf = (inst_.rv3d != nullptr) && (((inst_.rv3d->rflag & RV3D_NAVIGATING) != 0) || inst_.rv3d->viewlock != 0);
+    if (inst_.scene != nullptr) {
+      if (IDProperty *sgroup = IDP_GetProperties(&inst_.scene->id)) {
+        if (IDProperty *prop = IDP_GetPropertyFromGroup(sgroup, "tessera_navigating")) {
+          if (prop->type == IDP_INT && IDP_int_get(prop) != 0) {
+            is_navigating_gbuf = true;
+          }
+        }
+      }
+    }
+    if (!is_navigating_gbuf && inst_.rv3d == nullptr) {
+      tessera_stat_culling_margin_write(state.ob, culling_margin);
+    }
     float effective_pixel_error = pixel_error;
     if (is_navigating_gbuf) {
       effective_pixel_error *= 2.5f;

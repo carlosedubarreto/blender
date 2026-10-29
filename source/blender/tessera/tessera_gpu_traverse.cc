@@ -24,6 +24,14 @@ gpu::Shader *createTraverseShader()
 void main()
 {
   uint ci = uint(gl_GlobalInvocationID.x);
+  if (ci == 0u && use_elements_command > 0) {
+    /* Single Indirect Instanced Draw header at draw_counters[72..75]:
+     * [72] = vertexCount (max_cluster_indices, e.g. 384)
+     * [73] = instanceCount (atomically incremented per visible cluster)
+     * [74] = firstVertex (0, from clear_to_zero)
+     * [75] = firstInstance (0, from clear_to_zero) */
+    draw_counters[72] = uint(use_elements_command);
+  }
   if (ci >= uint(cluster_count)) {
     return;
   }
@@ -45,11 +53,21 @@ void main()
     return; // Drop invalid command; avoid GPU memory fault
   }
 
+  vec4 parent_sphere = cluster_parent_sphere[ci];
   vec4 sphere = cluster_sphere[ci];
   vec3 center = sphere.xyz;
   float radius = sphere.w;
 
-  /* Frustum culling (Gribb-Hartmann planes, a*x + b*y + c*z + d >= 0 inside). */
+  /* Coarse parent group sphere pre-culling + cluster sphere frustum culling
+   * (Gribb-Hartmann planes, a*x + b*y + c*z + d >= 0 inside). */
+  if (meta.w != 0xFFFFFFFFu && parent_sphere.w >= radius) {
+    for (int p = 0; p < 6; ++p) {
+      float dp = dot(frustum_planes[p].xyz, parent_sphere.xyz) + frustum_planes[p].w;
+      if (dp < -(parent_sphere.w + culling_margin)) {
+        return;
+      }
+    }
+  }
   for (int p = 0; p < 6; ++p) {
     float d = dot(frustum_planes[p].xyz, center) + frustum_planes[p].w;
     if (d < -(radius + culling_margin)) {
@@ -79,7 +97,6 @@ void main()
     return;
   }
 
-  vec4 parent_sphere = cluster_parent_sphere[ci];
   float dist_p = max(distance(camera_pos, parent_sphere.xyz) - parent_sphere.w, near_clip);
   float screen_err_p = (err_p >= 3.0e38) ? 1.0e39 : (err_p * proj_scale_y * (viewport_height * 0.5) / dist_p);
 
@@ -88,44 +105,61 @@ void main()
     return;
   }
 
-  /* Budget + overflow guards (read the shared counter before allocating). */
-  uint mat = 0u;
-  if (max_materials > 1) {
-    mat = cluster_materials[ci];
-    if (mat >= uint(max_materials)) {
-      mat = 0u;
-    }
-  }
-
   if ((max_valid_clusters > 0 && cluster_index >= uint(max_valid_clusters)) ||
       (max_valid_vertices > 0 && vertex_offset + vertex_count > uint(max_valid_vertices))) {
     return; // Drop invalid command; avoid GPU memory fault
   }
 
-  uint counter_val = draw_counters[mat];
-  if ((max_clusters > 0) && (counter_val >= uint(max_clusters))) {
-    return;
+  if (use_elements_command > 0) {
+    /* Single Indirect Instanced Draw mode (`render_forward`):
+     * `draw_counters[72..75]` is the single `DrawArraysIndirectCommand`:
+     *   [72] = count (max_cluster_indices, initialized by thread 0)
+     *   [73] = instanceCount (number of visible clusters)
+     *   [74] = first (0)
+     *   [75] = baseInstance (0)
+     * `draw_commands[slot]` stores the visible cluster index `ci`. */
+    uint slot = atomicAdd(draw_counters[73], 1u);
+    if (slot >= uint(max_commands)) {
+      return;
+    }
+    atomicAdd(draw_counters[0], 1u);
+    if (record_telemetry != 0) {
+      atomicAdd(draw_counters[64], 1u);
+      atomicAdd(draw_counters[65], index_count / 3u);
+      atomicMax(draw_counters[66], 65535u - min(meta.z, 65535u));
+      atomicMax(draw_counters[67], meta.z);
+    }
+    draw_commands[slot] = ci;
   }
-  uint slot = atomicAdd(draw_counters[mat], 1u);
-  if (slot >= uint(max_commands_per_material)) {
-    return;
+  else {
+    /* Multi-Draw Indirect mode (Eevee / Visibility ID pass): */
+    uint mat = 0u;
+    if (max_materials > 1) {
+      mat = cluster_materials[ci];
+      if (mat >= uint(max_materials)) {
+        mat = 0u;
+      }
+    }
+    uint counter_val = draw_counters[mat];
+    if ((max_clusters > 0) && (counter_val >= uint(max_clusters))) {
+      return;
+    }
+    uint slot = atomicAdd(draw_counters[mat], 1u);
+    if (slot >= uint(max_commands_per_material)) {
+      return;
+    }
+    if (record_telemetry != 0) {
+      atomicAdd(draw_counters[64], 1u);
+      atomicAdd(draw_counters[65], index_count / 3u);
+      atomicMax(draw_counters[66], 65535u - min(meta.z, 65535u));
+      atomicMax(draw_counters[67], meta.z);
+    }
+    uint base = (mat * uint(max_commands_per_material) + slot) * 4u;
+    draw_commands[base + 0u] = meta.y;
+    draw_commands[base + 1u] = 1u;
+    draw_commands[base + 2u] = meta.x;
+    draw_commands[base + 3u] = ci;
   }
-
-  if (record_telemetry != 0) {
-    atomicAdd(draw_counters[64], 1u);
-    atomicAdd(draw_counters[65], index_count / 3u);
-    atomicMin(draw_counters[66], meta.z);
-    atomicMax(draw_counters[67], meta.z);
-  }
-
-  /* DrawArraysIndirectCommand layout (4 x uint32): the visibility pass uses
-   * vertex pulling, so `first` is the absolute index-buffer position and the
-   * triangle id is derived from gl_VertexID directly. */
-  uint base = (mat * uint(max_commands_per_material) + slot) * 4u;
-  draw_commands[base + 0u] = meta.y;
-  draw_commands[base + 1u] = 1u;
-  draw_commands[base + 2u] = meta.x;
-  draw_commands[base + 3u] = 0u;
 }
 )";
 
@@ -147,7 +181,7 @@ void main()
     /* binding 3: x = firstIndex, y = indexCount, z = cluster LOD level,
      * w = encoded parent index (0xFFFFFFFF for roots). */
     info.storage_buf(3, gshader::Qualifier::read, "uvec4", "cluster_meta[]");
-    /* binding 4: indirect draw commands (4 uints per command). */
+    /* binding 4: indirect draw commands (4 or 5 uints per command). */
     info.storage_buf(4, gshader::Qualifier::write, "uint", "draw_commands[]");
     /* binding 5: shared atomic draw counters per material. */
     info.storage_buf(5, gshader::Qualifier::read_write, "uint", "draw_counters[]");
@@ -167,6 +201,7 @@ void main()
     info.push_constant(gshader::Type::int_t, "record_telemetry");
     info.push_constant(gshader::Type::int_t, "max_valid_clusters");
     info.push_constant(gshader::Type::int_t, "max_valid_vertices");
+    info.push_constant(gshader::Type::int_t, "use_elements_command");
     info.push_constant(gshader::Type::float4_t, "frustum_planes", 6);
 
     /* Runtime-created shader: register the raw source as "generated" content

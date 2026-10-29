@@ -120,6 +120,16 @@ public:
         return renderer_.getReverseZ();
     }
 
+    void setUseElementsIndirect(bool enabled)
+    {
+        renderer_.setUseElementsIndirect(enabled);
+    }
+
+    bool getUseElementsIndirect() const
+    {
+        return renderer_.getUseElementsIndirect();
+    }
+
     void setTelemetryEnabled(bool enabled)
     {
         renderer_.setTelemetryEnabled(enabled);
@@ -202,6 +212,7 @@ public:
 
 private:
     TesseraData data_;
+    size_t resident_bytes_ = 0;
     float4x4 view_proj_;
     float viewport_height_;
     float proj_scale_y_;

@@ -97,6 +97,16 @@ public:
     void setReverseZ(bool enabled) { mReverseZ = enabled; }
     bool getReverseZ() const { return mReverseZ; }
 
+    /** Configure 5-uint DrawElementsIndirectCommand emission for Solid Mode indexed draws. */
+    void setUseElementsIndirect(bool enabled)
+    {
+        if (mUseElementsIndirect != enabled) {
+            mUseElementsIndirect = enabled;
+            mCacheDirty = true;
+        }
+    }
+    bool getUseElementsIndirect() const { return mUseElementsIndirect; }
+
     void set_material_textures(const std::vector<TesseraMaterialTextures> &materials)
     {
         mVisibilityPass.set_material_textures(materials);
@@ -215,7 +225,7 @@ private:
 
     // Staging host-side command list produced by the CPU fallback path.
     std::vector<TesseraDrawCommand> mPendingCommands;
-    // DrawArraysIndirectCommand stream for the CPU fallback upload.
+    // Indirect command stream for the CPU fallback upload.
     std::vector<uint32_t> mCpuCommandStream;
 
     // GPU storage buffer holding the indirect draw commands (std430 layout).
@@ -282,6 +292,9 @@ private:
     // Inverted depth support (EEVEE Reverse-Z).
     bool mReverseZ = false;
 
+    // Use 5-uint DrawElementsIndirectCommand for Solid Mode hardware indexed drawing.
+    bool mUseElementsIndirect = false;
+
     // Set once the GPU path is proven working; set permanently if the
     // compute shader could not be created.
     bool mGpuTraversalActive = false;
@@ -294,8 +307,11 @@ private:
     const TesseraData *mCachedMetadataData = nullptr;
     size_t mCachedClusterCount = 0;
     uint32_t mCachedMaxMaterials = 1;
+    uint32_t mCachedMaxClusterIndices = 384;
     size_t mCachedIndexCount = 0;
     float mCachedMaxParentError = -1.0f;
+    float3 mCachedMeshCenter = float3(0.0f);
+    float mCachedMeshRadius = 0.0f;
 
     // Hardware GPU timer queries
     uint32_t mQueryTraverse[2] = {0, 0};

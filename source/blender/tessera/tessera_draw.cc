@@ -48,7 +48,11 @@ TesseraDrawPass::TesseraDrawPass(const TesseraData &data,
                                const float4x4 &viewProj,
                                float projScaleY,
                                float viewportHeight)
-    : data_(data), view_proj_(viewProj), viewport_height_(viewportHeight),
+    : resident_bytes_(data.positions.size() * sizeof(float) +
+                      data.indices.size() * sizeof(uint32_t) +
+                      data.clusters.size() * sizeof(TesseraCluster)),
+      view_proj_(viewProj),
+      viewport_height_(viewportHeight),
       proj_scale_y_(projScaleY)
 {
 }
@@ -60,11 +64,7 @@ TesseraDrawPass::~TesseraDrawPass()
 
 bool TesseraDrawPass::init()
 {
-    if (!renderer_.init()) {
-        return false;
-    }
-    renderer_.update(data_, view_proj_, proj_scale_y_, viewport_height_);
-    return true;
+    return renderer_.init();
 }
 
 void TesseraDrawPass::update(const TesseraData &data,
@@ -77,6 +77,9 @@ void TesseraDrawPass::update(const TesseraData &data,
     view_proj_ = viewProj;
     proj_scale_y_ = projScaleY;
     viewport_height_ = viewportHeight;
+    resident_bytes_ = data.positions.size() * sizeof(float) +
+                      data.indices.size() * sizeof(uint32_t) +
+                      data.clusters.size() * sizeof(TesseraCluster);
 
     /* Always forward to renderer::update() — this ensures matrices are
      * fresh each frame and triggers traversal when needed. */
@@ -106,13 +109,6 @@ void TesseraDrawPass::update(const TesseraData &data,
         mStreamer->update(++mFrame, assembled);
         if (assembled.clusters.size() == mStreamer->clusterCount()) {
             data_ = assembled;
-        }
-    }
-    else {
-        if (&data_ != &data && (data_.clusters.size() != data.clusters.size() ||
-                                data_.indices.size() != data.indices.size() ||
-                                data_.positions.size() != data.positions.size())) {
-            data_ = data;
         }
     }
 }
@@ -150,9 +146,7 @@ TesseraMemoryBudget TesseraDrawPass::getMemoryBudget() const
         return mStreamer->getMemoryBudget();
     }
     TesseraMemoryBudget budget;
-    budget.current_resident_bytes = data_.positions.size() * sizeof(float) +
-                                    data_.indices.size() * sizeof(uint32_t) +
-                                    data_.clusters.size() * sizeof(TesseraCluster);
+    budget.current_resident_bytes = resident_bytes_;
     budget.max_vram_bytes = 1024ULL * 1024ULL * 1024ULL;
     return budget;
 }
