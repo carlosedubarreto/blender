@@ -187,6 +187,12 @@ struct TesseraLodParams
     uint32_t maxClustersPerFrame = 0;
     /** Camera frustum margin in meters / scene units. Extends culling boundaries outward. */
     float cullingMargin = 0.02f;
+    /**
+     * Scale of the reference instance matrix (source-mesh units -> world),
+     * applied to the cluster errors (which are stored in source units).
+     * 1.0 for world-unit data (.nc2 exported in world space).
+     */
+    float errorScale = 1.0f;
 };
 
 /**

@@ -68,7 +68,9 @@ public:
                 float projScaleY,
                 float viewportHeight,
                 const float4x4 *lodViewProj = nullptr,
-                const float *lodProjScaleY = nullptr);
+                const float *lodProjScaleY = nullptr,
+                uint32_t instance_multiplier = 1,
+                float error_scale = 1.0f);
 
     /** Override the LOD pixel error threshold for the next frames. */
     void setPixelError(float pixelError)
@@ -157,6 +159,24 @@ public:
                       const float4 &base_color = float4(0.8f, 0.8f, 0.8f, 1.0f),
                       const float4x4 *view_proj_override = nullptr);
 
+    /**
+     * Batched forward pass for scattered instance fields: all surviving
+     * object instances of one archetype are rasterized with a SINGLE indirect
+     * instanced draw (per-instance world matrices from a storage buffer).
+     * \param view_proj pure world->clip projection (no instance baking).
+     *
+     * Requires #update to have been called with the same
+     * \a instance_multiplier == instance_mats count so the GPU-written
+     * indirect instanceCount already equals visible_clusters * count.
+     */
+    void draw_forward_instances(const float4x4 *instance_mats,
+                                size_t instance_count,
+                                int viewportWidth,
+                                int viewportHeight,
+                                int lighting_type = 1,
+                                const float4 &base_color = float4(0.8f, 0.8f, 0.8f, 1.0f),
+                                const float4x4 &view_proj = float4x4::identity());
+
     /** Two-sided / foliage-card mode (see TesseraVisibilityPass). */
     void set_two_sided(bool two_sided) { mVisibilityPass.set_two_sided(two_sided); }
 
@@ -210,7 +230,8 @@ private:
                                 float projScaleY,
                                 float viewportHeight,
                                 const float4x4 *lodViewProj = nullptr,
-                                const float *lodProjScaleY = nullptr);
+                                const float *lodProjScaleY = nullptr,
+                                uint32_t instance_multiplier = 1);
 
     /** GPU path: upload cluster data (if changed), dispatch, read back count. */
     void updateWithGpuTraversal(const TesseraData &data,
@@ -218,7 +239,8 @@ private:
                                 float projScaleY,
                                 float viewportHeight,
                                 const float4x4 *lodViewProj = nullptr,
-                                const float *lodProjScaleY = nullptr);
+                                const float *lodProjScaleY = nullptr,
+                                uint32_t instance_multiplier = 1);
 
     /** (Re)create or resize one SSBO to at least \a byteSize. */
     bool ensureStorageBuf(gpu::StorageBuf **buf, size_t byteSize, const char *name);
@@ -276,6 +298,13 @@ private:
     float mLastViewportHeight = 0.0f;
     float mLastPixelError = -1.0f;
     float mLastCullingMargin = -1.0f;
+    /* Instance multiplier baked into the last GPU-written indirect args; a
+     * change forces a re-traversal so the args are re-finalized. */
+    uint32_t mLastInstanceMultiplier = 0;
+    /* Reference-instance scale applied to the source-unit cluster errors
+     * (see #update). 1.0 for world-unit data. */
+    float mErrorScale = 1.0f;
+    float mLastErrorScale = -1.0f;
     bool mLastTelemetryEnabled = false;
     bool mMatricesCurrent = false;  // track if matrices have been updated this frame
     bool mCacheDirty = false;       // force re-run of GPU/CPU traversal

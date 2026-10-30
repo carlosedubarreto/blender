@@ -142,6 +142,36 @@ class TesseraVisibilityPass
                         uint32_t max_commands_per_material = 0,
                         gpu::StorageBuf *counter_buf = nullptr);
 
+    /**
+     * Instanced variant of #render_forward for scattered instance fields:
+     * every surviving object instance of one archetype is rasterized with a
+     * SINGLE indirect instanced draw. The per-instance world matrices are
+     * uploaded to a storage buffer; the vertex shader decodes
+     * gl_InstanceID -> (object instance, visible cluster slot) using the
+     * visible-cluster count the traversal finalize pass stored at
+     * draw_counters[77]. Requires #TesseraRenderer::update to have been
+     * called with the same instance multiplier so the GPU-written
+     * DrawArraysIndirectCommand instanceCount equals
+     * visible_clusters * instance_count.
+     *
+     * \param viewProj pure world->clip projection (NO instance/object matrix
+     *                 baked in — the per-instance model matrix comes from the
+     *                 instance buffer).
+     * \param cam_pos  camera position in world space (for studio lighting).
+     */
+    void render_forward_instances(gpu::StorageBuf *command_buf,
+                                  size_t draw_count,
+                                  const float4x4 *instance_mats,
+                                  size_t instance_count,
+                                  const float4x4 &viewProj,
+                                  const float3 &cam_pos,
+                                  int viewport_width,
+                                  int viewport_height,
+                                  int shading_mode = 0,
+                                  int lighting_type = 1,
+                                  const float4 &base_color = float4(0.8f, 0.8f, 0.8f, 1.0f),
+                                  gpu::StorageBuf *counter_buf = nullptr);
+
     void set_material_textures(const std::vector<TesseraMaterialTextures> &materials)
     {
         mMaterials = materials;
@@ -187,6 +217,29 @@ class TesseraVisibilityPass
     bool upload_dirty_data();
     bool ensure_vis_resources();
 
+    /**
+     * Shared tail of #render_forward / #render_forward_instances: binds the
+     * forward shader, its storage buffers (cluster list, metadata, indices,
+     * packed vertices, instance matrices, forward args), samplers and push
+     * constants, then issues the single indirect instanced draw.
+     * \param instance_count 0 = single-matrix mode (model_mat/normal_mat used);
+     *                        > 0 = per-instance matrices from #mInstanceMatsBuf.
+     */
+    void forward_draw_common(gpu::StorageBuf *command_buf,
+                             gpu::StorageBuf *counter_buf,
+                             const float4x4 &viewProj,
+                             const float4x4 &model_mat,
+                             const float3x3 &normal_mat,
+                             const float3 &cam_pos,
+                             int viewport_width,
+                             int viewport_height,
+                             int shading_mode,
+                             int lighting_type,
+                             const float4 &base_color,
+                             const float4 &has_tex_flags,
+                             bool alpha_mask_active,
+                             size_t instance_count);
+
     // Shaders (created lazily with an active context).
     gpu::Shader *mVisShader = nullptr;
     gpu::Shader *mMaterialShader = nullptr;
@@ -228,6 +281,12 @@ class TesseraVisibilityPass
     gpu::StorageBuf *mClusterMaterialsBuf = nullptr;
     gpu::StorageBuf *mTriMaterialsBuf = nullptr;
     gpu::StorageBuf *mMaterialParamsBuf = nullptr;
+
+    // Per-object-instance world matrices for scattered fields (grown as needed).
+    gpu::StorageBuf *mInstanceMatsBuf = nullptr;
+    size_t mInstanceMatsCapacity = 0;
+    // 1-matrix fallback bound when drawing in single (non-instanced) mode.
+    gpu::StorageBuf *mDummyInstanceBuf = nullptr;
 
     // Default fallback textures for unused material slots.
     gpu::Texture *mDefaultWhiteTex = nullptr;

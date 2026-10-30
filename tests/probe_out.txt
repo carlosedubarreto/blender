@@ -1,0 +1,54 @@
+00:04.437  blend            | Read blend: "C:\blender-git\tessera_cenas_teste\Tessera_HighPoy_Test_NVME_scatterflow_assets_1.blend"
+Reloading external rigs...
+Reloading external metarigs...
+BlenderMCP addon registered
+ScatterFlow Physics: PyBullet backend ready
+OpenScatter Groups: runtime start failed: '_RestrictContext' object has no attribute 'scene'
+Warning: 1 × Draw window and swap: 150.8649 ms, average: 150.86490000 ms
+Warning: 1 × Draw window and swap: 103.2590 ms, average: 103.25900000 ms
+Warning: 1 × Draw window and swap: 112.3991 ms, average: 112.39910000 ms
+Warning: 1 × Draw window and swap: 97.6835 ms, average: 97.68350000 ms
+
+=== ON-SCREEN (viewport looking at field) ===
+  Gravel_13                    clusters=   110 drawn_instances=     1
+  Ground_005                   clusters=  4044 drawn_instances=     1
+  Ground_013                   clusters=   966 drawn_instances=     1
+  Ground_009                   clusters=     0 drawn_instances=     1
+  Ground_001                   clusters=  1237 drawn_instances=     1
+  DewBerry                     clusters=   132 drawn_instances=  6526
+  StickyWilly                  clusters=    62 drawn_instances=  6559
+  SweetViolet                  clusters=    15 drawn_instances= 21602
+  StingingNettle               clusters=    31 drawn_instances=  3607
+  Debris_Leafs                 clusters=  1535 drawn_instances=   111
+  Rocks_Small                  clusters=   162 drawn_instances= 83236
+  PricklyPearCactus            clusters=   325 drawn_instances=    39
+  Galetta Grass                clusters=  4088 drawn_instances=   555
+  Rocks_Large                  clusters=   163 drawn_instances=   677
+  Sticks                       clusters=    51 drawn_instances=   702
+  TOTAL drawn instances: 123,619
+Warning: 1 × Draw window and swap: 115.8710 ms, average: 115.87099999 ms
+Warning: 1 × Draw window and swap: 131.6726 ms, average: 131.67260000 ms
+Warning: 1 × Draw window and swap: 110.6991 ms, average: 110.69910000 ms
+Warning: 1 × Draw window and swap: 113.4571 ms, average: 113.45710000 ms
+
+=== OFF-SCREEN (viewport panned far away) ===
+  Gravel_13                    clusters=   110 drawn_instances=     1
+  Ground_005                   clusters=  4044 drawn_instances=     1
+  Ground_013                   clusters=   966 drawn_instances=     1
+  Ground_009                   clusters=     0 drawn_instances=     1
+  Ground_001                   clusters=  1237 drawn_instances=     1
+  DewBerry                     clusters=   132 drawn_instances=  6526
+  StickyWilly                  clusters=    62 drawn_instances=  6559
+  SweetViolet                  clusters=    15 drawn_instances= 21602
+  StingingNettle               clusters=    31 drawn_instances=  3607
+  Debris_Leafs                 clusters=  1535 drawn_instances=   111
+  Rocks_Small                  clusters=   162 drawn_instances= 83236
+  PricklyPearCactus            clusters=   325 drawn_instances=    39
+  Galetta Grass                clusters=  4088 drawn_instances=   555
+  Rocks_Large                  clusters=   163 drawn_instances=   677
+  Sticks                       clusters=    51 drawn_instances=   702
+  TOTAL drawn instances: 123,619  (expected 0)
+  TOTAL reported clusters: 12,921
+BlenderMCP addon unregistered
+Exception in module unregister(): 'C:\\Users\\carlo\\AppData\\Roaming\\Blender Foundation\\Blender\\5.2\\scripts\\addons\\io_mesh_apx\\__init__.py'
+Writing: C:\Users\carlo\AppData\Local\Temp\blender.crash.txt

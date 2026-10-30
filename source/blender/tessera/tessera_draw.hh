@@ -67,7 +67,9 @@ public:
                 float projScaleY,
                 float viewportHeight,
                 const float4x4 *lodViewProj = nullptr,
-                const float *lodProjScaleY = nullptr);
+                const float *lodProjScaleY = nullptr,
+                uint32_t instance_multiplier = 1,
+                float error_scale = 1.0f);
 
     void setShadingMode(TesseraShadingMode mode);
 
@@ -178,6 +180,20 @@ public:
                       int lighting_type = 1,
                       const float4 &base_color = float4(0.8f, 0.8f, 0.8f, 1.0f),
                       const float4x4 *view_proj_override = nullptr) const;
+
+    /**
+     * Batched forward pass for scattered instance fields: every surviving
+     * object instance is rasterized with a SINGLE indirect instanced draw.
+     * \param view_proj pure world->clip projection (no instance baking).
+     * #update must have been called with instance_multiplier == the count.
+     */
+    void draw_forward_instances(const float4x4 *instance_mats,
+                                size_t instance_count,
+                                int viewportWidth,
+                                int viewportHeight,
+                                int lighting_type = 1,
+                                const float4 &base_color = float4(0.8f, 0.8f, 0.8f, 1.0f),
+                                const float4x4 &view_proj = float4x4::identity()) const;
 
     /** Two-sided / foliage-card mode (see TesseraVisibilityPass). */
     void set_two_sided(bool two_sided)

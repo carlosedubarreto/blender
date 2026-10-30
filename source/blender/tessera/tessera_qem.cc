@@ -506,8 +506,15 @@ SimplifyResult simplifyTriangles(const std::vector<float3> &positions,
 
         // --- PART6 ---
 
-        /* Perform the collapse: b merges into a at newp. */
-        max_err = std::max(max_err, std::sqrt(std::max(cur, 0.0)));
+        /* Perform the collapse: b merges into a at newp.
+         * Record the TRUE geometric deviation of this collapse: the quadric
+         * cost of the merged position. `cur` includes the +1000 boundary-lock
+         * queue penalty (a priority hack, not a displacement) — recording it
+         * floored every level's error at ~31 source units and destroyed the
+         * LOD thresholds (additive accumulation then compounded it into
+         * errors tens of thousands of times the mesh size). */
+        const double collapse_cost = std::max(quadric_cost(Qab, newp), 0.0);
+        max_err = std::max(max_err, std::sqrt(collapse_cost));
         verts[a] = newp;
         for (const uint32_t t : vtris[b]) {
             auto &tv = tris[t];

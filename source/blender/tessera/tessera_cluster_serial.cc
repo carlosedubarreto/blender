@@ -14,7 +14,10 @@
 
 #include "tessera_cluster.hh"
 
+#include <algorithm>
+#include <cmath>
 #include <cstring>
+#include <limits>
 #include <vector>
 
 namespace blender {
@@ -227,6 +230,40 @@ bool deserializeFromMemory(TesseraData &out, const uint8_t *data, size_t size)
                     proxy_idx_count))
     {
         return false;
+    }
+
+    /* Legacy-error normalization: .nc2 assets built before the max-based
+     * error-accumulation fix carry wildly inflated cluster errors (the old
+     * additive accumulation, compounded by a boundary-lock queue penalty
+     * baked into the recorded value, produced errors tens of thousands of
+     * times larger than the mesh itself). The coarsest simplification of a
+     * mesh can never deviate more than the mesh's own bounding radius, so
+     * rescale the whole DAG — shrink-only — when the largest stored error
+     * exceeds it. Newly built data already satisfies this bound and is left
+     * untouched (scale >= 1 is a no-op). */
+    if (!out.clusters.empty()) {
+        const float bdx = out.header.boundsMax[0] - out.header.boundsMin[0];
+        const float bdy = out.header.boundsMax[1] - out.header.boundsMin[1];
+        const float bdz = out.header.boundsMax[2] - out.header.boundsMin[2];
+        const float bounds_len = std::sqrt(bdx * bdx + bdy * bdy + bdz * bdz);
+        const float radius = bounds_len * 0.5f;
+        if (radius > 0.0f && std::isfinite(radius)) {
+            float max_error = 0.0f;
+            for (const TesseraCluster &c : out.clusters) {
+                max_error = std::max(max_error, c.error);
+            }
+            if (max_error > radius && max_error > 0.0f &&
+                std::isfinite(max_error))
+            {
+                const float scale = radius / max_error;
+                for (TesseraCluster &c : out.clusters) {
+                    c.error *= scale;
+                    if (c.parentError < 3.0e38f) {
+                        c.parentError *= scale;
+                    }
+                }
+            }
+        }
     }
     return true;
 }

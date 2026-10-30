@@ -21,16 +21,55 @@ gpu::Shader *createTraverseShader()
     namespace gshader = blender::gpu::shader;
 
     static const char *COMPUTE_SOURCE = R"(
+/* Index-count buckets for the Solid-Mode single-indirect-draw path: each
+ * visible cluster is appended to the bucket matching its index count so the
+ * per-bucket DrawArraysIndirectCommand can use a vertexCount close to the
+ * real cluster size (a single max-size draw would launch up to max/24 times
+ * more vertex shaders than needed). Sizes are fixed; the last bucket holds
+ * every cluster larger than 384 indices and is sized by the `bucket_max`
+ * push constant (the mesh's true max cluster index count). */
+uint bucket_of(uint index_count)
+{
+  if (index_count <= 24u) { return 0u; }
+  if (index_count <= 48u) { return 1u; }
+  if (index_count <= 96u) { return 2u; }
+  if (index_count <= 192u) { return 3u; }
+  if (index_count <= 384u) { return 4u; }
+  return 5u;
+}
+
+uint bucket_size(uint b)
+{
+  if (b == 0u) { return 24u; }
+  if (b == 1u) { return 48u; }
+  if (b == 2u) { return 96u; }
+  if (b == 3u) { return 192u; }
+  if (b == 4u) { return 384u; }
+  return uint(bucket_max);
+}
+
 void main()
 {
   uint ci = uint(gl_GlobalInvocationID.x);
-  if (ci == 0u && use_elements_command > 0) {
-    /* Single Indirect Instanced Draw header at draw_counters[72..75]:
-     * [72] = vertexCount (max_cluster_indices, e.g. 384)
-     * [73] = instanceCount (atomically incremented per visible cluster)
-     * [74] = firstVertex (0, from clear_to_zero)
-     * [75] = firstInstance (0, from clear_to_zero) */
-    draw_counters[72] = uint(use_elements_command);
+  if (ci == 0u && finalize_pass != 0) {
+    /* Finalize pass (this shader re-dispatched with cluster_count == 0 after
+     * the main traversal, so only thread 0 runs). Write one
+     * DrawArraysIndirectCommand per bucket at draw_counters[84 + b*4 .. +3]:
+     *   [84+b*4+0] = vertexCount   (bucket size)
+     *   [84+b*4+1] = instanceCount (bucket visible count * object instances)
+     *   [84+b*4+2] = firstVertex   (0)
+     *   [84+b*4+3] = firstInstance (0)
+     * The per-bucket visible counts were accumulated atomically at
+     * draw_counters[76 + b] by the main dispatch; multiplying here (after
+     * all traversal threads finished) scales the draw for scattered fields
+     * where every object instance reuses the same cluster selection. */
+    for (int b = 0; b < 6; ++b) {
+      uint count = draw_counters[76 + b];
+      draw_counters[84 + b * 4 + 0] = bucket_size(uint(b));
+      draw_counters[84 + b * 4 + 1] = count * uint(finalize_multiplier);
+      draw_counters[84 + b * 4 + 2] = 0u;
+      draw_counters[84 + b * 4 + 3] = 0u;
+    }
   }
   if (ci >= uint(cluster_count)) {
     return;
@@ -85,8 +124,15 @@ void main()
    * and leave only grazing silhouette edges visible. Occlusion is handled
    * by the depth pre-pass instead. */
   vec2 errs = cluster_errors[ci];
-  float err_c = errs.x;
-  float err_p = errs.y;
+  /* Errors are stored in the SOURCE mesh's units (the .nc2 / archetype build
+   * space). The instance matrix that baked this traversal transforms
+   * positions into world space, but not the errors — apply the reference
+   * instance's scale (`error_scale`) so the projected screen error matches
+   * the real world-space silhouette (botanical archetype sources are often
+   * authored in mm/cm; without this the cut over-refines by the unit ratio
+   * and ignores the pixel-error threshold). */
+  float err_c = errs.x * error_scale;
+  float err_p = (errs.y >= 3.0e38) ? errs.y : (errs.y * error_scale);
 
   const float near_clip = 0.01;
   float dist_c = max(distance(camera_pos, center) - radius, near_clip);
@@ -111,15 +157,18 @@ void main()
   }
 
   if (use_elements_command > 0) {
-    /* Single Indirect Instanced Draw mode (`render_forward`):
-     * `draw_counters[72..75]` is the single `DrawArraysIndirectCommand`:
-     *   [72] = count (max_cluster_indices, initialized by thread 0)
-     *   [73] = instanceCount (number of visible clusters)
-     *   [74] = first (0)
-     *   [75] = baseInstance (0)
-     * `draw_commands[slot]` stores the visible cluster index `ci`. */
-    uint slot = atomicAdd(draw_counters[73], 1u);
-    if (slot >= uint(max_commands)) {
+    /* Bucketed Single Indirect Instanced Draw mode (`render_forward`):
+     * every visible cluster is appended to the index-count bucket matching
+     * its size. Per bucket b, `draw_counters[76 + b]` accumulates the visible
+     * count and `draw_commands[b * cluster_count + slot]` stores the visible
+     * cluster index. The finalize pass writes one
+     * DrawArraysIndirectCommand per bucket at `draw_counters[84 + b*4]`
+     * (vertexCount = bucket size, instanceCount = count * instances). Each
+     * bucket region holds at most `cluster_count` entries (a bucket can never
+     * overflow because every visible cluster lands in exactly one bucket). */
+    uint b = bucket_of(index_count);
+    uint slot = atomicAdd(draw_counters[76 + b], 1u);
+    if (slot >= uint(cluster_count)) {
       return;
     }
     atomicAdd(draw_counters[0], 1u);
@@ -129,7 +178,7 @@ void main()
       atomicMax(draw_counters[66], 65535u - min(meta.z, 65535u));
       atomicMax(draw_counters[67], meta.z);
     }
-    draw_commands[slot] = ci;
+    draw_commands[b * uint(cluster_count) + slot] = ci;
   }
   else {
     /* Multi-Draw Indirect mode (Eevee / Visibility ID pass): */
@@ -193,6 +242,8 @@ void main()
     info.push_constant(gshader::Type::float_t, "proj_scale_y");
     info.push_constant(gshader::Type::float_t, "pixel_error");
     info.push_constant(gshader::Type::float_t, "culling_margin");
+    /* Reference instance scale applied to the source-unit cluster errors. */
+    info.push_constant(gshader::Type::float_t, "error_scale");
     info.push_constant(gshader::Type::int_t, "cluster_count");
     info.push_constant(gshader::Type::int_t, "max_clusters");
     info.push_constant(gshader::Type::int_t, "max_commands");
@@ -203,6 +254,12 @@ void main()
     info.push_constant(gshader::Type::int_t, "max_valid_vertices");
     info.push_constant(gshader::Type::int_t, "use_elements_command");
     info.push_constant(gshader::Type::float4_t, "frustum_planes", 6);
+    /* Elements mode: max cluster index count (sizes the last bucket). */
+    info.push_constant(gshader::Type::int_t, "bucket_max");
+    /* 1 when this dispatch is the args-finalize pass (cluster_count == 0). */
+    info.push_constant(gshader::Type::int_t, "finalize_pass");
+    /* Object-instance count baked into the per-bucket instanceCounts. */
+    info.push_constant(gshader::Type::int_t, "finalize_multiplier");
 
     /* Runtime-created shader: register the raw source as "generated" content
      * (same mechanism as the `gpu` Python module). */

@@ -72,7 +72,9 @@ void TesseraDrawPass::update(const TesseraData &data,
                             float projScaleY,
                             float viewportHeight,
                             const float4x4 *lodViewProj,
-                            const float *lodProjScaleY)
+                            const float *lodProjScaleY,
+                            uint32_t instance_multiplier,
+                            float error_scale)
 {
     view_proj_ = viewProj;
     proj_scale_y_ = projScaleY;
@@ -83,7 +85,8 @@ void TesseraDrawPass::update(const TesseraData &data,
 
     /* Always forward to renderer::update() — this ensures matrices are
      * fresh each frame and triggers traversal when needed. */
-    renderer_.update(data, viewProj, projScaleY, viewportHeight, lodViewProj, lodProjScaleY);
+    renderer_.update(data, viewProj, projScaleY, viewportHeight, lodViewProj, lodProjScaleY,
+                     instance_multiplier, error_scale);
 
     if (mStreamer != nullptr && mStreamer->isOpen()) {
         const float4x4 &lod_vp = (lodViewProj != nullptr) ? *lodViewProj : view_proj_;
@@ -204,6 +207,23 @@ void TesseraDrawPass::draw_forward(const float4x4 &model_mat,
                                    const float4x4 *view_proj_override) const
 {
     renderer_.draw_forward(model_mat, viewportWidth, viewportHeight, lighting_type, base_color, view_proj_override);
+}
+
+void TesseraDrawPass::draw_forward_instances(const float4x4 *instance_mats,
+                                             size_t instance_count,
+                                             int viewportWidth,
+                                             int viewportHeight,
+                                             int lighting_type,
+                                             const float4 &base_color,
+                                             const float4x4 &view_proj) const
+{
+    renderer_.draw_forward_instances(instance_mats,
+                                     instance_count,
+                                     viewportWidth,
+                                     viewportHeight,
+                                     lighting_type,
+                                     base_color,
+                                     view_proj);
 }
 
 size_t TesseraDrawPass::drawCount(uint32_t material_index) const

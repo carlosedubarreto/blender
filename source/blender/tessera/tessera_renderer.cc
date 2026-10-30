@@ -170,7 +170,9 @@ void TesseraRenderer::update(const TesseraData &data,
                             float projScaleY,
                             float viewportHeight,
                             const float4x4 *lodViewProj,
-                            const float *lodProjScaleY)
+                            const float *lodProjScaleY,
+                            uint32_t instance_multiplier,
+                            float error_scale)
 {
     if (data.clusters.empty() || mDrawBuffer == nullptr) {
         mPendingCommands.clear();
@@ -185,6 +187,7 @@ void TesseraRenderer::update(const TesseraData &data,
     /* Always keep rasterization matrix up to date (e.g. for sub-pixel TAA jitter). */
     mLastViewProj = viewProj;
     mLastProjScaleY = projScaleY;
+    mErrorScale = (error_scale > 0.0f) ? error_scale : 1.0f;
 
     /* Freshness check — only re-traverse if LOD/culling matrices, data, telemetry or view parameters changed. */
     bool data_changed = (mLastData == nullptr) || (&data != mLastData);
@@ -194,7 +197,9 @@ void TesseraRenderer::update(const TesseraData &data,
                         (mLastLodProjScaleY != lod_scale_y) ||
                         (mLastViewportHeight != viewportHeight) ||
                         (mLastPixelError != mPixelError) ||
-                        (mLastCullingMargin != mCullingMargin);
+                        (mLastCullingMargin != mCullingMargin) ||
+                        (mLastInstanceMultiplier != instance_multiplier) ||
+                        (mLastErrorScale != mErrorScale);
 
     if (!data_changed && !view_changed && !telem_changed && (mGpuTraversalActive || !mCpuCommandStream.empty())) {
         // Matrices, parameters, telemetry and data are identical to last frame; retain existing draw commands and count
@@ -210,6 +215,8 @@ void TesseraRenderer::update(const TesseraData &data,
     mLastViewportHeight = viewportHeight;
     mLastPixelError = mPixelError;
     mLastCullingMargin = mCullingMargin;
+    mLastInstanceMultiplier = instance_multiplier;
+    mLastErrorScale = mErrorScale;
     mLastTelemetryEnabled = mTelemetryEnabled;
 
     /* Try to bring up the compute traversal once. If it cannot be created
@@ -222,11 +229,15 @@ void TesseraRenderer::update(const TesseraData &data,
         }
     }
     if (mTraverseShader != nullptr) {
-        updateWithGpuTraversal(data, viewProj, projScaleY, viewportHeight, lodViewProj, lodProjScaleY);
+        updateWithGpuTraversal(
+            data, viewProj, projScaleY, viewportHeight, lodViewProj, lodProjScaleY,
+            instance_multiplier);
     }
     else {
         mGpuPathFailed = true;
-        updateWithCpuTraversal(data, viewProj, projScaleY, viewportHeight, lodViewProj, lodProjScaleY);
+        updateWithCpuTraversal(
+            data, viewProj, projScaleY, viewportHeight, lodViewProj, lodProjScaleY,
+            instance_multiplier);
     }
 }
 
@@ -235,7 +246,8 @@ void TesseraRenderer::updateWithGpuTraversal(const TesseraData &data,
                                             float projScaleY,
                                             float viewportHeight,
                                             const float4x4 *lodViewProj,
-                                            const float *lodProjScaleY)
+                                            const float *lodProjScaleY,
+                                            uint32_t instance_multiplier)
 {
     const size_t clusterCount = data.clusters.size();
 
@@ -280,9 +292,12 @@ void TesseraRenderer::updateWithGpuTraversal(const TesseraData &data,
     const size_t indexCount = mCachedIndexCount;
     const float maxParentError = mCachedMaxParentError;
 
-    // Dynamically size mDrawBuffer to the cluster count with headroom (5 uints per command)
-    const size_t neededCapacity = std::max(clusterCount, size_t(16384));
-    if (mDrawBuffer == nullptr || mAllocatedCommandCapacity < clusterCount) {
+    // Dynamically size mDrawBuffer to the cluster count with headroom.
+    // Elements mode uses six index-count bucket regions of `clusterCount`
+    // uints each inside the command buffer (6 * clusterCount uints total;
+    // the buffer holds 5 * capacity uints).
+    const size_t neededCapacity = std::max(clusterCount * 2, size_t(16384));
+    if (mDrawBuffer == nullptr || mAllocatedCommandCapacity * 5 < clusterCount * 6) {
         if (mDrawBuffer != nullptr) {
             GPU_storagebuf_free(mDrawBuffer);
             mDrawBuffer = nullptr;
@@ -388,6 +403,7 @@ void TesseraRenderer::updateWithGpuTraversal(const TesseraData &data,
     GPU_shader_uniform_1f(mTraverseShader, "proj_scale_y", lod_view.projScaleY);
     GPU_shader_uniform_1f(mTraverseShader, "pixel_error", mPixelError);
     GPU_shader_uniform_1f(mTraverseShader, "culling_margin", mCullingMargin);
+    GPU_shader_uniform_1f(mTraverseShader, "error_scale", mErrorScale);
     GPU_shader_uniform_1i(mTraverseShader, "cluster_count", int(clusterCount));
     GPU_shader_uniform_1i(mTraverseShader, "max_clusters", 0);
     GPU_shader_uniform_1i(mTraverseShader, "max_commands",
@@ -399,6 +415,7 @@ void TesseraRenderer::updateWithGpuTraversal(const TesseraData &data,
     GPU_shader_uniform_1i(mTraverseShader, "max_valid_vertices", int(indexCount));
     GPU_shader_uniform_1i(mTraverseShader, "use_elements_command",
                           mUseElementsIndirect ? int(mCachedMaxClusterIndices) : 0);
+    GPU_shader_uniform_1i(mTraverseShader, "bucket_max", int(mCachedMaxClusterIndices));
     GPU_shader_uniform_4fv_array(mTraverseShader, "frustum_planes", 6,
                                  culling_view.planes);
 
@@ -431,7 +448,27 @@ void TesseraRenderer::updateWithGpuTraversal(const TesseraData &data,
 #endif
 
     auto t_dispatch_start = std::chrono::high_resolution_clock::now();
+    /* Main traversal dispatch. finalize_pass must stay 0 here: the args
+     * finalization may only run once every atomicAdd(draw_counters[76 + b])
+     * of this dispatch is complete (separate ordered dispatch below). */
+    GPU_shader_uniform_1i(mTraverseShader, "finalize_pass", 0);
     GPU_compute_dispatch(mTraverseShader, groups, 1, 1);
+    if (mUseElementsIndirect) {
+        /* Finalize pass: re-dispatch the traversal shader with
+         * cluster_count == 0 so only thread 0 runs; it writes one
+         * DrawArraysIndirectCommand per index-count bucket (vertexCount =
+         * bucket size, instanceCount = bucket visible count * object
+         * instances). Runs every frame in elements mode, with or without
+         * scattered instances (multiplier == 1). */
+        GPU_shader_uniform_1i(mTraverseShader, "cluster_count", 0);
+        GPU_shader_uniform_1i(mTraverseShader, "finalize_pass", 1);
+        GPU_shader_uniform_1i(mTraverseShader, "finalize_multiplier",
+                              int(std::max<uint32_t>(instance_multiplier, 1u)));
+        GPU_compute_dispatch(mTraverseShader, 1, 1, 1);
+        GPU_shader_uniform_1i(mTraverseShader, "finalize_pass", 0);
+        GPU_shader_uniform_1i(mTraverseShader, "finalize_multiplier", 1);
+        GPU_shader_uniform_1i(mTraverseShader, "cluster_count", int(clusterCount));
+    }
     auto t_dispatch_end = std::chrono::high_resolution_clock::now();
 
 #ifdef WITH_OPENGL_BACKEND
@@ -495,7 +532,8 @@ void TesseraRenderer::updateWithCpuTraversal(const TesseraData &data,
                                             float projScaleY,
                                             float viewportHeight,
                                             const float4x4 *lodViewProj,
-                                            const float *lodProjScaleY)
+                                            const float *lodProjScaleY,
+                                            uint32_t instance_multiplier)
 {
     uint32_t max_materials = 1;
     for (const TesseraCluster &c : data.clusters) {
@@ -591,21 +629,56 @@ void TesseraRenderer::updateWithCpuTraversal(const TesseraData &data,
         max_cluster_idx = ((max_cluster_idx + 2) / 3) * 3;
         ensureStorageBuf(&mCounterBuf[0], 128 * sizeof(uint32_t), "tessera_draw_counter_0");
         if (mCounterBuf[0] != nullptr) {
+            /* Same bucketed args layout the GPU finalize pass writes:
+             * [76 + b] per-bucket visible counts, [84 + b*4 .. +3] one
+             * DrawArraysIndirectCommand per bucket (vertexCount = bucket
+             * size, instanceCount = bucket count * object instances). */
+            const uint32_t bucket_sizes[6] = {24u, 48u, 96u, 192u, 384u, max_cluster_idx};
+            auto bucket_of = [](uint32_t index_count) -> uint32_t {
+                if (index_count <= 24u) { return 0u; }
+                if (index_count <= 48u) { return 1u; }
+                if (index_count <= 96u) { return 2u; }
+                if (index_count <= 192u) { return 3u; }
+                if (index_count <= 384u) { return 4u; }
+                return 5u;
+            };
             uint32_t cpu_counters[128] = {0};
-            const uint32_t visible = uint32_t(
-                std::min(selected_indices.size(), mAllocatedCommandCapacity * 5));
+            uint32_t bucket_counts[6] = {0};
+            const uint32_t cluster_count_u = uint32_t(data.clusters.size());
+            const size_t stream_uints = mAllocatedCommandCapacity * 5;
+            mCpuCommandStream.assign(stream_uints, 0);
+            uint32_t visible = 0;
+            for (uint32_t ci : selected_indices) {
+                if (ci >= cluster_count_u) {
+                    continue;
+                }
+                const uint32_t index_count = data.clusters[ci].indexCount;
+                if (index_count == 0) {
+                    continue;
+                }
+                const uint32_t b = bucket_of(index_count);
+                const uint32_t slot = bucket_counts[b];
+                if (slot >= cluster_count_u ||
+                    size_t(b) * cluster_count_u + slot >= stream_uints)
+                {
+                    break;
+                }
+                mCpuCommandStream[size_t(b) * cluster_count_u + slot] = ci;
+                bucket_counts[b]++;
+                visible++;
+            }
             cpu_counters[0] = visible;
-            cpu_counters[72] = max_cluster_idx;
-            cpu_counters[73] = visible;
+            for (uint32_t b = 0; b < 6; ++b) {
+                cpu_counters[76 + b] = bucket_counts[b];
+                cpu_counters[84 + b * 4 + 0] = bucket_sizes[b];
+                cpu_counters[84 + b * 4 + 1] = bucket_counts[b] *
+                                               std::max<uint32_t>(instance_multiplier, 1u);
+                cpu_counters[84 + b * 4 + 2] = 0;
+                cpu_counters[84 + b * 4 + 3] = 0;
+            }
             GPU_storagebuf_update(mCounterBuf[0], cpu_counters);
             mAsyncReadCounterIndex = 0;
         }
-        const size_t stream_uints = mAllocatedCommandCapacity * 5;
-        if (selected_indices.size() > stream_uints) {
-            selected_indices.resize(stream_uints);
-        }
-        mCpuCommandStream.assign(stream_uints, 0);
-        std::copy(selected_indices.begin(), selected_indices.end(), mCpuCommandStream.begin());
         GPU_storagebuf_update(mDrawBuffer, mCpuCommandStream.data());
         return;
     }
@@ -838,6 +911,49 @@ void TesseraRenderer::draw_forward(const float4x4 &model_mat,
 #endif
 }
 
+void TesseraRenderer::draw_forward_instances(const float4x4 *instance_mats,
+                                             size_t instance_count,
+                                             int viewportWidth,
+                                             int viewportHeight,
+                                             int lighting_type,
+                                             const float4 &base_color,
+                                             const float4x4 &view_proj)
+{
+    if (mDrawBuffer == nullptr || mDrawCount == 0 || instance_mats == nullptr ||
+        instance_count == 0)
+    {
+        return;
+    }
+    if (!mVisibilityInitialized) {
+        if (!mVisibilityPass.init()) {
+            return;
+        }
+        mVisibilityInitialized = true;
+    }
+    /* NOTE: pass by reference — never `mLastData == nullptr ? TesseraData() : *mLastData`
+     * (the conditional operator would deep-copy the whole mesh data every frame). */
+    if (mLastData != nullptr) {
+        mVisibilityPass.set_data(*mLastData);
+    }
+    /* Pure world->clip projection: the camera position for studio lighting is
+     * derived from it in world space (no object/instance baking). */
+    const TesseraViewInfo view = getViewInfo(view_proj, 0.0f, mLastProjScaleY);
+    gpu::StorageBuf *param_buf = (mAsyncReadCounterIndex >= 0) ? mCounterBuf[mAsyncReadCounterIndex] :
+                                                                 nullptr;
+    mVisibilityPass.render_forward_instances(mDrawBuffer,
+                                             mDrawCount,
+                                             instance_mats,
+                                             instance_count,
+                                             view_proj,
+                                             view.camPos,
+                                             viewportWidth,
+                                             viewportHeight,
+                                             int(mShadingMode),
+                                             lighting_type,
+                                             base_color,
+                                             param_buf);
+}
+
 void TesseraRenderer::getLevelCounts(const TesseraData &data,
                                     const float4x4 &lodViewProj,
                                     float projScaleY,
@@ -849,6 +965,7 @@ void TesseraRenderer::getLevelCounts(const TesseraData &data,
     TesseraLodParams params;
     params.pixelError = mPixelError;
     params.cullingMargin = mCullingMargin;
+    params.errorScale = mErrorScale;
     selectClustersFlat(data, lodViewProj, projScaleY, viewportHeight, params, cmds);
     for (const auto &cmd : cmds) {
         for (const auto &c : data.clusters) {

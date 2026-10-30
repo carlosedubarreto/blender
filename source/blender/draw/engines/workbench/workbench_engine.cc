@@ -61,8 +61,11 @@
 #include "WM_api.hh"
 #include "WM_types.hh"
 
+#include <array>
 #include <chrono>
+#include <cmath>
 #include <cstdio>
+#include <limits>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -103,6 +106,17 @@ class Instance : public DrawEngine {
     /* Per-instance world matrices for scattered duplicates (Geometry Nodes /
      * ScatterFlow fields). Empty means a single draw with #object_mat. */
     std::vector<float4x4> instance_mats;
+    /* Instances surviving this frame's camera-frustum cull (rebuilt in pass 1,
+     * consumed by the batched indirect draws in pass 2). */
+    std::vector<float4x4> frame_visible_instances;
+    /* Distance-band sub-passes for scattered fields: instances at very
+     * different camera distances need very different LOD cuts, so the
+     * survivors are split into geometric distance bands and each band gets
+     * its own traversal pass (evaluated at the band's nearest instance).
+     * Band 0 reuses #pass; bands 1..N live here. */
+    Vector<std::unique_ptr<blender::tessera::TesseraDrawPass>> band_passes;
+    std::array<std::vector<float4x4>, 8> frame_band_instances;
+    uint32_t frame_band_count = 0;
     /* Sync round token: the instance list restarts when the base re-syncs. */
     uint32_t sync_round = 0;
     /* Two-sided / foliage-card detection (drives opaque solid shading). */
@@ -319,6 +333,41 @@ class Instance : public DrawEngine {
       value = float(IDP_int_get(prop));
     }
     return (value > 0.0f) ? value : 1.0f;
+  }
+
+  /**
+   * Dedicated LOD threshold for scattered instance fields (Geometry Nodes /
+   * ScatterFlow duplis). Scattered assets are individually tiny on screen
+   * even when there are tens of thousands of them, so tolerating a coarser
+   * cluster cut per instance trades a little per-instance detail for a large
+   * reduction in rasterized cluster instances (the dominant cost of huge
+   * fields). Defaults to 4 px; falls back to #tessera_pixel_error_get when
+   * explicitly set to a non-positive value.
+   */
+  static float tessera_scatter_pixel_error_get(Object *ob, float base_pixel_error)
+  {
+    if (!ob) {
+      return 4.0f;
+    }
+    const IDProperty *prop = tessera_property_find_safe(ob, "tessera_scatter_pixel_error");
+    if (prop == nullptr) {
+      return 4.0f;
+    }
+    float value = 4.0f;
+    if (prop->type == IDP_DOUBLE) {
+      value = float(IDP_double_get(prop));
+    }
+    else if (prop->type == IDP_FLOAT) {
+      value = IDP_float_get(prop);
+    }
+    else if (prop->type == IDP_INT) {
+      value = float(IDP_int_get(prop));
+    }
+    /* Non-positive falls back to the regular per-object threshold. */
+    if (value <= 0.0f) {
+      return (base_pixel_error > 0.0f) ? base_pixel_error : 1.0f;
+    }
+    return value;
   }
 
   static float tessera_culling_margin_get(Object *ob)
@@ -789,6 +838,7 @@ class Instance : public DrawEngine {
       if (state.data_source_key != arch.source_name || state.data.clusters.empty()) {
         state.data = *arch.built_data;
         state.pass.reset();
+        state.band_passes.clear();
       }
       state.data_source_key = arch.source_name;
       state.nc2_path = "";
@@ -833,6 +883,7 @@ class Instance : public DrawEngine {
         state.data_source_key = arch_resolved ? arch.source_name : "base";
         /* Drop the pass so it is rebuilt with the new data on draw. */
         state.pass.reset();
+        state.band_passes.clear();
       }
     }
     /* Objects whose data failed to load fall back to the regular mesh path. */
@@ -911,6 +962,7 @@ class Instance : public DrawEngine {
           state.used = false;
           state.ob = nullptr;
           state.pass.reset();
+          state.band_passes.clear();
           state.data = tessera::TesseraData{};
         }
         continue;
@@ -950,25 +1002,17 @@ class Instance : public DrawEngine {
                                                         unjittered_object_persmat;
       const float lod_proj_scale_y = has_cam_lod ? cam_proj_scale_y : viewport_proj_scale_y;
 
-      if (state.pass == nullptr) {
-        state.pass = std::make_unique<blender::tessera::TesseraDrawPass>(
-            state.data, object_persmat, viewport_proj_scale_y, float(resolution.y));
-        if (!state.pass->init()) {
-          state.pass.reset();
-          continue;
-        }
-      }
-
-      state.pass->setReverseZ(false);
-      state.pass->setUseElementsIndirect(true);
       const float culling_margin = (state.ob != nullptr) ?
           tessera_culling_margin_get(state.ob) : state.culling_margin;
       state.culling_margin = culling_margin;
-      state.pass->setCullingMargin(culling_margin);
       const float pixel_error = (state.ob != nullptr) ?
           tessera_pixel_error_get(state.ob) : state.pixel_error;
       state.pixel_error = pixel_error;
-      state.pass->setPixelError(pixel_error);
+      /* Scattered instance fields use a dedicated, coarser LOD threshold:
+       * each dupli is tiny on screen, so a coarser cluster cut per instance
+       * keeps the rasterized cluster-instance count sane for 100k+ fields. */
+      const float effective_pixel_error = (state.instance_mats.size() > 1) ?
+          tessera_scatter_pixel_error_get(state.ob, pixel_error) : pixel_error;
 
       tessera::TesseraShadingMode mode = tessera::TESSERA_SHADING_DIFFUSE;
       if (state.visualize_clusters == 1) {
@@ -983,10 +1027,10 @@ class Instance : public DrawEngine {
       else if (state.visualize_clusters == 4) {
         mode = tessera::TESSERA_SHADING_UVS;
       }
-      state.pass->setShadingMode(mode);
 
+      std::vector<tessera::TesseraMaterialTextures> mats;
       if (mode == tessera::TESSERA_SHADING_DIFFUSE) {
-        std::vector<tessera::TesseraMaterialTextures> mats(1);
+        mats.resize(1);
         if (scene_state_.shading.color_type == V3D_SHADING_SINGLE_COLOR) {
           mats[0].base_color = float4(scene_state_.shading.single_color[0],
                                       scene_state_.shading.single_color[1],
@@ -1012,8 +1056,30 @@ class Instance : public DrawEngine {
           mats[0].roughness_value = 0.5f;
           mats[0].specular_value = 0.5f;
         }
-        state.pass->set_material_textures(mats);
       }
+
+      /* Common per-pass configuration, applied to the main pass and to every
+       * distance-band sub-pass of scattered fields. */
+      const auto configure_pass = [&](blender::tessera::TesseraDrawPass &pass) {
+        pass.setReverseZ(false);
+        pass.setUseElementsIndirect(true);
+        pass.setCullingMargin(culling_margin);
+        pass.setPixelError(effective_pixel_error);
+        pass.setShadingMode(mode);
+        if (mode == tessera::TESSERA_SHADING_DIFFUSE) {
+          pass.set_material_textures(mats);
+        }
+      };
+
+      if (state.pass == nullptr) {
+        state.pass = std::make_unique<blender::tessera::TesseraDrawPass>(
+            state.data, object_persmat, viewport_proj_scale_y, float(resolution.y));
+        if (!state.pass->init()) {
+          state.pass.reset();
+          continue;
+        }
+      }
+      configure_pass(*state.pass);
 
       const bool show_stats = state.show_stats;
       const bool log_console = state.log_console;
@@ -1067,12 +1133,15 @@ class Instance : public DrawEngine {
 
       /* Same LOD threshold while navigating and at rest: scaling it during navigation made the
        * whole cluster cut pop (visible blinking) on every navigation start/stop. */
-      state.pass->setPixelError(pixel_error);
-      state.pass->setNavigating(is_navigating);
-      /* GPU counter readbacks stall the CPU on the whole GPU queue (Vulkan timeline wait);
-       * only request them on still frames. */
-      state.pass->setTelemetryEnabled(!is_navigating && (show_stats || log_console ||
-                                                         show_fps_hud || show_fps_panel));
+      const auto set_frame_flags = [&](blender::tessera::TesseraDrawPass &pass) {
+        pass.setPixelError(effective_pixel_error);
+        pass.setNavigating(is_navigating);
+        /* GPU counter readbacks stall the CPU on the whole GPU queue (Vulkan timeline wait);
+         * only request them on still frames. */
+        pass.setTelemetryEnabled(!is_navigating && (show_stats || log_console ||
+                                                    show_fps_hud || show_fps_panel));
+      };
+      set_frame_flags(*state.pass);
 
       /* For scattered instance fields, expand the traversal culling margin so
        * the cluster selection is not gated by the base archetype transform
@@ -1085,7 +1154,9 @@ class Instance : public DrawEngine {
       if (state.instance_mats.size() > 1) {
         float3 field_bs_center(0.0f);
         float field_bs_radius = 0.0f;
-        if (tessera::mesh_bounds_sphere(state.data, field_bs_center, field_bs_radius)) {
+        const bool have_bs = tessera::mesh_bounds_sphere(state.data, field_bs_center,
+                                                         field_bs_radius);
+        if (have_bs) {
           const float4x4 inv_object_mat = math::invert(state.object_mat);
           const float3 cam_pos_local = (inv_object_mat *
                                         float4(tessera_cull_view.camPos, 1.0f)).xyz();
@@ -1093,14 +1164,164 @@ class Instance : public DrawEngine {
           state.pass->setCullingMargin(dist_cam_local + 2.0f * field_bs_radius +
                                        state.culling_margin);
         }
-      }
+        /* Per-instance camera frustum culling (pass 1): build the surviving
+         * instance list once; pass 2 rasterizes all of them through batched
+         * indirect instanced draws instead of one draw call per scattered
+         * copy (fields reach 100k+ instances). */
+        state.frame_visible_instances.clear();
+        state.frame_visible_instances.reserve(state.instance_mats.size());
+        if (have_bs && field_bs_radius > 0.0f) {
+          for (const float4x4 &inst_mat : state.instance_mats) {
+            if (tessera::instance_in_frustum(tessera_cull_view,
+                                             inst_mat,
+                                             field_bs_center,
+                                             field_bs_radius,
+                                             state.culling_margin))
+            {
+              state.frame_visible_instances.push_back(inst_mat);
+            }
+          }
+        }
+        else {
+          /* No valid bounds: fall back to drawing every instance. */
+          state.frame_visible_instances = state.instance_mats;
+        }
 
-      state.pass->update(state.data,
-                         object_persmat,
-                         viewport_proj_scale_y,
-                         float(resolution.y),
-                         &lod_object_persmat,
-                         &lod_proj_scale_y);
+        /* Distance-band partition: instances at very different camera
+         * distances need very different LOD cuts. Split the survivors into
+         * geometric distance bands (ratio ~1.6, so a band's far end is at
+         * most ~1.6x its near end) and give each band its own traversal pass
+         * evaluated at the band's NEAREST instance — conservative: every
+         * instance in the band is at least as refined as its own cut
+         * demands. Far bands then select a handful of coarse clusters
+         * instead of re-drawing the whole near-field selection. */
+        state.frame_band_count = 0;
+        for (std::vector<float4x4> &band : state.frame_band_instances) {
+          band.clear();
+        }
+        std::array<float, 8> band_nearest_d;
+        std::array<float4x4, 8> band_nearest_mat;
+        band_nearest_d.fill(std::numeric_limits<float>::max());
+        if (!state.frame_visible_instances.empty()) {
+          constexpr float kBandRatio = 1.6f;
+          constexpr int kMaxBands = 8;
+          const float3 band_cam_pos = tessera_cull_view.camPos;
+          float dmin = std::numeric_limits<float>::max();
+          float dmax = 0.0f;
+          for (const float4x4 &inst_mat : state.frame_visible_instances) {
+            const float3 c = (inst_mat * float4(field_bs_center, 1.0f)).xyz();
+            const float d = math::distance(c, band_cam_pos);
+            dmin = std::min(dmin, d);
+            dmax = std::max(dmax, d);
+          }
+          int band_count = 1;
+          if (dmax > dmin * 1.25f && dmin > 1e-6f) {
+            const float steps = std::log(dmax / dmin) / std::log(kBandRatio);
+            band_count = std::clamp(int(std::ceil(steps)), 1, kMaxBands);
+          }
+          const float inv_log_ratio = 1.0f / std::log(kBandRatio);
+          for (const float4x4 &inst_mat : state.frame_visible_instances) {
+            const float3 c = (inst_mat * float4(field_bs_center, 1.0f)).xyz();
+            const float d = math::distance(c, band_cam_pos);
+            int k = (d > dmin && dmin > 1e-6f) ?
+                        int(std::log(d / dmin) * inv_log_ratio) : 0;
+            k = std::clamp(k, 0, band_count - 1);
+            state.frame_band_instances[k].push_back(inst_mat);
+            if (d < band_nearest_d[k]) {
+              band_nearest_d[k] = d;
+              band_nearest_mat[k] = inst_mat;
+            }
+          }
+          state.frame_band_count = uint32_t(band_count);
+        }
+        /* One LOD traversal per band (band 0 reuses the state's main pass;
+         * bands 1..N get their own sub-passes). Each band's selection is
+         * re-traversed only when its reference matrix, LOD view or instance
+         * count changes. */
+        const float4x4 lod_persmat = has_cam_lod ? cam_persmat : unjittered_persmat;
+        for (uint32_t k = 0; k < state.frame_band_count; ++k) {
+          std::vector<float4x4> &band = state.frame_band_instances[k];
+          if (band.empty()) {
+            continue;
+          }
+          blender::tessera::TesseraDrawPass *band_pass = state.pass.get();
+          if (k > 0) {
+            if (state.band_passes.size() < k) {
+              state.band_passes.resize(k);
+            }
+            if (state.band_passes[k - 1] == nullptr) {
+              state.band_passes[k - 1] =
+                  std::make_unique<blender::tessera::TesseraDrawPass>(
+                      state.data, object_persmat, viewport_proj_scale_y, float(resolution.y));
+              if (!state.band_passes[k - 1]->init()) {
+                state.band_passes[k - 1].reset();
+                continue;
+              }
+            }
+            band_pass = state.band_passes[k - 1].get();
+          }
+          configure_pass(*band_pass);
+          set_frame_flags(*band_pass);
+          /* The band's nearest instance is the reference transform: its LOD
+           * demand is the strongest in the band, so evaluating the cut there
+           * never under-refines any instance of the band. */
+          const float4x4 &band_ref = band_nearest_mat[k];
+          if (have_bs) {
+            const float4x4 inv_ref = math::invert(band_ref);
+            const float3 cam_local = (inv_ref * float4(tessera_cull_view.camPos, 1.0f)).xyz();
+            const float dist_local = math::distance(cam_local, field_bs_center);
+            band_pass->setCullingMargin(dist_local + 2.0f * field_bs_radius +
+                                        state.culling_margin);
+          }
+          const float4x4 band_object_persmat = viewport_persmat * band_ref;
+          const float4x4 band_lod_object_persmat = lod_persmat * band_ref;
+          /* Errors are stored in the source mesh's units; the reference
+           * instance's scale converts them to world space so the projected
+           * screen error (and thus the LOD cut) is correct. */
+          const float band_error_scale = std::max(
+              math::length(band_ref[0].xyz()),
+              std::max(math::length(band_ref[1].xyz()), math::length(band_ref[2].xyz())));
+          band_pass->update(state.data,
+                            band_object_persmat,
+                            viewport_proj_scale_y,
+                            float(resolution.y),
+                            &band_lod_object_persmat,
+                            &lod_proj_scale_y,
+                            uint32_t(band.size()),
+                            band_error_scale);
+        }
+        if (state.frame_band_count == 0) {
+          /* All instances were frustum-culled: still refresh the main pass
+           * matrices; nothing will be drawn for this state in pass 2. */
+          const float obj_error_scale = std::max(
+              math::length(state.object_mat[0].xyz()),
+              std::max(math::length(state.object_mat[1].xyz()),
+                       math::length(state.object_mat[2].xyz())));
+          state.pass->update(state.data,
+                             object_persmat,
+                             viewport_proj_scale_y,
+                             float(resolution.y),
+                             &lod_object_persmat,
+                             &lod_proj_scale_y,
+                             1,
+                             obj_error_scale);
+        }
+      }
+      else {
+        state.frame_visible_instances.clear();
+        const float obj_error_scale = std::max(
+            math::length(state.object_mat[0].xyz()),
+            std::max(math::length(state.object_mat[1].xyz()),
+                     math::length(state.object_mat[2].xyz())));
+        state.pass->update(state.data,
+                           object_persmat,
+                           viewport_proj_scale_y,
+                           float(resolution.y),
+                           &lod_object_persmat,
+                           &lod_proj_scale_y,
+                           1,
+                           obj_error_scale);
+      }
 
       if (show_fps_panel || show_fps_hud) {
         auto now = std::chrono::steady_clock::now();
@@ -1236,36 +1457,47 @@ class Instance : public DrawEngine {
         state.pass->set_two_sided(state.two_sided);
         int drawn_instances = 0;
         if (state.instance_mats.size() > 1) {
-          /* Mesh bounding sphere in object space (union of cluster spheres)
-           * used for the per-instance camera frustum test. */
-          float3 tessera_bs_center(0.0f);
-          float tessera_bs_radius = 0.0f;
-          const bool tessera_have_bs = tessera::mesh_bounds_sphere(
-              state.data, tessera_bs_center, tessera_bs_radius);
-          /* Scattered dupli / Geometry-Nodes field: one rasterization draw per
-           * instance matrix, reusing the recorded cluster selection. The
-           * instance transform enters both the projection
-           * (M_draw = P_view * M_instance) and the normal matrix. */
-          for (const float4x4 &inst_mat : state.instance_mats) {
-            /* Per-instance camera frustum culling: transform the mesh
-             * bounding sphere by the instance matrix and test it against the
-             * six world-space frustum planes. Instances failing the test are
-             * dropped before any rasterization dispatch, so scattered foliage
-             * outside the camera view cone (or beyond the user-configured
-             * culling margin) never reaches the GPU. */
-            if (tessera_have_bs &&
-                !tessera::instance_in_frustum(tessera_cull_view,
-                                              inst_mat,
-                                              tessera_bs_center,
-                                              tessera_bs_radius,
-                                              state.culling_margin))
-            {
-              continue; /* Cull instance. */
+          /* Scattered dupli / Geometry-Nodes field: the survivors were
+           * frustum-culled and split into distance bands in pass 1 (each band
+           * has its own LOD selection); every band is rasterized with a
+           * single batched indirect instanced draw (per-instance world
+           * matrices from a storage buffer) instead of one draw call per
+           * scattered copy. */
+          for (uint32_t k = 0; k < state.frame_band_count; ++k) {
+            const std::vector<float4x4> &band = state.frame_band_instances[k];
+            if (band.empty()) {
+              continue;
             }
-            const float4x4 inst_view_proj = viewport_persmat * inst_mat;
-            state.pass->draw_forward(
-                inst_mat, resolution.x, resolution.y, lighting_type, base_col, &inst_view_proj);
-            drawn_instances += 1;
+            const blender::tessera::TesseraDrawPass *band_pass =
+                (k == 0) ? state.pass.get() :
+                           ((k - 1 < state.band_passes.size() &&
+                             state.band_passes[k - 1] != nullptr) ?
+                                state.band_passes[k - 1].get() :
+                                nullptr);
+            if (band_pass == nullptr) {
+              continue;
+            }
+            if (band.size() == 1) {
+              /* Degenerate single survivor: keep the classic single-matrix
+               * path (the GPU args were not instance-multiplied). */
+              const float4x4 inst_view_proj = viewport_persmat * band[0];
+              band_pass->draw_forward(band[0],
+                                      resolution.x,
+                                      resolution.y,
+                                      lighting_type,
+                                      base_col,
+                                      &inst_view_proj);
+            }
+            else {
+              band_pass->draw_forward_instances(band.data(),
+                                                band.size(),
+                                                resolution.x,
+                                                resolution.y,
+                                                lighting_type,
+                                                base_col,
+                                                viewport_persmat);
+            }
+            drawn_instances += int(band.size());
           }
         }
         else {
@@ -1296,6 +1528,15 @@ class Instance : public DrawEngine {
                               nullptr;
         if (stat_ob != nullptr) {
           tessera_stat_int_write(stat_ob, "tessera_stat_drawn_instances", emitter_item.value);
+          if (emitter_item.value == 0) {
+            /* Every scattered instance was frustum-culled: nothing of this
+             * emitter reaches the rasterizer, so report zero active
+             * clusters/triangles as well (keeps camera-culling verification
+             * meaningful — the selection stat alone would still show the
+             * camera-LOD cut). */
+            tessera_stat_int_write(stat_ob, "tessera_stat_clusters", 0);
+            tessera_stat_int_write(stat_ob, "tessera_stat_triangles", 0);
+          }
         }
       }
     }

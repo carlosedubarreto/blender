@@ -256,13 +256,12 @@ TesseraArchetype ArchetypeResolver::resolve(const Main *bmain,
         }
       }
     }
-    printf("Tessera: emitter '%s' realized range matched archetype '%s' (%lld verts)%s\n",
-           emitter ? emitter->id.name + 2 : "?",
-           result.source_name.c_str(),
-           long long(mesh_fingerprint(*matched_mesh).verts),
-           result.nc2_path.empty() ? " [no .nc2, building]" : "");
-    fflush(stdout);
     if (!result.nc2_path.empty()) {
+      printf("Tessera: emitter '%s' realized range matched archetype '%s' (%lld verts)\n",
+             emitter ? emitter->id.name + 2 : "?",
+             result.source_name.c_str(),
+             long long(mesh_fingerprint(*matched_mesh).verts));
+      fflush(stdout);
       CacheEntry entry;
       entry.arch = result;
       entry.fp_verts = fp.verts;
@@ -272,6 +271,24 @@ TesseraArchetype ArchetypeResolver::resolve(const Main *bmain,
     }
     /* No pre-built .nc2: build from the matched botanical mesh. */
     realized = matched_mesh;
+    /* The matched source mesh in #Main is stable across sync rounds while the
+     * realized dupli meshes are re-created by Geometry-Nodes every sync, so
+     * the pointer fast path above always misses. Reuse a previously built
+     * DAG through the stable source-mesh pointer instead of re-simplifying
+     * the archetype on every frame. */
+    if (const CacheEntry *entry = resolved_.lookup_ptr(realized)) {
+      if (entry->fp_verts == fp.verts && entry->fp_corners == fp.corners &&
+          entry->arch.built_data != nullptr)
+      {
+        return entry->arch;
+      }
+    }
+    printf("Tessera: emitter '%s' realized range matched archetype '%s' (%lld verts) "
+           "[no .nc2, building]\n",
+           emitter ? emitter->id.name + 2 : "?",
+           result.source_name.c_str(),
+           long long(mesh_fingerprint(*matched_mesh).verts));
+    fflush(stdout);
   }
   {
     TesseraData data;

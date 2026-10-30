@@ -643,8 +643,14 @@ BuildResult buildClusterDAG(const std::vector<BuildVertex> &verts,
                 coarse_tri_array, coarse_all, coarse_positions,
                 params.maxClusterTris);
 
-            /* Cumulative error: a parent cluster must have an error at least as
-             * large as all its children plus the current simplification error. */
+            /* Cumulative error: a parent cluster's error must bound the worst
+             * geometric deviation between the parent and the original surface.
+             * Use max-accumulation (the largest of the children's errors and
+             * this simplification step's displacement) — additive accumulation
+             * (summing over levels) produced errors tens of thousands of
+             * times larger than the mesh itself, which flattened the LOD cut:
+             * no practical pixel-error threshold could reach the coarse
+             * levels, so scattered fields ignored the LOD budget entirely. */
             float max_child_error = 0.0f;
             for (const uint32_t cid : mg) {
                 max_child_error = std::max(max_child_error, R.clusters[cid].error);
@@ -652,7 +658,8 @@ BuildResult buildClusterDAG(const std::vector<BuildVertex> &verts,
             /* Guarantee strict error monotonicity up the tree: parent error must strictly exceed
              * all constituent children by at least epsilon (scaled for large error values). */
             const float error_eps = std::max(1e-4f, max_child_error * 1e-4f);
-            const float accumulated_error = max_child_error + std::max(simplified.error, error_eps);
+            const float accumulated_error = std::max(max_child_error, simplified.error) +
+                                            error_eps;
 
             std::vector<uint32_t> parents;
             for (const auto &part : parts) {

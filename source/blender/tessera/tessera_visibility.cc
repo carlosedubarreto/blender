@@ -741,11 +741,28 @@ gpu::Shader *createGbufferShader()
 static const char *FORWARD_VERT_SOURCE = R"(
 void main()
 {
-  /* Single Indirect Instanced Draw:
-   * - gpu_InstanceIndex is the slot in visible_clusters[] (0 .. instanceCount - 1)
-   * - in_vid is the local vertex index within the cluster (0 .. max_cluster_indices - 1) */
-  uint slot_idx = uint(gpu_InstanceIndex);
-  uint cluster_idx = visible_clusters[slot_idx];
+  /* Bucketed Single Indirect Instanced Draw:
+   * - One draw per index-count bucket b: counter_buf[84 + b*4 .. +3] is the
+   *   GPU-written DrawArraysIndirectCommand {bucket_size, count_b * N, 0, 0}
+   *   and counter_buf[76 + b] (bound as forward_args) the unmultiplied
+   *   visible-cluster count of that bucket. draw_commands holds six bucket
+   *   regions of `cluster_count` entries each.
+   * - gpu_InstanceIndex is the flat instance index (0 .. count_b * N - 1):
+   *     object instance = flat / count_b      (instanced scatter fields)
+   *     cluster slot    = flat % count_b
+   *   In single-matrix mode (instance_count == 0) flat IS the cluster slot.
+   * - in_vid is the local vertex index within the cluster
+   *   (0 .. bucket_size - 1). */
+  uint flat_id = uint(gpu_InstanceIndex);
+  uint count_b = forward_args[76 + uint(bucket_index)];
+  uint region_base = uint(bucket_index) * uint(cluster_count);
+  uint obj_index = 0u;
+  uint slot_idx = flat_id;
+  if (instance_count > 0 && count_b > 0u) {
+    obj_index = flat_id / count_b;
+    slot_idx = flat_id - obj_index * count_b;
+  }
+  uint cluster_idx = visible_clusters[region_base + slot_idx];
   uvec4 meta = cluster_meta[cluster_idx];
   uint local_vid = in_vid;
   if (local_vid >= meta.y) {
@@ -764,10 +781,23 @@ void main()
   vec3 pos = v0.xyz;
   vec3 nor = vec3(v0.w, v1.xy);
 
-  vec4 world_pos = model_mat * vec4(pos, 1.0);
-  gl_Position = view_proj * vec4(pos, 1.0);
+  vec4 world_pos;
+  mat3 norm_mat;
+  if (instance_count > 0) {
+    /* Instanced scatter field: model transform and normal matrix come from
+     * the per-instance world matrix in the instance buffer. view_proj is the
+     * pure world->clip projection (no instance baking). */
+    mat4 model = instance_mats[obj_index];
+    world_pos = model * vec4(pos, 1.0);
+    norm_mat = transpose(inverse(mat3(model)));
+    gl_Position = view_proj * world_pos;
+  }
+  else {
+    world_pos = model_mat * vec4(pos, 1.0);
+    gl_Position = view_proj * vec4(pos, 1.0);
+    norm_mat = normal_mat;
+  }
 
-  mat3 norm_mat = normal_mat;
   vec3 n = norm_mat * nor;
   float len_n = length(n);
   v_world_normal = (len_n > 1e-6) ? (n / len_n) : nor;
@@ -888,6 +918,12 @@ gpu::Shader *createForwardShader()
     info.storage_buf(1, Qualifier::read, "uvec4", "cluster_meta[]");
     info.storage_buf(2, Qualifier::read, "uint", "tri_indices[]");
     info.storage_buf(3, Qualifier::read, "vec4", "packed_verts[]");
+    /* Per-object-instance world matrices (scattered fields; a 1-matrix dummy
+     * is bound in single-instance mode). */
+    info.storage_buf(4, Qualifier::read, "mat4", "instance_mats[]");
+    /* The renderer's counter buffer: [72..75] is the GPU-written
+     * DrawArraysIndirectCommand, [77] the visible-cluster count. */
+    info.storage_buf(5, Qualifier::read, "uint", "forward_args[]");
 
     info.sampler(0, ImageType::Float2D, "tex_diffuse_0");
     info.sampler(1, ImageType::Float2D, "tex_diffuse_1");
@@ -905,6 +941,11 @@ gpu::Shader *createForwardShader()
     info.push_constant(Type::int_t, "debug_clusters");
     info.push_constant(Type::int_t, "has_alpha_mask");
     info.push_constant(Type::float4_t, "has_tex_flags");
+    /* Number of object instances rasterized through the instance buffer.
+     * 0 = single-matrix mode (model_mat / normal_mat push constants). */
+    info.push_constant(Type::int_t, "instance_count");
+    /* Index-count bucket of this draw (0..5; see the traversal shader). */
+    info.push_constant(Type::int_t, "bucket_index");
 
     StageInterfaceInfo iface("tessera_forward_iface", "");
     iface.smooth(Type::float3_t, "v_world_pos");
@@ -950,6 +991,16 @@ bool TesseraVisibilityPass::init()
                                              gpu::TextureFormat::UNORM_8_8_8_8,
                                              GPU_TEXTURE_USAGE_SHADER_READ,
                                              rough);
+
+    /* One-matrix fallback bound to the instance-matrix slot when drawing in
+     * single (non-instanced) mode, so the descriptor is always valid. */
+    if (mDummyInstanceBuf == nullptr) {
+        const float4x4 identity = float4x4::identity();
+        mDummyInstanceBuf = GPU_storagebuf_create_ex(sizeof(float4x4),
+                                                     identity.ptr(),
+                                                     GPU_USAGE_STATIC,
+                                                     "tessera_dummy_instance_mat");
+    }
 
     return mDefaultWhiteTex != nullptr;
 }
@@ -1028,6 +1079,9 @@ void TesseraVisibilityPass::terminate()
     if (mClusterMaterialsBuf != nullptr) { GPU_storagebuf_free(mClusterMaterialsBuf); mClusterMaterialsBuf = nullptr; }
     if (mTriMaterialsBuf != nullptr) { GPU_storagebuf_free(mTriMaterialsBuf); mTriMaterialsBuf = nullptr; }
     if (mMaterialParamsBuf != nullptr) { GPU_storagebuf_free(mMaterialParamsBuf); mMaterialParamsBuf = nullptr; }
+    if (mInstanceMatsBuf != nullptr) { GPU_storagebuf_free(mInstanceMatsBuf); mInstanceMatsBuf = nullptr; }
+    mInstanceMatsCapacity = 0;
+    if (mDummyInstanceBuf != nullptr) { GPU_storagebuf_free(mDummyInstanceBuf); mDummyInstanceBuf = nullptr; }
     mCachedVisData = nullptr;
     mVisResourcesDirty = false;
     mMaxClusterIndices = 384;
@@ -1898,11 +1952,146 @@ void TesseraVisibilityPass::render_forward(gpu::StorageBuf *command_buf,
         }
     }
 
+    /* Single-matrix mode: model/normal push constants + one indirect draw. */
+    (void)material_counts;
+    (void)max_commands_per_material;
+    forward_draw_common(command_buf,
+                        counter_buf,
+                        viewProj,
+                        model_mat,
+                        compute_normal_matrix(model_mat),
+                        cam_pos,
+                        viewport_width,
+                        viewport_height,
+                        shading_mode,
+                        lighting_type,
+                        base_color,
+                        has_tex_flags,
+                        alpha_mask_active,
+                        0);
+}
+
+void TesseraVisibilityPass::render_forward_instances(gpu::StorageBuf *command_buf,
+                                                     size_t draw_count,
+                                                     const float4x4 *instance_mats,
+                                                     size_t instance_count,
+                                                     const float4x4 &viewProj,
+                                                     const float3 &cam_pos,
+                                                     int viewport_width,
+                                                     int viewport_height,
+                                                     int shading_mode,
+                                                     int lighting_type,
+                                                     const float4 &base_color,
+                                                     gpu::StorageBuf *counter_buf)
+{
+    if (command_buf == nullptr || counter_buf == nullptr || draw_count == 0 ||
+        instance_mats == nullptr || instance_count == 0 || mForwardBatch == nullptr ||
+        mPackedVertsBuf == nullptr || mIndicesBuf == nullptr || mClusterMetaBuf == nullptr)
+    {
+        return;
+    }
+    if (viewport_width <= 0 || viewport_height <= 0) {
+        return;
+    }
+    if (mForwardShader == nullptr) {
+        mForwardShader = createForwardShader();
+        if (mForwardShader == nullptr) {
+            return;
+        }
+    }
+
+    /* (Re)upload the surviving per-instance world matrices. The buffer grows
+     * as needed; the usage size is adjusted so only the active matrices are
+     * transferred each frame. */
+    const size_t needed_bytes = instance_count * sizeof(float4x4);
+    if (mInstanceMatsBuf == nullptr || mInstanceMatsCapacity < needed_bytes) {
+        if (mInstanceMatsBuf != nullptr) {
+            GPU_storagebuf_free(mInstanceMatsBuf);
+        }
+        /* Grow generously to avoid per-frame reallocation churn while the
+         * scatter system edits instance counts. */
+        mInstanceMatsCapacity = std::max<size_t>(needed_bytes * 2, 1024 * sizeof(float4x4));
+        mInstanceMatsBuf = GPU_storagebuf_create_ex(mInstanceMatsCapacity,
+                                                    nullptr,
+                                                    GPU_USAGE_DYNAMIC,
+                                                    "tessera_instance_mats");
+        if (mInstanceMatsBuf == nullptr) {
+            mInstanceMatsCapacity = 0;
+            return;
+        }
+    }
+    GPU_storagebuf_usage_size_set(mInstanceMatsBuf, needed_bytes);
+    GPU_storagebuf_update(mInstanceMatsBuf, instance_mats->ptr());
+
+    /* Alpha cutout state (same policy as the single-instance path). */
+    bool alpha_mask_active = false;
+    float4 has_tex_flags(0.0f);
+    if (mAlphaMask) {
+        for (int s = 0; s < 4; ++s) {
+            const bool slot_has_diffuse = (s < int(mMaterials.size())) &&
+                                          mMaterials[s].has_diffuse &&
+                                          (mMaterials[s].diffuse != nullptr);
+            if (slot_has_diffuse) {
+                has_tex_flags[s] = 1.0f;
+                alpha_mask_active = true;
+            }
+        }
+    }
+
+    /* The model/normal push constants are unused in instanced mode (the
+     * vertex shader derives both from the per-instance matrix); identities
+     * keep the state deterministic. */
+    forward_draw_common(command_buf,
+                        counter_buf,
+                        viewProj,
+                        float4x4::identity(),
+                        float3x3::identity(),
+                        cam_pos,
+                        viewport_width,
+                        viewport_height,
+                        shading_mode,
+                        lighting_type,
+                        base_color,
+                        has_tex_flags,
+                        alpha_mask_active,
+                        instance_count);
+}
+
+void TesseraVisibilityPass::forward_draw_common(gpu::StorageBuf *command_buf,
+                                                gpu::StorageBuf *counter_buf,
+                                                const float4x4 &viewProj,
+                                                const float4x4 &model_mat,
+                                                const float3x3 &normal_mat,
+                                                const float3 &cam_pos,
+                                                int viewport_width,
+                                                int viewport_height,
+                                                int shading_mode,
+                                                int lighting_type,
+                                                const float4 &base_color,
+                                                const float4 &has_tex_flags,
+                                                bool alpha_mask_active,
+                                                size_t instance_count)
+{
+    (void)viewport_width;
+    (void)viewport_height;
+
     GPU_shader_bind(mForwardShader);
     GPU_storagebuf_bind(command_buf, 0);
     GPU_storagebuf_bind(mClusterMetaBuf, 1);
     GPU_storagebuf_bind(mIndicesBuf, 2);
     GPU_storagebuf_bind(mPackedVertsBuf, 3);
+    /* Instance matrices (a one-matrix dummy is bound in single-instance mode
+     * so the descriptor is always valid) and the forward args/counter buffer
+     * ([72..75] = DrawArraysIndirectCommand, [77] = visible cluster count). */
+    if (instance_count > 0 && mInstanceMatsBuf != nullptr) {
+        GPU_storagebuf_bind(mInstanceMatsBuf, 4);
+    }
+    else if (mDummyInstanceBuf != nullptr) {
+        GPU_storagebuf_bind(mDummyInstanceBuf, 4);
+    }
+    if (counter_buf != nullptr) {
+        GPU_storagebuf_bind(counter_buf, 5);
+    }
     if (alpha_mask_active) {
         for (int s = 0; s < 4; ++s) {
             const bool slot_has_diffuse = (s < int(mMaterials.size())) &&
@@ -1919,31 +2108,50 @@ void TesseraVisibilityPass::render_forward(gpu::StorageBuf *command_buf,
 
     GPU_shader_uniform_mat4(mForwardShader, "view_proj", viewProj.ptr());
     GPU_shader_uniform_mat4(mForwardShader, "model_mat", model_mat.ptr());
-    float3x3 fwd_norm = compute_normal_matrix(model_mat);
-    GPU_shader_uniform_mat3(mForwardShader, "normal_mat", reinterpret_cast<const float(*)[3]>(fwd_norm.ptr()));
+    GPU_shader_uniform_mat3(
+        mForwardShader, "normal_mat", reinterpret_cast<const float(*)[3]>(normal_mat.ptr()));
     GPU_shader_uniform_3f(mForwardShader, "camera_pos", cam_pos.x, cam_pos.y, cam_pos.z);
     /* Two-sided (foliage card) meshes render fully opaque in solid view. */
     float4 forward_base_color = base_color;
     if (mTwoSided) {
         forward_base_color.w = 1.0f;
     }
-    GPU_shader_uniform_4f(mForwardShader, "base_color", forward_base_color.x, forward_base_color.y, forward_base_color.z, forward_base_color.w);
+    GPU_shader_uniform_4f(mForwardShader,
+                          "base_color",
+                          forward_base_color.x,
+                          forward_base_color.y,
+                          forward_base_color.z,
+                          forward_base_color.w);
     GPU_shader_uniform_1i(mForwardShader, "shading_mode", shading_mode);
     GPU_shader_uniform_1i(mForwardShader, "lighting_type", lighting_type);
     GPU_shader_uniform_1i(mForwardShader, "cluster_count", int(mClusterCount));
-    GPU_shader_uniform_1i(mForwardShader, "debug_clusters", shading_mode == TESSERA_SHADING_CLUSTERS ? 1 : 0);
+    GPU_shader_uniform_1i(mForwardShader,
+                          "debug_clusters",
+                          shading_mode == TESSERA_SHADING_CLUSTERS ? 1 : 0);
     GPU_shader_uniform_1i(mForwardShader, "has_alpha_mask", alpha_mask_active ? 1 : 0);
-    GPU_shader_uniform_4f(mForwardShader, "has_tex_flags", has_tex_flags.x, has_tex_flags.y, has_tex_flags.z, has_tex_flags.w);
+    GPU_shader_uniform_4f(mForwardShader,
+                          "has_tex_flags",
+                          has_tex_flags.x,
+                          has_tex_flags.y,
+                          has_tex_flags.z,
+                          has_tex_flags.w);
+    GPU_shader_uniform_1i(mForwardShader, "instance_count", int(instance_count));
 
-    /* Single indirect instanced draw: counter_buf[72..75] holds one DrawArraysIndirectCommand
-     * {max_cluster_indices, visible_cluster_count, 0, 0} written entirely on the GPU by the
-     * traversal compute shader; command_buf holds the visible cluster indices. No CPU readback,
-     * no multi-draw-indirect-count dependency (VKBatch does not implement it). */
-    (void)material_counts;
-    (void)max_commands_per_material;
+    /* One indirect instanced draw per index-count bucket: counter_buf
+     * [84 + b*4 .. +3] holds a GPU-written DrawArraysIndirectCommand
+     * {bucket_size, count_b * object_instances, 0, 0} (finalized on the GPU
+     * by the traversal compute shader); command_buf holds six bucket regions
+     * of cluster_count visible-cluster indices. Empty buckets draw nothing
+     * (instanceCount 0). No CPU readback, no multi-draw-indirect-count
+     * dependency. */
     GPU_storagebuf_sync_as_indirect_buffer(counter_buf);
     GPU_batch_set_shader(mForwardBatch, mForwardShader);
-    GPU_batch_draw_indirect(mForwardBatch, counter_buf, intptr_t(72 * sizeof(uint32_t)));
+    for (int b = 0; b < 6; ++b) {
+        GPU_shader_uniform_1i(mForwardShader, "bucket_index", b);
+        GPU_batch_draw_indirect(mForwardBatch,
+                                counter_buf,
+                                intptr_t((84 + b * 4) * sizeof(uint32_t)));
+    }
 }
 
 }  // namespace tessera

@@ -79,6 +79,8 @@ struct TraversalContext {
     float projScaleY = 1.0f;
     float pixelError = 1.0f;
     float cullingMargin = 0.0f;
+    /* Reference instance scale applied to the source-unit cluster errors. */
+    float error_scale = 1.0f;
     bool orthographic = false;
     std::size_t maxClusters = std::numeric_limits<std::size_t>::max();
     std::vector<TesseraDrawCommand> *out = nullptr;
@@ -101,7 +103,7 @@ void traverseCluster(const TraversalContext &ctx, uint32_t ci)
 
     const float cluster_screen_err = (cluster.error <= 0.0f)
         ? 0.0f
-        : projectedErrorPx(center, cluster.sphere[3], cluster.error,
+        : projectedErrorPx(center, cluster.sphere[3], cluster.error * ctx.error_scale,
                            ctx.camPos, ctx.viewportHeight,
                            ctx.projScaleY, ctx.orthographic);
 
@@ -109,7 +111,8 @@ void traverseCluster(const TraversalContext &ctx, uint32_t ci)
     const float parent_screen_err =
         (cluster.parentError >= 1e38f)
             ? std::numeric_limits<float>::max()
-            : projectedErrorPx(pcenter, cluster.parentSphere[3], cluster.parentError,
+            : projectedErrorPx(pcenter, cluster.parentSphere[3],
+                               cluster.parentError * ctx.error_scale,
                                ctx.camPos, ctx.viewportHeight,
                                ctx.projScaleY, ctx.orthographic);
 
@@ -381,6 +384,7 @@ std::size_t selectClusters(const TesseraData &data,
     ctx.projScaleY = view.projScaleY;
     ctx.pixelError = params.pixelError;
     ctx.cullingMargin = params.cullingMargin;
+    ctx.error_scale = params.errorScale > 0.0f ? params.errorScale : 1.0f;
     ctx.maxClusters = params.maxClustersPerFrame > 0
                           ? std::size_t(params.maxClustersPerFrame)
                           : std::numeric_limits<std::size_t>::max();
@@ -445,9 +449,10 @@ std::size_t selectClustersFlat(const TesseraData &data,
          * A cluster is rendered iff:
          *   projectedError(cluster) <= tau  AND  projectedError(parent) > tau
          */
+        const float scale = params.errorScale > 0.0f ? params.errorScale : 1.0f;
         const float err_c = (cluster.error <= 0.0f)
             ? 0.0f
-            : projectedErrorPx(center, radius, cluster.error,
+            : projectedErrorPx(center, radius, cluster.error * scale,
                                lod_view.camPos, viewportHeight, lod_view.projScaleY,
                                lod_view.orthographic);
 
@@ -455,7 +460,7 @@ std::size_t selectClustersFlat(const TesseraData &data,
         const float pradius = cluster.parentSphere[3];
         const float err_p = (cluster.parentError >= 1e38f)
             ? std::numeric_limits<float>::max()
-            : projectedErrorPx(pcenter, pradius, cluster.parentError,
+            : projectedErrorPx(pcenter, pradius, cluster.parentError * scale,
                                lod_view.camPos, viewportHeight, lod_view.projScaleY,
                                lod_view.orthographic);
 
