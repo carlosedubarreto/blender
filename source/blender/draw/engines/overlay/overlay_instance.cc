@@ -512,6 +512,10 @@ void Instance::begin_sync()
 
 void Instance::object_sync(ObjectRef &ob_ref, Manager &manager)
 {
+  if (ob_ref.is_range() && !object_is_selected(ob_ref) && !state.is_wireframe_mode) {
+    return;
+  }
+
   const bool in_object_mode = ob_ref.object->mode == OB_MODE_OBJECT;
   const bool in_edit_mode = ob_ref.object->mode == OB_MODE_EDIT;
   const bool in_paint_mode = object_is_paint_mode(ob_ref.object);

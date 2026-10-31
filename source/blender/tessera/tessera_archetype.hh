@@ -101,6 +101,8 @@ class ArchetypeResolver {
   };
   /** Realized-mesh pointer -> resolved archetype. */
   Map<const void *, CacheEntry> resolved_;
+  /** Realized-mesh fingerprint -> resolved archetype (stable across depsgraph pointer recreations). */
+  Map<std::pair<int64_t, int64_t>, TesseraArchetype> resolved_by_fp_;
 };
 
 }  // namespace tessera

@@ -119,7 +119,8 @@ public:
               const float3 &mesh_center,
               float mesh_radius,
               float culling_margin,
-              std::vector<float4x4> &out_visible) const;
+              std::vector<float4x4> &out_visible,
+              float max_draw_distance = 0.0f) const;
 };
 
 /**

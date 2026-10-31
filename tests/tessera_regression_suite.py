@@ -1246,7 +1246,7 @@ def test_viewport_interaction_performance():
             ob["tessera_culling_margin"] = 0.02
             ob["tessera_pixel_error"] = 1.0
 
-        # Full-scene close view framing all 5 meshes
+        # Full-scene view framing all 5 meshes
         cam.location = mathutils.Vector((center.x + radius * 6.0, center.y + radius * 4.0, center.z + radius * 3.0))
         cam.rotation_euler = ((center + mathutils.Vector((radius * 1.8, 0.0, 0.0))) - cam.location).to_track_quat('-Z', 'Y').to_euler()
         bpy.context.view_layer.update()
@@ -1254,7 +1254,7 @@ def test_viewport_interaction_performance():
         tris_near = sum(int(ob.get("tessera_stat_triangles", 0)) for ob in mesh_objects)
         clusters_near = sum(int(ob.get("tessera_stat_clusters", 0)) for ob in mesh_objects)
 
-        # Panned & zoomed-out view where off-screen meshes are frustum-culled and distant clusters coarsen
+        # Panned & zoomed-in view where off-screen meshes are frustum-culled
         for ob in mesh_objects:
             ob["tessera_pixel_error"] = 3.0
         cam.location = mathutils.Vector((center.x + radius * 0.25, center.y, center.z + radius * 0.15))

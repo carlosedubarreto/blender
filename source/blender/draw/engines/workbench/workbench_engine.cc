@@ -118,6 +118,7 @@ class Instance : public DrawEngine {
      * Band 0 reuses #pass; bands 1..N live here. */
     Vector<std::unique_ptr<blender::tessera::TesseraDrawPass>> band_passes;
     std::array<std::vector<float4x4>, 8> frame_band_instances;
+    std::array<float, 8> frame_band_nearest_d = {0.0f};
     uint32_t frame_band_count = 0;
     /* Accelerated spatial BVH for hierarchical frustum culling of scattered instances. */
     tessera::InstanceBVH instance_bvh;
@@ -164,6 +165,7 @@ class Instance : public DrawEngine {
   const Object *tessera_last_ob_ = nullptr;
   const void *tessera_last_data_ = nullptr;
   uint32_t tessera_last_sync_round_ = 0;
+
 
   /* Cap on collected per-object instance matrices (bounds per-frame cost of
    * scattered Geometry-Nodes / ScatterFlow fields). Up to 131k covers massive
@@ -443,7 +445,7 @@ class Instance : public DrawEngine {
       }
     }
 
-    return 24.0f;
+    return 16.0f;
   }
 
   static float tessera_max_draw_distance_get(const Scene *scene, Object *ob, const std::string &ob_name)
@@ -515,21 +517,27 @@ class Instance : public DrawEngine {
     };
 
     if (contains_ci(name, "Debris") || contains_ci(name, "LeafScatter")) {
-      return 21.0f;
+      return 20.0f;
     }
     if (contains_ci(name, "Rocks_Small") || contains_ci(name, "SweetViolet") ||
         contains_ci(name, "Pebble") || contains_ci(name, "Stick"))
     {
-      return 21.0f;
+      return 22.0f;
     }
     if (contains_ci(name, "Galetta") || contains_ci(name, "Grass")) {
-      return 23.5f;
+      return 28.0f;
     }
-    if (contains_ci(name, "DewBerry") || contains_ci(name, "StickyWilly") ||
-        contains_ci(name, "StingingNettle") || contains_ci(name, "Shrub") ||
-        contains_ci(name, "Bush") || contains_ci(name, "Flower"))
+    if (contains_ci(name, "StickyWilly") || contains_ci(name, "StingingNettle")) {
+      return 30.0f;
+    }
+    if (contains_ci(name, "DewBerry") || contains_ci(name, "Shrub") ||
+        contains_ci(name, "Bush") || contains_ci(name, "Flower") ||
+        contains_ci(name, "Cactus"))
     {
-      return 23.5f;
+      return 35.0f;
+    }
+    if (contains_ci(name, "Rocks_Large") || contains_ci(name, "Rock")) {
+      return 0.0f;
     }
 
     return 0.0f;
@@ -734,7 +742,7 @@ class Instance : public DrawEngine {
         return (value >= 0.0f) ? value : 0.0f;
       }
     }
-    return 4.5f;
+    return 3.0f;
   }
 
   /** LOD view source: 0 = viewport view, 1 = the scene's active camera. */
@@ -1055,8 +1063,6 @@ class Instance : public DrawEngine {
       return false;
     }
 
-    std::lock_guard lock(this->tessera_mutex_);
-
     const bool is_dupli = (ob->base_flag & BASE_FROM_DUPLI) != 0;
     const bool is_range = ob_ref.is_range();
 
@@ -1073,8 +1079,10 @@ class Instance : public DrawEngine {
                                 (kMaxTesseraInstancesPerObject - tessera_last_state_->instance_mats.size()) :
                                 0;
         const int to_copy = std::min(int(room), range_count);
+        const size_t old_sz = tessera_last_state_->instance_mats.size();
+        tessera_last_state_->instance_mats.resize(old_sz + to_copy);
         for (int i = 0; i < to_copy; ++i) {
-          tessera_last_state_->instance_mats.push_back(ob_ref.object_to_world(i));
+          tessera_last_state_->instance_mats[old_sz + i] = ob_ref.object_to_world(i);
         }
       }
       else if (is_dupli) {
@@ -1184,13 +1192,21 @@ class Instance : public DrawEngine {
       }
     }
     if (!is_dupli && !is_range) {
-      /* Base sync of a pure Geometry-Nodes instancer: the evaluated geometry
+      /* Base sync of a pure Geometry-Nodes or dupli instancer: the evaluated geometry
        * is an instance cloud, so the native pipeline draws nothing for the
        * base object itself — skip its Tessera draw to stay identical. */
-      if (ob->runtime && ob->runtime->geometry_set_eval &&
-          ob->runtime->geometry_set_eval->has_instances())
-      {
+      const bool is_instancer = (ob->transflag & OB_DUPLI) != 0 ||
+                                (ob->runtime && ob->runtime->geometry_set_eval &&
+                                 ob->runtime->geometry_set_eval->has_instances());
+      if (is_instancer) {
         state.is_instancer_base = true;
+        /* Preserve all child archetype states cached for this instancer across frames */
+        const std::string prefix = std::string(ob->id.name + 2) + "|";
+        for (auto item : tessera_objects_.items()) {
+          if (item.key.rfind(prefix, 0) == 0) {
+            item.value->used = true;
+          }
+        }
       }
     }
     /* ScatterFlow / Geometry-Nodes instances arrive as ObjectRef instance
@@ -1204,8 +1220,10 @@ class Instance : public DrawEngine {
                               (kMaxTesseraInstancesPerObject - state.instance_mats.size()) :
                               0;
       const int to_copy = std::min(int(room), range_count);
+      const size_t old_sz = state.instance_mats.size();
+      state.instance_mats.resize(old_sz + to_copy);
       for (int i = 0; i < to_copy; ++i) {
-        state.instance_mats.push_back(ob_ref.object_to_world(i));
+        state.instance_mats[old_sz + i] = ob_ref.object_to_world(i);
       }
     }
     else if (is_dupli) {
@@ -1314,8 +1332,6 @@ class Instance : public DrawEngine {
 
     Map<std::string, int> drawn_instances_by_emitter;
 
-    auto t_p1_start = std::chrono::steady_clock::now();
-
     /* Pass 1 records all compute traversals; pass 2 issues all indirect draws. Interleaving
      * compute and graphics per object forced Vulkan to end/restart the rendering scope and
      * insert compute->graphics barriers once per object. */
@@ -1405,7 +1421,7 @@ class Instance : public DrawEngine {
        * keeps the rasterized cluster-instance count sane for 100k+ fields. */
       const float effective_pixel_error = (state.instance_mats.size() > 1) ?
           tessera_scatter_pixel_error_get(scene_state_.scene, state.ob, pixel_error) :
-          (state.data.clusters.size() > 5000 ? std::max(pixel_error, 2.5f) : pixel_error);
+          (state.data.clusters.size() > 5000 ? std::max(pixel_error, 8.0f) : pixel_error);
 
       tessera::TesseraShadingMode mode = tessera::TESSERA_SHADING_DIFFUSE;
       if (state.visualize_clusters == 1) {
@@ -1458,11 +1474,11 @@ class Instance : public DrawEngine {
         pass.setUseElementsIndirect(true);
         pass.setCullingMargin(culling_margin);
         /* Adaptive error scaling per distance band:
-         * Bands 2 through 7 scale up pixel error progressively,
+         * Bands 1 through 7 scale up pixel error progressively,
          * forcing mid and distant foliage/rocks to clamp to coarse parent clusters. */
         float band_err = effective_pixel_error;
-        if (band_idx >= 2) {
-          band_err *= (1.0f + float(band_idx - 1) * 2.5f);
+        if (band_idx >= 1) {
+          band_err *= (1.0f + float(band_idx) * 1.5f);
         }
         pass.setPixelError(band_err);
         pass.setLodDistance(lod_distance);
@@ -1536,7 +1552,6 @@ class Instance : public DrawEngine {
       /* Same LOD threshold while navigating and at rest: scaling it during navigation made the
        * whole cluster cut pop (visible blinking) on every navigation start/stop. */
       const auto set_frame_flags = [&](blender::tessera::TesseraDrawPass &pass) {
-        pass.setPixelError(effective_pixel_error);
         pass.setNavigating(is_navigating);
         /* GPU counter readbacks stall the CPU on the whole GPU queue (Vulkan timeline wait);
          * only request them on still frames. */
@@ -1566,10 +1581,12 @@ class Instance : public DrawEngine {
           state.pass->setCullingMargin(dist_cam_local + 2.0f * field_bs_radius +
                                        state.culling_margin);
         }
-        /* Per-instance camera frustum culling (pass 1): build the surviving
-         * instance list once; pass 2 rasterizes all of them through batched
-         * indirect instanced draws instead of one draw call per scattered
-         * copy (fields reach 100k+ instances). */
+        const float max_draw_dist = tessera_max_draw_distance_get(
+            scene_state_.scene, state.ob, state.ob_name);
+
+        /* Per-instance camera frustum & distance culling (pass 1): build the surviving
+         * instance list hierarchically through the BVH; pass 2 rasterizes all of them through
+         * batched indirect instanced draws instead of one draw call per scattered copy. */
         state.frame_visible_instances.clear();
         if (have_bs && field_bs_radius > 0.0f) {
           if (!state.instance_bvh.is_built() ||
@@ -1582,11 +1599,19 @@ class Instance : public DrawEngine {
                                   field_bs_center,
                                   field_bs_radius,
                                   state.culling_margin,
-                                  state.frame_visible_instances);
+                                  state.frame_visible_instances,
+                                  max_draw_dist);
         }
         else {
-          /* No valid bounds: fall back to drawing every instance. */
-          state.frame_visible_instances = state.instance_mats;
+          /* No valid bounds: fall back to drawing every instance within max distance. */
+          const float max_d_sq = max_draw_dist > 0.0f ? max_draw_dist * max_draw_dist : 0.0f;
+          for (const float4x4 &mat : state.instance_mats) {
+            const float3 c = (mat * float4(field_bs_center, 1.0f)).xyz();
+            if (max_d_sq > 0.0f && math::distance_squared(c, tessera_cull_view.camPos) > max_d_sq) {
+              continue;
+            }
+            state.frame_visible_instances.push_back(mat);
+          }
         }
 
         /* Distance-band partition: instances at very different camera
@@ -1605,51 +1630,15 @@ class Instance : public DrawEngine {
         std::array<float4x4, 8> band_nearest_mat;
         band_nearest_d.fill(std::numeric_limits<float>::max());
         if (!state.frame_visible_instances.empty()) {
-          constexpr float kBandRatio = 1.45f;
-          constexpr int kMaxBands = 8;
-          const float log_ratio = std::log(kBandRatio);
           const float3 band_cam_pos = tessera_cull_view.camPos;
           const float min_screen_radius_px = tessera_min_screen_radius_get(scene_state_.scene, state.ob);
-          const float max_draw_dist = tessera_max_draw_distance_get(
-              scene_state_.scene, state.ob, state.ob_name);
           const float px_scale = viewport_proj_scale_y * (float(resolution.y) * 0.5f);
 
           float dmin = std::numeric_limits<float>::max();
           float dmax = 0.0f;
-          static int s_dist_print = 0;
-          bool do_print = (++s_dist_print % 100 == 0);
-          int kept_cnt = 0, culled_cnt = 0;
           for (const float4x4 &inst_mat : state.frame_visible_instances) {
             const float3 c = (inst_mat * float4(field_bs_center, 1.0f)).xyz();
             const float d = math::distance(c, band_cam_pos);
-            if (max_draw_dist > 0.0f && d > max_draw_dist) {
-              culled_cnt++;
-              continue;
-            }
-            kept_cnt++;
-            dmin = std::min(dmin, d);
-            dmax = std::max(dmax, d);
-          }
-          if (do_print && state.instance_mats.size() > 100) {
-            printf("[MaxDist Check] %-20s: cam=(%.1f,%.1f,%.1f) max_d=%.1f | kept=%d, culled=%d\n",
-                   state.ob_name.c_str(), band_cam_pos.x, band_cam_pos.y, band_cam_pos.z,
-                   max_draw_dist, kept_cnt, culled_cnt);
-            fflush(stdout);
-          }
-          int band_count = 1;
-          if (dmax > dmin * 1.25f && dmin > 1e-6f) {
-            const float steps = std::log(dmax / dmin) / log_ratio;
-            band_count = std::clamp(int(std::ceil(steps)), 1, kMaxBands);
-          }
-
-          for (const float4x4 &inst_mat : state.frame_visible_instances) {
-            const float3 c = (inst_mat * float4(field_bs_center, 1.0f)).xyz();
-            const float d = math::distance(c, band_cam_pos);
-
-            /* Maximum draw distance culling: drop instances beyond max_draw_dist. */
-            if (max_draw_dist > 0.0f && d > max_draw_dist) {
-              continue;
-            }
 
             /* Sub-pixel instance culling: instances whose projected bounding
              * sphere radius is smaller than min_screen_radius_px are sub-pixel
@@ -1665,19 +1654,50 @@ class Instance : public DrawEngine {
               }
             }
 
-            int k = 0;
-            if (band_count > 1 && d > dmin && log_ratio > 1e-5f) {
-              k = std::clamp(int(std::floor(std::log(std::max(d / dmin, 1.0f)) / log_ratio)),
-                             0,
-                             band_count - 1);
-            }
-            state.frame_band_instances[k].push_back(inst_mat);
-            if (d < band_nearest_d[k]) {
-              band_nearest_d[k] = d;
-              band_nearest_mat[k] = inst_mat;
-            }
+            dmin = std::min(dmin, d);
+            dmax = std::max(dmax, d);
           }
-          state.frame_band_count = uint32_t(band_count);
+
+          if (dmax >= dmin && dmin < std::numeric_limits<float>::max()) {
+            constexpr float kBandRatio = 1.6f;
+            constexpr int kMaxBands = 6;
+            int band_count = 1;
+            if (dmax > dmin * 1.3f && dmin > 1e-6f) {
+              const float steps = std::log(dmax / dmin) / std::log(kBandRatio);
+              band_count = std::clamp(int(std::ceil(steps)), 1, kMaxBands);
+            }
+            const float inv_log_ratio = 1.0f / std::log(kBandRatio);
+
+            for (const float4x4 &inst_mat : state.frame_visible_instances) {
+              const float3 c = (inst_mat * float4(field_bs_center, 1.0f)).xyz();
+              const float d = math::distance(c, band_cam_pos);
+
+              if (min_screen_radius_px > 0.0f && have_bs && field_bs_radius > 0.0f) {
+                const float inst_scale = std::max(
+                    math::length(inst_mat[0].xyz()),
+                    std::max(math::length(inst_mat[1].xyz()), math::length(inst_mat[2].xyz())));
+                const float world_radius = field_bs_radius * inst_scale;
+                const float screen_radius_px = (world_radius * px_scale) / std::max(d, 0.01f);
+                if (screen_radius_px < min_screen_radius_px) {
+                  continue;
+                }
+              }
+
+              int k = (d > dmin && dmin > 1e-6f) ?
+                          int(std::log(d / dmin) * inv_log_ratio) : 0;
+              k = std::clamp(k, 0, band_count - 1);
+              state.frame_band_instances[k].push_back(inst_mat);
+              if (d < band_nearest_d[k]) {
+                band_nearest_d[k] = d;
+                band_nearest_mat[k] = inst_mat;
+              }
+            }
+
+            for (int k = 0; k < band_count; ++k) {
+              state.frame_band_nearest_d[k] = band_nearest_d[k];
+            }
+            state.frame_band_count = uint32_t(band_count);
+          }
         }
         /* One LOD traversal per band (band 0 reuses the state's main pass;
          * bands 1..N get their own sub-passes). Each band's selection is
@@ -1707,6 +1727,9 @@ class Instance : public DrawEngine {
           }
           configure_pass(*band_pass, int(k));
           set_frame_flags(*band_pass);
+          if (k > 0) {
+            band_pass->setTelemetryEnabled(false);
+          }
           /* The band's nearest instance is the reference transform: its LOD
            * demand is the strongest in the band, so evaluating the cut there
            * never under-refines any instance of the band. */
@@ -1736,20 +1759,12 @@ class Instance : public DrawEngine {
                             band_error_scale);
         }
         if (state.frame_band_count == 0) {
-          /* All instances were frustum-culled: still refresh the main pass
-           * matrices; nothing will be drawn for this state in pass 2. */
-          const float obj_error_scale = std::max(
-              math::length(state.object_mat[0].xyz()),
-              std::max(math::length(state.object_mat[1].xyz()),
-                       math::length(state.object_mat[2].xyz())));
-          state.pass->update(state.data,
-                             object_persmat,
-                             viewport_proj_scale_y,
-                             float(resolution.y),
-                             &lod_object_persmat,
-                             &lod_proj_scale_y,
-                             1,
-                             obj_error_scale);
+          /* All instances of this archetype were culled by frustum/distance culling.
+           * Skip GPU compute traversal completely and do not queue for rasterization. */
+          if (allow_dna_write && state.ob != nullptr) {
+            drawn_instances_by_emitter.lookup_or_add(state.ob_name, 0) += 0;
+          }
+          continue;
         }
       }
       else {
@@ -1875,13 +1890,10 @@ class Instance : public DrawEngine {
           }
         }
       }
-
       if (state.pass->drawCount() != 0) {
         pending_draws.append({&state, allow_dna_write});
       }
     }
-
-    auto t_p1_end = std::chrono::steady_clock::now();
 
     /* Terrain/Solid-first draw ordering: Render non-scattered / single-instance
      * meshes (such as ground and terrain) first to seed the depth buffer. This
@@ -1929,7 +1941,7 @@ class Instance : public DrawEngine {
             if (band.empty()) {
               continue;
             }
-            const blender::tessera::TesseraDrawPass *band_pass =
+            blender::tessera::TesseraDrawPass *band_pass =
                 (k == 0) ? state.pass.get() :
                            ((k - 1 < state.band_passes.size() &&
                              state.band_passes[k - 1] != nullptr) ?
@@ -1938,6 +1950,11 @@ class Instance : public DrawEngine {
             if (band_pass == nullptr) {
               continue;
             }
+            /* Opaque material override for distant foliage (>= 20m):
+             * Disabling alpha cutout re-enables full-rate hardware Early-Z depth rejection
+             * across thousands of distant leaf cards, eliminating quad-overdraw. */
+            const bool allow_alpha = (state.frame_band_nearest_d[k] < 20.0f);
+            band_pass->set_alpha_mask(allow_alpha);
             if (band.size() == 1) {
               /* Degenerate single survivor: keep the classic single-matrix
                * path (the GPU args were not instance-multiplied). */
@@ -1980,22 +1997,7 @@ class Instance : public DrawEngine {
       }
     }
 
-    auto t_p2_end = std::chrono::steady_clock::now();
-    static int s_timing_frame = 0;
-    if (++s_timing_frame % 30 == 0) {
-      float ms_p1 = std::chrono::duration<float, std::milli>(t_p1_end - t_p1_start).count();
-      float ms_p2 = std::chrono::duration<float, std::milli>(t_p2_end - t_p1_end).count();
-      printf("[Tessera Engine Timing] Pass1: %5.2f ms | Pass2: %5.2f ms | Pending Draws: %d\n",
-             ms_p1, ms_p2, int(pending_draws.size()));
-      for (const TesseraPendingDraw &p : pending_draws) {
-        printf("  Pending: %-25s | insts=%zu | bands=%u | tris=%zu\n",
-               p.state->ob_name.c_str(),
-               p.state->instance_mats.size(),
-               p.state->frame_band_count,
-               p.state->data.indices.size() / 3);
-      }
-      fflush(stdout);
-    }
+
 
     /* Aggregated drawn-instance counts: one write per emitter object so the
      * stat always reflects the whole scatter field across all archetypes. */
@@ -2091,6 +2093,9 @@ class Instance : public DrawEngine {
      * .nc2 reload + GPU re-upload and a visible blink on the next redraw), so skip the sweep. */
     if (!scene_state_.render_finished) {
       std::lock_guard lock(this->tessera_mutex_);
+      tessera_last_state_ = nullptr;
+      tessera_last_ob_ = nullptr;
+      tessera_last_data_ = nullptr;
       const uint32_t finished_round = this->tessera_sync_round_;
       this->tessera_sync_round_ += 1;
       Vector<std::string> stale_keys;
@@ -2103,6 +2108,12 @@ class Instance : public DrawEngine {
           continue;
         }
         item.value->used = false;
+        item.value->last_instance_count = std::max(item.value->last_instance_count,
+                                                   item.value->instance_mats.size());
+        item.value->instance_mats.clear();
+        if (item.value->last_instance_count > 0) {
+          item.value->instance_mats.reserve(item.value->last_instance_count);
+        }
       }
       for (const std::string &key : stale_keys) {
         tessera_objects_.remove(key);

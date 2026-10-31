@@ -136,21 +136,17 @@ void main()
   float dist_world = max(dist_c * safe_error_scale, near_clip);
   float screen_err_c = (err_c <= 0.0) ? 0.0 : (err_c * proj_scale_y * (viewport_height * 0.5) / dist_world);
 
-  /* Adaptive distance-based error expansion:
-   * Dynamically relax distant clusters into coarse parent clusters without near popping. */
-  float safe_lod_dist = max(lod_distance, 0.1);
-  float d_norm = dist_world / safe_lod_dist;
-  float tau_effective = pixel_error * (1.0 + min(d_norm * d_norm * d_norm, 500.0) * lod_intensity);
+  /* Adaptive distance-based subdivision & error expansion (Prompt Objective 2):
+   * tau_effective = tau_base * (1.0 + max(0.0, (d - d_near)/(d_near))^2 * k_falloff) */
+  float tau_effective = pixel_error;
+  if (dist_world > lod_distance) {
+    float d_rel = (dist_world - lod_distance) / max(lod_distance, 0.1);
+    tau_effective = pixel_error * (1.0 + min(d_rel * d_rel, 100.0) * lod_intensity);
+  }
 
-  /* Mid/Far distance cluster level clamping: for clusters beyond 15/22/28 meters,
-   * prevent selection of fine Level 0..2 clusters when a coarser parent exists. */
-  if (dist_world > 15.0 && meta.z <= 1u && meta.w != 0xFFFFFFFFu) {
-    return;
-  }
-  if (dist_world > 22.0 && meta.z <= 2u && meta.w != 0xFFFFFFFFu) {
-    return;
-  }
-  if (dist_world > 28.0 && meta.z <= 3u && meta.w != 0xFFFFFFFFu) {
+  /* Far-band coarse LOD clamping for scattered clutter/foliage (finalize_multiplier > 1):
+   * Beyond 30m, prevent fine leaf clusters (meta.z < 3) when a coarser parent exists. */
+  if (finalize_multiplier > 1 && dist_world > 30.0 && meta.z < 3u && meta.w != 0xFFFFFFFFu) {
     return;
   }
 
@@ -168,6 +164,16 @@ void main()
     return;
   }
 
+  /* Progressive card thinning for scattered foliage/clutter:
+   * Multi-cluster meshes (cluster_count > 500, e.g. Galetta Grass) under scattering
+   * thin out distant clusters to control micro-polygon overdraw while preserving silhouette. */
+  if (finalize_multiplier > 1 && cluster_count > 500 && dist_world > 18.0) {
+    uint thin_stride = (dist_world > 28.0) ? 8u : ((dist_world > 22.0) ? 4u : 2u);
+    if ((ci & (thin_stride - 1u)) != 0u) {
+      return;
+    }
+  }
+
   if ((max_valid_clusters > 0 && cluster_index >= uint(max_valid_clusters)) ||
       (max_valid_vertices > 0 && vertex_offset + vertex_count > uint(max_valid_vertices))) {
     return; // Drop invalid command; avoid GPU memory fault
@@ -183,6 +189,9 @@ void main()
      * (vertexCount = bucket size, instanceCount = count * instances). Each
      * bucket region holds at most `cluster_count` entries (a bucket can never
      * overflow because every visible cluster lands in exactly one bucket). */
+    if ((max_clusters > 0) && (draw_counters[0] >= uint(max_clusters))) {
+      return;
+    }
     uint b = bucket_of(index_count);
     uint slot = atomicAdd(draw_counters[76 + b], 1u);
     if (slot >= uint(cluster_count)) {
@@ -356,22 +365,12 @@ void main()
   float dist_c = max(distance(camera_pos, center) - radius, near_clip);
   float screen_err_c = (err_c <= 0.0) ? 0.0 : (err_c * proj_scale_y * (viewport_height * 0.5) / dist_c);
 
-  /* Adaptive distance-based error expansion:
-   * Dynamically relax distant clusters into coarse parent clusters without near popping. */
-  float safe_lod_dist = max(lod_distance, 0.1);
-  float d_norm = dist_c / safe_lod_dist;
-  float tau_effective = pixel_error * (1.0 + min(d_norm * d_norm * d_norm, 500.0) * lod_intensity);
-
-  /* Mid/Far distance cluster level clamping: for clusters beyond 15/22/28 meters,
-   * prevent selection of fine Level 0..2 clusters when a coarser parent exists. */
-  if (dist_c > 15.0 && meta.z <= 1u && meta.w != 0xFFFFFFFFu) {
-    return;
-  }
-  if (dist_c > 22.0 && meta.z <= 2u && meta.w != 0xFFFFFFFFu) {
-    return;
-  }
-  if (dist_c > 28.0 && meta.z <= 3u && meta.w != 0xFFFFFFFFu) {
-    return;
+  /* Adaptive distance-based subdivision & error expansion (Prompt Objective 2):
+   * tau_effective = tau_base * (1.0 + max(0.0, (d - d_near)/(d_near))^2 * k_falloff) */
+  float tau_effective = pixel_error;
+  if (dist_c > lod_distance) {
+    float d_rel = (dist_c - lod_distance) / max(lod_distance, 0.1);
+    tau_effective = pixel_error * (1.0 + min(d_rel * d_rel, 100.0) * lod_intensity);
   }
 
   /* Early out: if cluster error exceeds tau_effective, cluster is too coarse */

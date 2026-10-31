@@ -292,30 +292,63 @@ void InstanceBVH::build(const std::vector<float4x4> &instance_mats,
     }
 }
 
+static inline float aabb_min_dist_sq(const float3 &p, const float3 &bmin, const float3 &bmax)
+{
+    float d2 = 0.0f;
+    for (int i = 0; i < 3; ++i) {
+        if (p[i] < bmin[i]) {
+            float diff = bmin[i] - p[i];
+            d2 += diff * diff;
+        } else if (p[i] > bmax[i]) {
+            float diff = p[i] - bmax[i];
+            d2 += diff * diff;
+        }
+    }
+    return d2;
+}
+
+static inline float aabb_max_dist_sq(const float3 &p, const float3 &bmin, const float3 &bmax)
+{
+    float d2 = 0.0f;
+    for (int i = 0; i < 3; ++i) {
+        float d_min = std::abs(p[i] - bmin[i]);
+        float d_max = std::abs(p[i] - bmax[i]);
+        float diff = std::max(d_min, d_max);
+        d2 += diff * diff;
+    }
+    return d2;
+}
+
 void InstanceBVH::cull(const TesseraViewInfo &view_info,
                        const std::vector<float4x4> &instance_mats,
                        const float3 &mesh_center,
                        float mesh_radius,
                        float culling_margin,
-                       std::vector<float4x4> &out_visible) const
+                       std::vector<float4x4> &out_visible,
+                       float max_draw_dist) const
 {
     out_visible.clear();
     const size_t N = instance_mats.size();
     if (N == 0) {
         return;
     }
+    const float max_dist_sq = (max_draw_dist > 0.0f) ? (max_draw_dist * max_draw_dist) : 0.0f;
+    const float3 &cam_pos = view_info.camPos;
+
     if (!is_built() || N <= 16 || nodes.empty()) {
         /* Fallback linear culling for small instance counts */
         out_visible.reserve(N);
         for (const float4x4 &mat : instance_mats) {
+            const float3 c = (mat * float4(mesh_center, 1.0f)).xyz();
+            if (max_dist_sq > 0.0f && math::distance_squared(c, cam_pos) > max_dist_sq) {
+                continue;
+            }
             if (instance_in_frustum(view_info, mat, mesh_center, mesh_radius, culling_margin)) {
                 out_visible.push_back(mat);
             }
         }
         return;
     }
-
-    out_visible.reserve(N);
 
     uint32_t stack[128];
     int stack_top = 0;
@@ -325,6 +358,10 @@ void InstanceBVH::cull(const TesseraViewInfo &view_info,
         const uint32_t node_idx = stack[--stack_top];
         const InstanceBVHNode &node = nodes[node_idx];
 
+        if (max_dist_sq > 0.0f && aabb_min_dist_sq(cam_pos, node.bmin, node.bmax) > max_dist_sq) {
+            continue;
+        }
+
         const FrustumIntersection isect = box_in_frustum(
             view_info.planes, node.bmin, node.bmax, culling_margin);
 
@@ -332,7 +369,10 @@ void InstanceBVH::cull(const TesseraViewInfo &view_info,
             continue;
         }
 
-        if (isect == FrustumIntersection::INSIDE) {
+        const bool all_within_dist = (max_dist_sq <= 0.0f) ||
+                                     (aabb_max_dist_sq(cam_pos, node.bmin, node.bmax) <= max_dist_sq);
+
+        if (isect == FrustumIntersection::INSIDE && all_within_dist) {
             /* Bulk acceptance: all descendant instances are inside with zero further tests! */
             const uint32_t end = node.instance_start + node.instance_count;
             for (uint32_t i = node.instance_start; i < end; ++i) {
@@ -347,7 +387,13 @@ void InstanceBVH::cull(const TesseraViewInfo &view_info,
             for (uint32_t i = node.instance_start; i < end; ++i) {
                 const uint32_t inst_idx = instance_indices[i];
                 const float4x4 &mat = instance_mats[inst_idx];
-                if (instance_in_frustum(view_info, mat, mesh_center, mesh_radius, culling_margin)) {
+                const float3 c = (mat * float4(mesh_center, 1.0f)).xyz();
+                if (max_dist_sq > 0.0f && math::distance_squared(c, cam_pos) > max_dist_sq) {
+                    continue;
+                }
+                if (isect == FrustumIntersection::INSIDE ||
+                    instance_in_frustum(view_info, mat, mesh_center, mesh_radius, culling_margin))
+                {
                     out_visible.push_back(mat);
                 }
             }

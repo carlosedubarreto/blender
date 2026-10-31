@@ -418,6 +418,8 @@ void TesseraRenderer::updateWithGpuTraversal(const TesseraData &data,
     GPU_shader_uniform_1i(mTraverseShader, "use_elements_command",
                           mUseElementsIndirect ? int(mCachedMaxClusterIndices) : 0);
     GPU_shader_uniform_1i(mTraverseShader, "bucket_max", int(mCachedMaxClusterIndices));
+    GPU_shader_uniform_1i(mTraverseShader, "finalize_multiplier",
+                          int(std::max<uint32_t>(instance_multiplier, 1u)));
     GPU_shader_uniform_4fv_array(mTraverseShader, "frustum_planes", 6,
                                  culling_view.planes);
 

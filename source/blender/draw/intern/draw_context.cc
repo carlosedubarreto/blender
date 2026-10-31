@@ -777,6 +777,10 @@ enum class DrawFilter {
    */
   Draw,
   /**
+   * Draw this object, but skip generating and walking its duplis.
+   */
+  DrawSkipDuplis,
+  /**
    * Skip drawing this object, but still generate and iterate its duplis (if any).
    * A dupli may be individually selectable / visible even when its instancer is not.
    */
@@ -879,7 +883,7 @@ static void foreach_obref_in_scene(
     /* Decide drawability for the top-level object, then fall through to the dupli path. */
     const DrawFilter parent_filter = should_draw_object_cb(*ob, process_duplis);
 
-    if (parent_filter == DrawFilter::Draw && ob_visible) {
+    if ((parent_filter == DrawFilter::Draw || parent_filter == DrawFilter::DrawSkipDuplis) && ob_visible) {
       /* NOTE: object_duplilist_preview is still handled by DEG_OBJECT_ITER,
        * dupli_parent and dupli_object_current won't be null for these. */
       ObjectRef ob_ref(ob, data_.dupli_parent, data_.dupli_object_current);
@@ -890,7 +894,7 @@ static void foreach_obref_in_scene(
       continue;
     }
 
-    if (parent_filter == DrawFilter::SkipRecursive) {
+    if (parent_filter == DrawFilter::SkipRecursive || parent_filter == DrawFilter::DrawSkipDuplis) {
       /* Filter rejected this instancer; skip its duplis entirely. */
       continue;
     }
@@ -1548,8 +1552,39 @@ static void drw_draw_render_loop_3d(DRWContext &draw_ctx, RenderEngineType *engi
   const bool do_populate_loop = internal_engine || overlays_on || !draw_type_render ||
                                 gpencil_engine_needed;
 
-  auto should_draw_object = [&](Object &ob, bool /*has_duplis*/) -> DrawFilter {
-    return BKE_object_is_visible_in_viewport(v3d, &ob) ? DrawFilter::Draw : DrawFilter::Skip;
+  const bool is_workbench = (engine_type == &DRW_engine_viewport_workbench_type);
+  static const Depsgraph *s_last_depsgraph = nullptr;
+  static uint64_t s_last_depsgraph_update = 0;
+  const uint64_t current_depsgraph_update = depsgraph ? DEG_get_update_count(depsgraph) : 0;
+  const bool depsgraph_dirty = (depsgraph != s_last_depsgraph ||
+                                current_depsgraph_update != s_last_depsgraph_update);
+  if (depsgraph_dirty) {
+    s_last_depsgraph = depsgraph;
+    s_last_depsgraph_update = current_depsgraph_update;
+  }
+
+  auto should_draw_object = [&](Object &ob, bool has_duplis) -> DrawFilter {
+    if (!BKE_object_is_visible_in_viewport(v3d, &ob)) {
+      return DrawFilter::Skip;
+    }
+    if (has_duplis && !depsgraph_dirty && is_workbench) {
+      const bool is_selected = (ob.base_flag & BASE_SELECTED) != 0;
+      const bool is_wire = (v3d->shading.type == OB_WIRE);
+      if (!is_selected && !is_wire) {
+        const IDProperty *tess_prop = (ob.id.properties != nullptr) ?
+            IDP_GetPropertyFromGroup(ob.id.properties, "tessera_enabled") :
+            nullptr;
+        const bool tess_enabled = (tess_prop == nullptr) ?
+                                      true :
+                                      ((tess_prop->type == IDP_INT) ?
+                                           (IDP_int_get(tess_prop) != 0) :
+                                           (tess_prop->data.val != 0));
+        if (tess_enabled) {
+          return DrawFilter::DrawSkipDuplis;
+        }
+      }
+    }
+    return DrawFilter::Draw;
   };
 
   draw_ctx.enable_engines(gpencil_engine_needed, engine_type);

@@ -6,6 +6,12 @@ import mathutils
 
 def get_gl_finish():
     try:
+        import gpu
+        if hasattr(gpu.state, 'finish'):
+            return gpu.state.finish
+    except Exception:
+        pass
+    try:
         opengl32 = ctypes.windll.opengl32
         opengl32.glFinish.argtypes = []
         opengl32.glFinish.restype = None

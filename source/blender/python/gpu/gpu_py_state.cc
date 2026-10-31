@@ -549,6 +549,17 @@ static PyObject *pygpu_state_active_framebuffer_get(PyObject * /*self*/)
   return BPyGPUFrameBuffer_CreatePyObject(fb, true);
 }
 
+PyDoc_STRVAR(
+    pygpu_state_finish_doc,
+    ".. function:: finish()\n"
+    "\n"
+    "   Wait for the GPU to finish executing all issued commands across backends.\n");
+static PyObject *pygpu_state_finish(PyObject * /*self*/)
+{
+  GPU_finish();
+  Py_RETURN_NONE;
+}
+
 /** \} */
 
 /* -------------------------------------------------------------------- */
@@ -647,6 +658,10 @@ static PyMethodDef pygpu_state__tp_methods[] = {
      reinterpret_cast<PyCFunction>(pygpu_state_active_framebuffer_get),
      METH_NOARGS,
      pygpu_state_active_framebuffer_get_doc},
+    {"finish",
+     reinterpret_cast<PyCFunction>(pygpu_state_finish),
+     METH_NOARGS,
+     pygpu_state_finish_doc},
     {nullptr, nullptr, 0, nullptr},
 };
 

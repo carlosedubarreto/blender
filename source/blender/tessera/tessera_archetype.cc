@@ -108,6 +108,7 @@ void ArchetypeResolver::clear()
 {
   std::lock_guard lock(mutex_);
   resolved_.clear();
+  resolved_by_fp_.clear();
 }
 
 TesseraArchetype ArchetypeResolver::resolve(const Main *bmain,
@@ -143,7 +144,7 @@ TesseraArchetype ArchetypeResolver::resolve(const Main *bmain,
 
   std::lock_guard lock(mutex_);
 
-  /* Fast path: previously resolved realized meshes (pointer + fingerprint). */
+  /* Fast path 1: previously resolved realized meshes (pointer + fingerprint). */
   if (const CacheEntry *entry = resolved_.lookup_ptr(realized)) {
     if (entry->fp_verts == fp.verts && entry->fp_corners == fp.corners) {
       result = entry->arch;
@@ -154,12 +155,27 @@ TesseraArchetype ArchetypeResolver::resolve(const Main *bmain,
     resolved_.remove(realized);
   }
 
+  /* Fast path 2: previously resolved fingerprint (stable across depsgraph dupli pointer churn). */
+  const std::pair<int64_t, int64_t> fp_key(fp.verts, fp.corners);
+  if (const TesseraArchetype *cached_arch = resolved_by_fp_.lookup_ptr(fp_key)) {
+    result = *cached_arch;
+    result.valid = true;
+    CacheEntry entry;
+    entry.arch = result;
+    entry.fp_verts = fp.verts;
+    entry.fp_corners = fp.corners;
+    resolved_.add(realized, entry);
+    resolved_by_fp_.add_overwrite(fp_key, result);
+    return result;
+  }
+
   /* Match the realized mesh against the original objects in main. Geometry
    * Nodes realization copies the source mesh one-to-one (no merge), so the
    * realized (vertex, corner) counts identify the source plant variety. */
   const Mesh *matched_mesh = nullptr;
   const Object *matched_ob = nullptr;
   if (bmain != nullptr && fp.verts > 24) {
+    Vector<const Object *, 8> candidates;
     for (const Object *ob = static_cast<const Object *>(bmain->objects.first); ob != nullptr;
          ob = static_cast<const Object *>(ob->id.next))
     {
@@ -167,20 +183,78 @@ TesseraArchetype ArchetypeResolver::resolve(const Main *bmain,
         continue;
       }
       const Mesh *me = reinterpret_cast<const Mesh *>(ob->data);
-      if (me == nullptr || me == matched_mesh) {
+      if (me == nullptr) {
         continue;
       }
       const MeshFingerprint cand = mesh_fingerprint(*me);
       if (cand == fp) {
-        if (matched_mesh != nullptr && matched_mesh != me) {
-          /* Ambiguous: two different originals share the fingerprint. */
-          matched_mesh = nullptr;
-          matched_ob = nullptr;
-          break;
+        bool duplicate = false;
+        for (const Object *existing : candidates) {
+          if (existing->data == ob->data) {
+            duplicate = true;
+            break;
+          }
         }
-        matched_mesh = me;
-        matched_ob = ob;
+        if (!duplicate) {
+          candidates.append(ob);
+        }
       }
+    }
+
+    if (candidates.size() == 1) {
+      matched_ob = candidates[0];
+      matched_mesh = reinterpret_cast<const Mesh *>(matched_ob->data);
+    }
+    else if (candidates.size() > 1) {
+      /* Disambiguate when multiple scene objects share the same vertex/corner fingerprint
+       * (e.g. Desert Rock2_V15 and Desert Rock3_V15 both having 6004 vertices). */
+      const Object *best_ob = nullptr;
+      int best_score = -1;
+
+      const char *emitter_name = (emitter != nullptr) ? emitter->id.name + 2 : "";
+
+      for (const Object *cand_ob : candidates) {
+        int score = 0;
+        const char *cand_name = cand_ob->id.name + 2;
+
+        /* Emitter keyword hints: "Small" matches "Rock3", "Large" matches "Rock2". */
+        if (strstr(emitter_name, "Small") != nullptr || strstr(emitter_name, "small") != nullptr) {
+          if (strstr(cand_name, "Rock3") != nullptr || strstr(cand_name, "Small") != nullptr) {
+            score += 100;
+          }
+        }
+        if (strstr(emitter_name, "Large") != nullptr || strstr(emitter_name, "large") != nullptr) {
+          if (strstr(cand_name, "Rock2") != nullptr || strstr(cand_name, "Large") != nullptr) {
+            score += 100;
+          }
+        }
+
+        /* Check for common prefix or substring with emitter name. */
+        if (emitter_name[0] != '\0') {
+          if (strstr(cand_name, emitter_name) != nullptr || strstr(emitter_name, cand_name) != nullptr) {
+            score += 50;
+          }
+        }
+
+        /* Prefer candidates that have a pre-existing .nc2 file on disk. */
+        if (blend_path != nullptr && blend_path[0] != '\0') {
+          char path[FILE_MAX];
+          BLI_snprintf(path, sizeof(path), "//%s.nc2", cand_name);
+          BLI_path_abs(path, blend_path);
+          BLI_stat_t info;
+          if (BLI_stat(path, &info) == 0 && info.st_size > 88) {
+            score += 10;
+          }
+        }
+
+        if (score > best_score) {
+          best_score = score;
+          best_ob = cand_ob;
+        }
+      }
+
+      matched_ob = (best_ob != nullptr) ? best_ob : candidates[0];
+      matched_mesh = reinterpret_cast<const Mesh *>(matched_ob->data);
     }
   }
 
@@ -257,16 +331,12 @@ TesseraArchetype ArchetypeResolver::resolve(const Main *bmain,
       }
     }
     if (!result.nc2_path.empty()) {
-      printf("Tessera: emitter '%s' realized range matched archetype '%s' (%lld verts)\n",
-             emitter ? emitter->id.name + 2 : "?",
-             result.source_name.c_str(),
-             long long(mesh_fingerprint(*matched_mesh).verts));
-      fflush(stdout);
       CacheEntry entry;
       entry.arch = result;
       entry.fp_verts = fp.verts;
       entry.fp_corners = fp.corners;
       resolved_.add(realized, entry);
+      resolved_by_fp_.add_overwrite(fp_key, result);
       return result;
     }
     /* No pre-built .nc2: build from the matched botanical mesh. */
@@ -283,12 +353,6 @@ TesseraArchetype ArchetypeResolver::resolve(const Main *bmain,
         return entry->arch;
       }
     }
-    printf("Tessera: emitter '%s' realized range matched archetype '%s' (%lld verts) "
-           "[no .nc2, building]\n",
-           emitter ? emitter->id.name + 2 : "?",
-           result.source_name.c_str(),
-           long long(mesh_fingerprint(*matched_mesh).verts));
-    fflush(stdout);
   }
   {
     TesseraData data;
@@ -308,17 +372,12 @@ TesseraArchetype ArchetypeResolver::resolve(const Main *bmain,
     }
     /* Realized scatter geometry is almost always alpha-cutout foliage cards. */
     result.two_sided = true;
-    printf("Tessera: emitter '%s' realized range built from geometry (%lld verts, "
-           "%u clusters)\n",
-           emitter ? emitter->id.name + 2 : "?",
-           long long(mesh_fingerprint(*realized).verts),
-           result.built_data->header.clusterCount);
-    fflush(stdout);
     CacheEntry entry;
     entry.arch = result;
     entry.fp_verts = fp.verts;
     entry.fp_corners = fp.corners;
     resolved_.add(realized, entry);
+    resolved_by_fp_.add_overwrite(fp_key, result);
   }
   return result;
 }

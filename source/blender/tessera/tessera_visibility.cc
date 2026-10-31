@@ -783,6 +783,62 @@ void main()
     world_pos = model * vec4(pos, 1.0);
     norm_mat = mat3(model);
     gl_Position = view_proj * world_pos;
+
+    /* Per-instance GPU Distance LOD & Foliage Thinning:
+     * Discard distant micro-triangles directly in vertex shader. */
+    float inst_dist = distance(camera_pos, world_pos.xyz);
+    if (cluster_count > 500) {
+      if (inst_dist > 30.0) {
+        if ((cluster_idx & 31u) != 0u) {
+          gl_Position = vec4(2.0, 2.0, 2.0, 0.0);
+          return;
+        }
+      } else if (inst_dist > 22.0) {
+        if ((cluster_idx & 15u) != 0u) {
+          gl_Position = vec4(2.0, 2.0, 2.0, 0.0);
+          return;
+        }
+      } else if (inst_dist > 15.0) {
+        if ((cluster_idx & 7u) != 0u) {
+          gl_Position = vec4(2.0, 2.0, 2.0, 0.0);
+          return;
+        }
+      } else if (inst_dist > 10.0) {
+        if ((cluster_idx & 3u) != 0u) {
+          gl_Position = vec4(2.0, 2.0, 2.0, 0.0);
+          return;
+        }
+      }
+    } else if (cluster_count > 100) {
+      if (inst_dist > 25.0) {
+        if ((cluster_idx & 15u) != 0u) {
+          gl_Position = vec4(2.0, 2.0, 2.0, 0.0);
+          return;
+        }
+      } else if (inst_dist > 18.0) {
+        if ((cluster_idx & 7u) != 0u) {
+          gl_Position = vec4(2.0, 2.0, 2.0, 0.0);
+          return;
+        }
+      } else if (inst_dist > 12.0) {
+        if ((cluster_idx & 3u) != 0u) {
+          gl_Position = vec4(2.0, 2.0, 2.0, 0.0);
+          return;
+        }
+      }
+    } else if (cluster_count > 10) {
+      if (inst_dist > 20.0) {
+        if ((cluster_idx & 7u) != 0u) {
+          gl_Position = vec4(2.0, 2.0, 2.0, 0.0);
+          return;
+        }
+      } else if (inst_dist > 12.0) {
+        if ((cluster_idx & 3u) != 0u) {
+          gl_Position = vec4(2.0, 2.0, 2.0, 0.0);
+          return;
+        }
+      }
+    }
   }
   else {
     world_pos = model_mat * vec4(pos, 1.0);
@@ -817,8 +873,10 @@ void main()
   /* Alpha cutout: leaf / grass cards carry their silhouette in the base
    * color texture alpha channel; reject transparent texel borders so foliage
    * renders as solid, fully-shaped leaves instead of rectangular quads or
-   * faint outlines. */
-  if (has_alpha_mask != 0) {
+   * faint outlines.
+   * Gated to < 28m: beyond 28m, distant cards are treated as opaque, enabling
+   * full-rate hardware Early-Z to eliminate quad-overdraw. */
+  if (has_alpha_mask != 0 && distance(camera_pos, v_world_pos) < 28.0) {
     float slot_has_d = (v_mat == 0u) ? has_tex_flags.x :
                        (v_mat == 1u) ? has_tex_flags.y :
                        (v_mat == 2u) ? has_tex_flags.z : has_tex_flags.w;
@@ -2067,6 +2125,13 @@ void TesseraVisibilityPass::forward_draw_common(gpu::StorageBuf *command_buf,
 {
     (void)viewport_width;
     (void)viewport_height;
+
+    GPU_clip_control_unit_range(false);
+    GPU_depth_test(GPU_DEPTH_LESS_EQUAL);
+    GPU_depth_mask(true);
+    GPU_color_mask(true, true, true, true);
+    GPU_face_culling(GPU_CULL_NONE);
+    GPU_blend(GPU_BLEND_NONE);
 
     GPU_shader_bind(mForwardShader);
     GPU_storagebuf_bind(command_buf, 0);

@@ -15,6 +15,12 @@ import mathutils
 
 def get_gl_finish():
     try:
+        import gpu
+        if hasattr(gpu.state, 'finish'):
+            return gpu.state.finish
+    except Exception:
+        pass
+    try:
         opengl32 = ctypes.windll.opengl32
         opengl32.glFinish.argtypes = []
         opengl32.glFinish.restype = None
@@ -102,12 +108,12 @@ def run_benchmark():
 
         def redraw_gui_frame():
             with bpy.context.temp_override(**override):
-                bpy.ops.wm.redraw_timer(type='DRAW_WIN_SWAP', iterations=1)
+                bpy.ops.wm.redraw_timer(type='DRAW_SWAP', iterations=1)
 
-        def run_orbit_60(label):
-            # Warmup 5 frames
-            for i in range(5):
-                yaw = (i / 60.0) * 2.0 * math.pi
+        is_dense_scatter = (len(mesh_objects) > 20)
+        def run_orbit(label, num_frames=60, warmup=5):
+            for i in range(warmup):
+                yaw = (i / float(num_frames)) * 2.0 * math.pi
                 rv3d.view_rotation = mathutils.Euler((math.radians(65.0), 0.0, yaw), 'XYZ').to_quaternion()
                 redraw_gui_frame()
             gl_finish()
@@ -115,8 +121,8 @@ def run_benchmark():
             t0 = time.perf_counter()
             cpu_draw_sum = 0.0
             gl_finish_sum = 0.0
-            for frame_idx in range(60):
-                yaw = (frame_idx / 60.0) * 2.0 * math.pi
+            for frame_idx in range(num_frames):
+                yaw = (frame_idx / float(num_frames)) * 2.0 * math.pi
                 pitch = math.radians(60.0 + 10.0 * math.sin(2.0 * yaw))
                 rv3d.view_rotation = mathutils.Euler((pitch, 0.0, yaw), 'XYZ').to_quaternion()
                 t_a = time.perf_counter()
@@ -127,10 +133,10 @@ def run_benchmark():
                 cpu_draw_sum += (t_b - t_a)
                 gl_finish_sum += (t_c - t_b)
             elapsed = time.perf_counter() - t0
-            avg_ms = (elapsed * 1000.0) / 60.0
-            cpu_ms = (cpu_draw_sum * 1000.0) / 60.0
-            gpu_wait_ms = (gl_finish_sum * 1000.0) / 60.0
-            fps = 60.0 / max(elapsed, 1e-6)
+            avg_ms = (elapsed * 1000.0) / float(num_frames)
+            cpu_ms = (cpu_draw_sum * 1000.0) / float(num_frames)
+            gpu_wait_ms = (gl_finish_sum * 1000.0) / float(num_frames)
+            fps = float(num_frames) / max(elapsed, 1e-6)
             print(f"  [{label:<42}] : {fps:6.1f} FPS ({avg_ms:6.2f} ms/frame | redraw={cpu_ms:6.2f}ms, glFinish={gpu_wait_ms:6.2f}ms)")
             return fps, avg_ms
 
@@ -144,7 +150,9 @@ def run_benchmark():
         bpy.context.view_layer.update()
         redraw_gui_frame()
 
-        base_fps, base_ms = run_orbit_60("Native Blender Baseline (Tessera OFF)")
+        base_frames = 5 if is_dense_scatter else 60
+        base_warmup = 1 if is_dense_scatter else 5
+        base_fps, base_ms = run_orbit("Native Blender Baseline (Tessera OFF)", num_frames=base_frames, warmup=base_warmup)
 
         # -------------------------------------------------------------------------
         # Phase 2: Tessera Enabled (Full Base Mesh + Indexed Hardware Indirect)
@@ -166,7 +174,7 @@ def run_benchmark():
         bpy.context.view_layer.update()
         redraw_gui_frame()
 
-        tess_fps, tess_ms = run_orbit_60("Tessera ON (Solid Diffuse, User Persp)")
+        tess_fps, tess_ms = run_orbit("Tessera ON (Solid Diffuse, User Persp)", num_frames=60, warmup=5)
 
         # -------------------------------------------------------------------------
         # Phase 3: Tessera Enabled (Cluster Color Visualization Mode)
@@ -176,7 +184,7 @@ def run_benchmark():
         bpy.context.view_layer.update()
         redraw_gui_frame()
 
-        vis_fps, vis_ms = run_orbit_60("Tessera ON (Cluster Colors, User Persp)")
+        vis_fps, vis_ms = run_orbit("Tessera ON (Cluster Colors, User Persp)", num_frames=60, warmup=5)
 
         for ob in mesh_objects:
             ob["tessera_visualize_clusters"] = 0
