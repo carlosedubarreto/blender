@@ -105,6 +105,8 @@ class Instance : public DrawEngine {
     /* Name of the emitter object this state belongs to (differs from the map
      * key when a scatter field splits into per-archetype range states). */
     std::string ob_name;
+    /* Resolved archetype object name (e.g. "SweetViolet_V1" from ScatterFlow) */
+    std::string matched_archetype_name;
     /* Per-instance world matrices for scattered duplicates (Geometry Nodes /
      * ScatterFlow fields). Empty means a single draw with #object_mat. */
     std::vector<float4x4> instance_mats;
@@ -543,51 +545,70 @@ class Instance : public DrawEngine {
     return 0.0f;
   }
 
-  static float tessera_culling_margin_get(const Scene *scene, Object *ob)
+  static float tessera_culling_margin_get(const Scene *scene, Object *ob, Object *arch_ob = nullptr)
   {
-    if (ob != nullptr) {
-      const IDProperty *prop = tessera_property_find_safe(ob, "tessera_culling_margin");
-      if (prop != nullptr) {
-        float value = 0.02f;
-        if (prop->type == IDP_DOUBLE) {
-          value = float(IDP_double_get(prop));
-        }
-        else if (prop->type == IDP_FLOAT) {
-          value = IDP_float_get(prop);
-        }
-        else if (prop->type == IDP_INT) {
-          value = float(IDP_int_get(prop));
-        }
-        return (value >= 0.0f) ? value : 0.0f;
+    auto read_margin = [](Object *target) -> std::optional<float> {
+      if (target == nullptr) {
+        return std::nullopt;
       }
+      if (const IDProperty *prop = tessera_property_find_safe(target, "tessera_culling_margin")) {
+        if (prop->type == IDP_DOUBLE) {
+          return float(IDP_double_get(prop));
+        }
+        if (prop->type == IDP_FLOAT) {
+          return IDP_float_get(prop);
+        }
+        if (prop->type == IDP_INT) {
+          return float(IDP_int_get(prop));
+        }
+      }
+      if (const IDProperty *prop = tessera_property_find_safe(target, "culling_margin")) {
+        if (prop->type == IDP_DOUBLE) {
+          return float(IDP_double_get(prop));
+        }
+        if (prop->type == IDP_FLOAT) {
+          return IDP_float_get(prop);
+        }
+        if (prop->type == IDP_INT) {
+          return float(IDP_int_get(prop));
+        }
+      }
+      return std::nullopt;
+    };
+
+    if (auto m = read_margin(ob)) {
+      return std::clamp(*m, -1000.0f, 1000.0f);
+    }
+    if (auto m = read_margin(arch_ob)) {
+      return std::clamp(*m, -1000.0f, 1000.0f);
     }
 
     if (scene != nullptr) {
-      if (const IDProperty *prop = tessera_scene_property_find_safe(scene, "tessera_batch_culling_margin")) {
-        float value = 0.02f;
-        if (prop->type == IDP_DOUBLE) {
-          value = float(IDP_double_get(prop));
+      auto read_scene_margin = [](const Scene *sc, const char *prop_name) -> std::optional<float> {
+        if (const IDProperty *prop = tessera_scene_property_find_safe(sc, prop_name)) {
+          if (prop->type == IDP_DOUBLE) {
+            return float(IDP_double_get(prop));
+          }
+          if (prop->type == IDP_FLOAT) {
+            return IDP_float_get(prop);
+          }
+          if (prop->type == IDP_INT) {
+            return float(IDP_int_get(prop));
+          }
         }
-        else if (prop->type == IDP_FLOAT) {
-          value = IDP_float_get(prop);
-        }
-        else if (prop->type == IDP_INT) {
-          value = float(IDP_int_get(prop));
-        }
-        return (value >= 0.0f) ? value : 0.0f;
+        return std::nullopt;
+      };
+      if (auto m = read_scene_margin(scene, "tessera_batch_culling_margin")) {
+        return std::clamp(*m, -1000.0f, 1000.0f);
       }
-      if (const IDProperty *prop = tessera_scene_property_find_safe(scene, "tessera_culling_margin")) {
-        float value = 0.02f;
-        if (prop->type == IDP_DOUBLE) {
-          value = float(IDP_double_get(prop));
-        }
-        else if (prop->type == IDP_FLOAT) {
-          value = IDP_float_get(prop);
-        }
-        else if (prop->type == IDP_INT) {
-          value = float(IDP_int_get(prop));
-        }
-        return (value >= 0.0f) ? value : 0.0f;
+      if (auto m = read_scene_margin(scene, "batch_culling_margin")) {
+        return std::clamp(*m, -1000.0f, 1000.0f);
+      }
+      if (auto m = read_scene_margin(scene, "tessera_culling_margin")) {
+        return std::clamp(*m, -1000.0f, 1000.0f);
+      }
+      if (auto m = read_scene_margin(scene, "culling_margin")) {
+        return std::clamp(*m, -1000.0f, 1000.0f);
       }
     }
 
@@ -746,16 +767,25 @@ class Instance : public DrawEngine {
   }
 
   /** LOD view source: 0 = viewport view, 1 = the scene's active camera. */
-  static int tessera_view_source_get(Object *ob)
+  static int tessera_view_source_get(Object *ob, Object *arch_ob = nullptr)
   {
-    if (!ob) {
-      return 0;
+    auto read_vs = [](Object *target) -> std::optional<int> {
+      if (!target) {
+        return std::nullopt;
+      }
+      const IDProperty *prop = tessera_property_find_safe(target, "tessera_view_source");
+      if (prop != nullptr && prop->type == IDP_INT) {
+        return IDP_int_get(prop);
+      }
+      return std::nullopt;
+    };
+    if (auto vs = read_vs(arch_ob)) {
+      return *vs;
     }
-    const IDProperty *prop = tessera_property_find_safe(ob, "tessera_view_source");
-    if (prop == nullptr || prop->type != IDP_INT) {
-      return 0; /* Safe default (Viewport Mode). */
+    if (auto vs = read_vs(ob)) {
+      return *vs;
     }
-    return IDP_int_get(prop);
+    return 0; /* Safe default (Viewport Mode). */
   }
 
   static bool tessera_show_stats_get(Object *ob)
@@ -1001,29 +1031,39 @@ class Instance : public DrawEngine {
                                     const int2 &resolution,
                                     const Object *state_ob,
                                     float4x4 &r_persmat,
-                                    float &r_proj_scale_y)
+                                    float &r_proj_scale_y,
+                                    const Object *arch_ob = nullptr)
   {
     if (scene == nullptr || draw_ctx->depsgraph == nullptr) {
       return false;
     }
     const Object *cam_ob = nullptr;
-    if (state_ob != nullptr) {
-      IDProperty *cull_cam_prop = tessera_property_find_safe(const_cast<Object *>(state_ob), "tessera_cull_camera");
-      if (cull_cam_prop != nullptr) {
-        if (cull_cam_prop != nullptr && cull_cam_prop->type == IDP_STRING) {
-          const char *cam_name = IDP_string_get(cull_cam_prop);
-          if (cam_name != nullptr && cam_name[0] != '\0') {
-            Main *bmain = DEG_get_bmain(draw_ctx->depsgraph);
-            if (bmain != nullptr) {
-              Object *found = static_cast<Object *>(
-                  BLI_findstring(&bmain->objects, cam_name, offsetof(ID, name) + 2));
-              if (found != nullptr) {
-                cam_ob = DEG_get_evaluated(draw_ctx->depsgraph, found);
-              }
+    auto find_cull_cam = [&](const Object *target) -> const Object * {
+      if (target == nullptr) {
+        return nullptr;
+      }
+      IDProperty *cull_cam_prop = tessera_property_find_safe(const_cast<Object *>(target), "tessera_cull_camera");
+      if (cull_cam_prop != nullptr && cull_cam_prop->type == IDP_STRING) {
+        const char *cam_name = IDP_string_get(cull_cam_prop);
+        if (cam_name != nullptr && cam_name[0] != '\0') {
+          Main *bmain = DEG_get_bmain(draw_ctx->depsgraph);
+          if (bmain != nullptr) {
+            Object *found = static_cast<Object *>(
+                BLI_findstring(&bmain->objects, cam_name, offsetof(ID, name) + 2));
+            if (found != nullptr) {
+              return DEG_get_evaluated(draw_ctx->depsgraph, found);
             }
           }
         }
       }
+      return nullptr;
+    };
+
+    if (arch_ob != nullptr) {
+      cam_ob = find_cull_cam(arch_ob);
+    }
+    if (cam_ob == nullptr && state_ob != nullptr) {
+      cam_ob = find_cull_cam(state_ob);
     }
     if (cam_ob == nullptr && scene->camera != nullptr) {
       cam_ob = DEG_get_evaluated(draw_ctx->depsgraph, scene->camera);
@@ -1159,14 +1199,23 @@ class Instance : public DrawEngine {
       state.used = true;
       state.ob = ob;
       state.ob_name = std::string(ob->id.name + 2);
+      state.matched_archetype_name.clear();
+      if (arch_resolved && !arch.matched_object_name.empty()) {
+        state.matched_archetype_name = arch.matched_object_name;
+      }
+      Object *arch_ob = (!state.matched_archetype_name.empty() && arch_bmain != nullptr) ?
+                            static_cast<Object *>(BLI_findstring(&arch_bmain->objects,
+                                                                 state.matched_archetype_name.c_str(),
+                                                                 offsetof(ID, name) + 2)) :
+                            nullptr;
       state.show_stats = tessera_show_stats_get(ob);
       state.log_console = tessera_log_console_get(ob);
       state.show_fps_panel = tessera_show_fps_panel_get(ob);
       state.show_fps_hud = tessera_show_fps_hud_get(ob);
       state.visualize_clusters = tessera_visualize_get(ob);
       state.pixel_error = tessera_pixel_error_get(ob);
-      state.view_source = tessera_view_source_get(ob);
-      state.culling_margin = tessera_culling_margin_get(scene_state_.scene, ob);
+      state.view_source = tessera_view_source_get(ob, arch_ob);
+      state.culling_margin = tessera_culling_margin_get(scene_state_.scene, ob, arch_ob);
       state.lod_distance = tessera_lod_distance_get(scene_state_.scene, ob);
       state.lod_intensity = tessera_lod_intensity_get(scene_state_.scene, ob);
       state.object_mat = ob_ref.is_range() ? ob_ref.object_to_world(0) : ob->object_to_world();
@@ -1180,13 +1229,8 @@ class Instance : public DrawEngine {
           state.base_color = arch.base_color;
           state.base_color_valid = true;
         }
-        if (!arch.matched_object_name.empty() && arch_bmain != nullptr) {
-          Object *arch_ob = static_cast<Object *>(BLI_findstring(&arch_bmain->objects,
-                                                                 arch.matched_object_name.c_str(),
-                                                                 offsetof(ID, name) + 2));
-          if (arch_ob != nullptr) {
-            state.two_sided = state.two_sided || tessera_object_is_two_sided(arch_ob);
-          }
+        if (arch_ob != nullptr) {
+          state.two_sided = state.two_sided || tessera_object_is_two_sided(arch_ob);
         }
         state.two_sided = state.two_sided || arch.two_sided;
       }
@@ -1373,12 +1417,16 @@ class Instance : public DrawEngine {
       if (!is_tessera_eligible_mesh(ob)) {
         continue;
       }
+      Object *arch_ob = (!state.matched_archetype_name.empty() && this->draw_ctx != nullptr) ?
+                            tessera_object_revalidate(this->draw_ctx, state.matched_archetype_name) :
+                            nullptr;
+
       /* Rasterization matrix: always projects to the active viewport framebuffer. */
       const float4x4 object_persmat = viewport_persmat * state.object_mat;
       /* Unjittered viewport matrix for stable LOD & frustum culling across TAA samples. */
       const float4x4 unjittered_object_persmat = unjittered_persmat * state.object_mat;
 
-      const int view_source = tessera_view_source_get(ob);
+      const int view_source = tessera_view_source_get(ob, arch_ob);
       state.view_source = view_source;
 
       float4x4 cam_persmat;
@@ -1387,7 +1435,8 @@ class Instance : public DrawEngine {
                                         this->draw_ctx->rv3d != nullptr &&
                                         this->draw_ctx->rv3d->persp != RV3D_CAMOB);
       const bool has_explicit_cull_cam = (tessera_property_find_safe(ob, "tessera_cull_camera") !=
-                                          nullptr);
+                                          nullptr) ||
+                                         (arch_ob != nullptr && tessera_property_find_safe(arch_ob, "tessera_cull_camera") != nullptr);
       const bool is_cam_view = in_user_perspective ?
                                    has_explicit_cull_cam :
                                    ((state.view_source != 0) ||
@@ -1396,7 +1445,7 @@ class Instance : public DrawEngine {
       bool has_cam_lod = false;
       if (is_cam_view) {
         if (tessera_camera_persmat(
-                scene_state_.scene, this->draw_ctx, resolution, state.ob, cam_persmat, cam_proj_scale_y)) {
+                scene_state_.scene, this->draw_ctx, resolution, state.ob, cam_persmat, cam_proj_scale_y, arch_ob)) {
           has_cam_lod = true;
         }
       }
@@ -1404,8 +1453,7 @@ class Instance : public DrawEngine {
                                                         unjittered_object_persmat;
       const float lod_proj_scale_y = has_cam_lod ? cam_proj_scale_y : viewport_proj_scale_y;
 
-      const float culling_margin = (state.ob != nullptr) ?
-          tessera_culling_margin_get(scene_state_.scene, state.ob) : state.culling_margin;
+      const float culling_margin = tessera_culling_margin_get(scene_state_.scene, state.ob, arch_ob);
       state.culling_margin = culling_margin;
       const float lod_distance = (state.ob != nullptr) ?
           tessera_lod_distance_get(scene_state_.scene, state.ob) : state.lod_distance;
@@ -1573,10 +1621,14 @@ class Instance : public DrawEngine {
         float field_bs_radius = 0.0f;
         const bool have_bs = tessera::mesh_bounds_sphere(state.data, field_bs_center,
                                                          field_bs_radius);
+        const tessera::TesseraViewInfo instance_cull_view = has_cam_lod ?
+            tessera::getViewInfo(cam_persmat, float(resolution.y), cam_proj_scale_y) :
+            tessera_cull_view;
+
         if (have_bs) {
           const float4x4 inv_object_mat = math::invert(state.object_mat);
           const float3 cam_pos_local = (inv_object_mat *
-                                        float4(tessera_cull_view.camPos, 1.0f)).xyz();
+                                        float4(instance_cull_view.camPos, 1.0f)).xyz();
           const float dist_cam_local = math::distance(cam_pos_local, field_bs_center);
           state.pass->setCullingMargin(dist_cam_local + 2.0f * field_bs_radius +
                                        state.culling_margin);
@@ -1594,7 +1646,7 @@ class Instance : public DrawEngine {
           {
             state.instance_bvh.build(state.instance_mats, field_bs_center, field_bs_radius);
           }
-          state.instance_bvh.cull(tessera_cull_view,
+          state.instance_bvh.cull(instance_cull_view,
                                   state.instance_mats,
                                   field_bs_center,
                                   field_bs_radius,
@@ -1607,7 +1659,7 @@ class Instance : public DrawEngine {
           const float max_d_sq = max_draw_dist > 0.0f ? max_draw_dist * max_draw_dist : 0.0f;
           for (const float4x4 &mat : state.instance_mats) {
             const float3 c = (mat * float4(field_bs_center, 1.0f)).xyz();
-            if (max_d_sq > 0.0f && math::distance_squared(c, tessera_cull_view.camPos) > max_d_sq) {
+            if (max_d_sq > 0.0f && math::distance_squared(c, instance_cull_view.camPos) > max_d_sq) {
               continue;
             }
             state.frame_visible_instances.push_back(mat);
@@ -1630,9 +1682,9 @@ class Instance : public DrawEngine {
         std::array<float4x4, 8> band_nearest_mat;
         band_nearest_d.fill(std::numeric_limits<float>::max());
         if (!state.frame_visible_instances.empty()) {
-          const float3 band_cam_pos = tessera_cull_view.camPos;
+          const float3 band_cam_pos = instance_cull_view.camPos;
           const float min_screen_radius_px = tessera_min_screen_radius_get(scene_state_.scene, state.ob);
-          const float px_scale = viewport_proj_scale_y * (float(resolution.y) * 0.5f);
+          const float px_scale = (has_cam_lod ? cam_proj_scale_y : viewport_proj_scale_y) * (float(resolution.y) * 0.5f);
 
           float dmin = std::numeric_limits<float>::max();
           float dmax = 0.0f;
@@ -1736,7 +1788,7 @@ class Instance : public DrawEngine {
           const float4x4 &band_ref = band_nearest_mat[k];
           if (have_bs) {
             const float4x4 inv_ref = math::invert(band_ref);
-            const float3 cam_local = (inv_ref * float4(tessera_cull_view.camPos, 1.0f)).xyz();
+            const float3 cam_local = (inv_ref * float4(instance_cull_view.camPos, 1.0f)).xyz();
             const float dist_local = math::distance(cam_local, field_bs_center);
             band_pass->setCullingMargin(dist_local + 2.0f * field_bs_radius +
                                         state.culling_margin);
@@ -1763,6 +1815,13 @@ class Instance : public DrawEngine {
            * Skip GPU compute traversal completely and do not queue for rasterization. */
           if (allow_dna_write && state.ob != nullptr) {
             drawn_instances_by_emitter.lookup_or_add(state.ob_name, 0) += 0;
+            tessera_stat_culling_margin_write(state.ob, state.culling_margin);
+            if (arch_ob != nullptr && arch_ob != state.ob) {
+              tessera_stat_culling_margin_write(arch_ob, state.culling_margin);
+              tessera_stat_int_write(arch_ob, "tessera_stat_drawn_instances", 0);
+              tessera_stat_int_write(arch_ob, "tessera_stat_clusters", 0);
+              tessera_stat_int_write(arch_ob, "tessera_stat_triangles", 0);
+            }
           }
           continue;
         }
@@ -1825,6 +1884,7 @@ class Instance : public DrawEngine {
           tessera::TesseraTelemetry telem = state.pass->getTelemetry();
           telem.cam_distance = cam_distance;
           telem.pixel_error = state.pass->getPixelError();
+          telem.culling_margin = state.culling_margin;
 
           tessera::TesseraMemoryBudget budget = state.pass ? state.pass->getMemoryBudget() :
                                                              tessera::TesseraMemoryBudget{};
@@ -1863,6 +1923,9 @@ class Instance : public DrawEngine {
               state.ob != nullptr)
           {
             tessera_write_telemetry_to_object(state.ob, telem, &budget, total_instances, active_instances);
+            if (arch_ob != nullptr && arch_ob != state.ob) {
+              tessera_write_telemetry_to_object(arch_ob, telem, &budget, total_instances, active_instances);
+            }
             if (scene_state_.scene != nullptr) {
               if (IDProperty *sgroup = IDP_EnsureProperties(&scene_state_.scene->id)) {
                 idp_float_replace(sgroup, "tessera_stat_vram_resident_mb", float(budget.current_resident_bytes) / (1024.0f * 1024.0f));
@@ -1912,6 +1975,9 @@ class Instance : public DrawEngine {
     for (const TesseraPendingDraw &pending : pending_draws) {
       TesseraObjectState &state = *pending.state;
       const bool allow_dna_write = pending.allow_dna_write;
+      Object *arch_ob = (!state.matched_archetype_name.empty() && this->draw_ctx != nullptr) ?
+                            tessera_object_revalidate(this->draw_ctx, state.matched_archetype_name) :
+                            nullptr;
       {
         int lighting_type = (scene_state_.shading.light == V3D_LIGHTING_FLAT) ? 0 : 1;
         float4 base_col(0.8f, 0.8f, 0.8f, 1.0f);
@@ -1989,6 +2055,10 @@ class Instance : public DrawEngine {
         if (allow_dna_write) {
           if (state.instance_mats.size() > 1) {
             drawn_instances_by_emitter.lookup_or_add(state.ob_name, 0) += drawn_instances;
+            if (arch_ob != nullptr && arch_ob != state.ob) {
+              tessera_stat_int_write(arch_ob, "tessera_stat_drawn_instances", drawn_instances);
+              tessera_stat_culling_margin_write(arch_ob, state.culling_margin);
+            }
           }
           else {
             tessera_stat_int_write(state.ob, "tessera_stat_drawn_instances", drawn_instances);

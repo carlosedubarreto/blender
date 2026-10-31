@@ -1685,7 +1685,11 @@ def run_suite():
     print("="*80)
     if all_passed:
         print("ALL TESTS PASSED SUCCESSFULLY.")
-        sys.exit(0)
+        try:
+            import bpy
+            bpy.ops.wm.quit_blender()
+        except Exception:
+            sys.exit(0)
     else:
         print("REGRESSION SUITE FAILED.")
         sys.exit(1)
