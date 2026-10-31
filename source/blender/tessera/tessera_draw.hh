@@ -112,6 +112,26 @@ public:
         return renderer_.getCullingMargin();
     }
 
+    void setLodDistance(float dist)
+    {
+        renderer_.setLodDistance(dist);
+    }
+
+    float getLodDistance() const
+    {
+        return renderer_.getLodDistance();
+    }
+
+    void setLodIntensity(float intensity)
+    {
+        renderer_.setLodIntensity(intensity);
+    }
+
+    float getLodIntensity() const
+    {
+        return renderer_.getLodIntensity();
+    }
+
     void setReverseZ(bool enabled)
     {
         renderer_.setReverseZ(enabled);

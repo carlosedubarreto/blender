@@ -72,6 +72,12 @@ def _batch_prop_update(self, context, prop_name):
     if val is None:
         return
 
+    # Always persist the active batch setting on the scene ID properties so C++ draw engines
+    # can immediately read the batch camera margin and batch LOD thresholds.
+    if scope == 'ALL_SCENE':
+        scene[f"tessera_batch_{prop_name}"] = int(val) if isinstance(val, bool) else val
+        scene[f"tessera_{prop_name}"] = int(val) if isinstance(val, bool) else val
+
     targets = scene.objects if scope == 'ALL_SCENE' else getattr(context, "selected_objects", [])
 
     for ob in targets:
@@ -104,6 +110,10 @@ def _enabled_update(self, context):
     self.id_data["tessera_enabled"] = int(self.enabled)
     if "tessera_culling_margin" not in self.id_data:
         self.id_data["tessera_culling_margin"] = float(getattr(self, "culling_margin", 0.02))
+    if "tessera_lod_distance" not in self.id_data:
+        self.id_data["tessera_lod_distance"] = float(getattr(self, "lod_distance", 10.0))
+    if "tessera_lod_intensity" not in self.id_data:
+        self.id_data["tessera_lod_intensity"] = float(getattr(self, "lod_intensity", 2.5))
     if "tessera_view_source" not in self.id_data:
         self.id_data["tessera_view_source"] = int(getattr(self, "use_camera_view", False))
     if "tessera_texture_lod_mode" not in self.id_data:
@@ -139,10 +149,62 @@ def _culling_margin_update(self, context):
     _tag_tessera_redraw(self, context)
 
 
+def _lod_distance_update(self, context):
+    self.id_data["tessera_lod_distance"] = float(self.lod_distance)
+    _tag_tessera_redraw(self, context)
+
+
+def _lod_intensity_update(self, context):
+    self.id_data["tessera_lod_intensity"] = float(self.lod_intensity)
+    _tag_tessera_redraw(self, context)
+
+
+def _scatter_pixel_error_update(self, context):
+    self.id_data["tessera_scatter_pixel_error"] = float(self.scatter_pixel_error)
+    _tag_tessera_redraw(self, context)
+
+
+def _min_screen_radius_update(self, context):
+    self.id_data["tessera_min_screen_radius"] = float(self.min_screen_radius)
+    _tag_tessera_redraw(self, context)
+
+
+def _max_draw_distance_update(self, context):
+    self.id_data["tessera_max_draw_distance"] = float(self.max_draw_distance)
+    _tag_tessera_redraw(self, context)
+
+
 def get_effective_margin(ob, context=None):
     if ob is None:
         return 0.02
+    if "tessera_culling_margin" in ob:
+        return max(0.0, float(ob["tessera_culling_margin"]))
+    scene = getattr(context, "scene", None) if context else None
+    if scene and "tessera_batch_culling_margin" in scene:
+        return max(0.0, float(scene["tessera_batch_culling_margin"]))
     return max(0.0, float(ob.get("tessera_culling_margin", 0.02)))
+
+
+def get_effective_lod_distance(ob, context=None):
+    if ob is None:
+        return 10.0
+    if "tessera_lod_distance" in ob:
+        return max(0.1, float(ob["tessera_lod_distance"]))
+    scene = getattr(context, "scene", None) if context else None
+    if scene and "tessera_batch_lod_distance" in scene:
+        return max(0.1, float(scene["tessera_batch_lod_distance"]))
+    return max(0.1, float(ob.get("tessera_lod_distance", 10.0)))
+
+
+def get_effective_lod_intensity(ob, context=None):
+    if ob is None:
+        return 2.5
+    if "tessera_lod_intensity" in ob:
+        return max(0.0, float(ob["tessera_lod_intensity"]))
+    scene = getattr(context, "scene", None) if context else None
+    if scene and "tessera_batch_lod_intensity" in scene:
+        return max(0.0, float(scene["tessera_batch_lod_intensity"]))
+    return max(0.0, float(ob.get("tessera_lod_intensity", 2.5)))
 
 
 def get_effective_pixel_error(ob, context=None):
@@ -262,6 +324,55 @@ class TesseraProperties(bpy.types.PropertyGroup):
         soft_max=10.0,
         unit='LENGTH',
         update=_culling_margin_update,
+    )
+
+    lod_distance: FloatProperty(
+        name="LOD Distance",
+        description="Distance where adaptive cluster LOD relaxation begins (in scene units)",
+        default=10.0,
+        min=0.1,
+        soft_max=500.0,
+        unit='LENGTH',
+        update=_lod_distance_update,
+    )
+
+    lod_intensity: FloatProperty(
+        name="LOD Intensity",
+        description="Intensity/aggressiveness of cluster simplification over distance (0.0 = pure pixel error, higher = faster reduction)",
+        default=2.5,
+        min=0.0,
+        soft_max=20.0,
+        update=_lod_intensity_update,
+    )
+
+    scatter_pixel_error: FloatProperty(
+        name="Scatter Pixel Error",
+        description="LOD error tolerance in pixels for scattered dupli/Geometry-Nodes fields",
+        default=12.0,
+        min=0.1,
+        soft_max=50.0,
+        precision=2,
+        update=_scatter_pixel_error_update,
+    )
+
+    min_screen_radius: FloatProperty(
+        name="Min Screen Radius",
+        description="Minimum projected radius in screen pixels below which scattered instances are culled",
+        default=2.5,
+        min=0.0,
+        soft_max=20.0,
+        precision=1,
+        update=_min_screen_radius_update,
+    )
+
+    max_draw_distance: FloatProperty(
+        name="Max Draw Distance",
+        description="Distance beyond which scattered instances are culled (0.0 = unlimited/auto)",
+        default=0.0,
+        min=0.0,
+        soft_max=500.0,
+        unit='LENGTH',
+        update=_max_draw_distance_update,
     )
 
     # Camera LOD toggle: True locks LOD and culling to the active scene camera.
@@ -388,6 +499,53 @@ class TesseraSceneSettings(bpy.types.PropertyGroup):
         update=lambda s, c: _batch_prop_update(s, c, "culling_margin"),
     )
 
+    batch_lod_distance: FloatProperty(
+        name="Batch LOD Distance",
+        description="Distance where adaptive cluster LOD relaxation begins across meshes (scene units)",
+        min=0.1,
+        soft_max=500.0,
+        default=10.0,
+        unit='LENGTH',
+        update=lambda s, c: _batch_prop_update(s, c, "lod_distance"),
+    )
+
+    batch_lod_intensity: FloatProperty(
+        name="Batch LOD Intensity",
+        description="Intensity/aggressiveness of cluster simplification over distance across meshes",
+        min=0.0,
+        soft_max=20.0,
+        default=2.5,
+        update=lambda s, c: _batch_prop_update(s, c, "lod_intensity"),
+    )
+
+    batch_scatter_pixel_error: FloatProperty(
+        name="Batch Scatter Pixel Error",
+        description="Target LOD error in pixels for scattered instance fields across target meshes",
+        min=0.1,
+        soft_max=50.0,
+        default=12.0,
+        update=lambda s, c: _batch_prop_update(s, c, "scatter_pixel_error"),
+    )
+
+    batch_min_screen_radius: FloatProperty(
+        name="Batch Min Screen Radius",
+        description="Minimum projected radius in screen pixels below which scattered instances are culled",
+        min=0.0,
+        soft_max=20.0,
+        default=2.5,
+        update=lambda s, c: _batch_prop_update(s, c, "min_screen_radius"),
+    )
+
+    batch_max_draw_distance: FloatProperty(
+        name="Batch Max Draw Distance",
+        description="Global distance cutoff for scattered instance fields (0.0 = asset auto)",
+        min=0.0,
+        soft_max=500.0,
+        default=0.0,
+        unit='LENGTH',
+        update=lambda s, c: _batch_prop_update(s, c, "max_draw_distance"),
+    )
+
     batch_texture_lod_mode: EnumProperty(
         name="Batch Texture LOD",
         description="Texture resolution scaling mode across target meshes",
@@ -431,6 +589,48 @@ class TesseraSceneSettings(bpy.types.PropertyGroup):
         default=0.02,
         unit='LENGTH',
         update=lambda s, c: _batch_prop_update(s, c, "culling_margin"),
+    )
+
+    lod_distance: FloatProperty(
+        name="LOD Distance",
+        min=0.1,
+        soft_max=500.0,
+        default=10.0,
+        unit='LENGTH',
+        update=lambda s, c: _batch_prop_update(s, c, "lod_distance"),
+    )
+
+    lod_intensity: FloatProperty(
+        name="LOD Intensity",
+        min=0.0,
+        soft_max=20.0,
+        default=2.5,
+        update=lambda s, c: _batch_prop_update(s, c, "lod_intensity"),
+    )
+
+    scatter_pixel_error: FloatProperty(
+        name="Scatter Pixel Error",
+        min=0.1,
+        soft_max=50.0,
+        default=12.0,
+        update=lambda s, c: _batch_prop_update(s, c, "scatter_pixel_error"),
+    )
+
+    min_screen_radius: FloatProperty(
+        name="Min Screen Radius",
+        min=0.0,
+        soft_max=20.0,
+        default=2.5,
+        update=lambda s, c: _batch_prop_update(s, c, "min_screen_radius"),
+    )
+
+    max_draw_distance: FloatProperty(
+        name="Max Draw Distance",
+        min=0.0,
+        soft_max=500.0,
+        default=0.0,
+        unit='LENGTH',
+        update=lambda s, c: _batch_prop_update(s, c, "max_draw_distance"),
     )
 
     texture_lod_mode: EnumProperty(

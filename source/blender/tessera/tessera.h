@@ -193,6 +193,10 @@ struct TesseraLodParams
      * 1.0 for world-unit data (.nc2 exported in world space).
      */
     float errorScale = 1.0f;
+    /** Distance threshold where adaptive distance-based LOD relaxation begins (in meters/scene units). */
+    float lodDistance = 10.0f;
+    /** Aggressiveness / intensity of cluster LOD reduction over distance. */
+    float lodIntensity = 2.5f;
 };
 
 /**

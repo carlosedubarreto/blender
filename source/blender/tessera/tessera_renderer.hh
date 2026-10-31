@@ -92,6 +92,28 @@ public:
     }
     float getCullingMargin() const { return mCullingMargin; }
 
+    /** Distance threshold where adaptive distance-based LOD relaxation begins (in meters/scene units). */
+    void setLodDistance(float dist)
+    {
+        dist = std::max(dist, 0.1f);
+        if (std::abs(mLodDistance - dist) > 1e-4f) {
+            mLodDistance = dist;
+            mCacheDirty = true;
+        }
+    }
+    float getLodDistance() const { return mLodDistance; }
+
+    /** Aggressiveness / intensity of cluster LOD reduction over distance. */
+    void setLodIntensity(float intensity)
+    {
+        intensity = std::max(intensity, 0.0f);
+        if (std::abs(mLodIntensity - intensity) > 1e-4f) {
+            mLodIntensity = intensity;
+            mCacheDirty = true;
+        }
+    }
+    float getLodIntensity() const { return mLodIntensity; }
+
     /** Select the material-pass shading mode (diffuse/clusters/normals). */
     void setShadingMode(TesseraShadingMode mode) { mShadingMode = mode; }
 
@@ -314,6 +336,12 @@ private:
 
     // Camera frustum culling margin (meters).
     float mCullingMargin = 0.02f;
+
+    // Distance threshold where adaptive distance-based LOD relaxation begins (meters).
+    float mLodDistance = 10.0f;
+
+    // Aggressiveness / intensity of cluster LOD reduction over distance.
+    float mLodIntensity = 2.5f;
 
     // Material-pass shading mode.
     TesseraShadingMode mShadingMode = TESSERA_SHADING_DIFFUSE;

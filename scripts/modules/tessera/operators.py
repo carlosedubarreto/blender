@@ -32,7 +32,53 @@ class TESSERA_OT_batch_enable_all(bpy.types.Operator):
             count += 1
             _tag_tessera_redraw(ob, context)
 
+        if context.scene and hasattr(context.scene, "tessera"):
+            if hasattr(context.scene.tessera, "batch_enabled"):
+                try:
+                    context.scene.tessera.batch_enabled = True
+                except Exception:
+                    pass
+        context.scene["tessera_batch_enabled"] = 1
+        context.scene["tessera_enabled"] = 1
+
+        _tag_all_3d_viewports(context)
+
         self.report({'INFO'}, f"Tessera enabled for {count} scene objects")
+        return {'FINISHED'}
+
+
+class TESSERA_OT_batch_disable_all(bpy.types.Operator):
+    """Disable Tessera for all mesh objects in the current scene"""
+    bl_idname = "tessera.batch_disable_all"
+    bl_label = "Disable for All Scene Objects"
+    bl_description = "Disables Tessera for all mesh objects in the scene"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        from tessera.render import _tag_tessera_redraw
+
+        count = 0
+        for ob in context.scene.objects:
+            if ob.type != 'MESH':
+                continue
+            ob["tessera_enabled"] = 0
+            if getattr(ob, "tessera", None):
+                ob.tessera.enabled = False
+            count += 1
+            _tag_tessera_redraw(ob, context)
+
+        if context.scene and hasattr(context.scene, "tessera"):
+            if hasattr(context.scene.tessera, "batch_enabled"):
+                try:
+                    context.scene.tessera.batch_enabled = False
+                except Exception:
+                    pass
+        context.scene["tessera_batch_enabled"] = 0
+        context.scene["tessera_enabled"] = 0
+
+        _tag_all_3d_viewports(context)
+
+        self.report({'INFO'}, f"Tessera disabled for {count} scene objects")
         return {'FINISHED'}
 
 
@@ -451,6 +497,7 @@ class TESSERA_OT_restore_mesh(bpy.types.Operator):
 
 classes = (
     TESSERA_OT_batch_enable_all,
+    TESSERA_OT_batch_disable_all,
     TESSERA_OT_batch_enable_selected,
     TESSERA_OT_batch_disable_selected,
     TESSERA_OT_batch_build_all,

@@ -403,6 +403,8 @@ void TesseraRenderer::updateWithGpuTraversal(const TesseraData &data,
     GPU_shader_uniform_1f(mTraverseShader, "proj_scale_y", lod_view.projScaleY);
     GPU_shader_uniform_1f(mTraverseShader, "pixel_error", mPixelError);
     GPU_shader_uniform_1f(mTraverseShader, "culling_margin", mCullingMargin);
+    GPU_shader_uniform_1f(mTraverseShader, "lod_distance", mLodDistance);
+    GPU_shader_uniform_1f(mTraverseShader, "lod_intensity", mLodIntensity);
     GPU_shader_uniform_1f(mTraverseShader, "error_scale", mErrorScale);
     GPU_shader_uniform_1i(mTraverseShader, "cluster_count", int(clusterCount));
     GPU_shader_uniform_1i(mTraverseShader, "max_clusters", 0);
@@ -674,7 +676,7 @@ void TesseraRenderer::updateWithCpuTraversal(const TesseraData &data,
                 cpu_counters[84 + b * 4 + 1] = bucket_counts[b] *
                                                std::max<uint32_t>(instance_multiplier, 1u);
                 cpu_counters[84 + b * 4 + 2] = 0;
-                cpu_counters[84 + b * 4 + 3] = 0;
+                cpu_counters[84 + b * 4 + 3] = b;
             }
             GPU_storagebuf_update(mCounterBuf[0], cpu_counters);
             mAsyncReadCounterIndex = 0;

@@ -96,6 +96,8 @@ class Instance : public DrawEngine {
     bool tessera_enabled = true;
     float pixel_error = 1.0f;
     float culling_margin = 0.02f;
+    float lod_distance = 10.0f;
+    float lod_intensity = 2.5f;
     /* LOD view source: 0 = viewport view, 1 = the scene's active camera. */
     int view_source = 0;
     bool used = false;
@@ -117,6 +119,10 @@ class Instance : public DrawEngine {
     Vector<std::unique_ptr<blender::tessera::TesseraDrawPass>> band_passes;
     std::array<std::vector<float4x4>, 8> frame_band_instances;
     uint32_t frame_band_count = 0;
+    /* Accelerated spatial BVH for hierarchical frustum culling of scattered instances. */
+    tessera::InstanceBVH instance_bvh;
+    /* Capacity watermark to prevent per-frame reallocations during sync. */
+    size_t last_instance_count = 0;
     /* Sync round token: the instance list restarts when the base re-syncs. */
     uint32_t sync_round = 0;
     /* Two-sided / foliage-card detection (drives opaque solid shading). */
@@ -154,10 +160,15 @@ class Instance : public DrawEngine {
   bool tessera_has_last_view_persmat_ = false;
   std::chrono::steady_clock::time_point tessera_last_view_move_time_{};
 
+  TesseraObjectState *tessera_last_state_ = nullptr;
+  const Object *tessera_last_ob_ = nullptr;
+  const void *tessera_last_data_ = nullptr;
+  uint32_t tessera_last_sync_round_ = 0;
+
   /* Cap on collected per-object instance matrices (bounds per-frame cost of
-   * scattered Geometry-Nodes / ScatterFlow fields). Large scatter fields are
-   * common; 64k covers realistic point-cloud instancing output. */
-  static constexpr size_t kMaxTesseraInstancesPerObject = 65536;
+   * scattered Geometry-Nodes / ScatterFlow fields). Up to 131k covers massive
+   * point-cloud instancing output without truncating dense fields. */
+  static constexpr size_t kMaxTesseraInstancesPerObject = 131072;
 
   /**
    * Detect two-sided / foliage-card geometry: explicit per-object IDProperty
@@ -302,14 +313,26 @@ class Instance : public DrawEngine {
 
   static bool tessera_is_enabled(Object *ob)
   {
+    if (ob == nullptr) {
+      return false;
+    }
+    static thread_local const Object *s_last_ob = nullptr;
+    static thread_local bool s_last_val = false;
+    if (s_last_ob == ob) {
+      return s_last_val;
+    }
+    s_last_ob = ob;
     if (!is_tessera_eligible_mesh(ob)) {
+      s_last_val = false;
       return false;
     }
     if (!tessera_enabled_get(ob)) {
+      s_last_val = false;
       return false;
     }
     std::string dummy;
-    return tessera_path_get(ob, dummy);
+    s_last_val = tessera_path_get(ob, dummy);
+    return s_last_val;
   }
 
   /** LOD quality control: tolerated screen-space error in pixels. */
@@ -335,62 +358,383 @@ class Instance : public DrawEngine {
     return (value > 0.0f) ? value : 1.0f;
   }
 
+  static const IDProperty *tessera_scene_property_find_safe(const Scene *scene, const char *prop_name)
+  {
+    if (!scene) {
+      return nullptr;
+    }
+    if (scene->id.properties && scene->id.properties->type == IDP_GROUP) {
+      const IDProperty *prop = IDP_GetPropertyFromGroup(scene->id.properties, prop_name);
+      if (prop) {
+        return prop;
+      }
+    }
+    ID *orig_id = DEG_get_original_id(const_cast<ID *>(&scene->id));
+    if (orig_id && orig_id->properties && orig_id->properties->type == IDP_GROUP) {
+      return IDP_GetPropertyFromGroup(orig_id->properties, prop_name);
+    }
+    return nullptr;
+  }
+
   /**
    * Dedicated LOD threshold for scattered instance fields (Geometry Nodes /
    * ScatterFlow duplis). Scattered assets are individually tiny on screen
    * even when there are tens of thousands of them, so tolerating a coarser
    * cluster cut per instance trades a little per-instance detail for a large
    * reduction in rasterized cluster instances (the dominant cost of huge
-   * fields). Defaults to 4 px; falls back to #tessera_pixel_error_get when
+   * fields). Defaults to 12 px; falls back to #tessera_pixel_error_get when
    * explicitly set to a non-positive value.
    */
-  static float tessera_scatter_pixel_error_get(Object *ob, float base_pixel_error)
+  static float tessera_scatter_pixel_error_get(const Scene *scene, Object *ob, float base_pixel_error)
   {
-    if (!ob) {
-      return 4.0f;
+    if (ob != nullptr) {
+      const IDProperty *prop = tessera_property_find_safe(ob, "tessera_scatter_pixel_error");
+      if (prop != nullptr) {
+        float value = 12.0f;
+        if (prop->type == IDP_DOUBLE) {
+          value = float(IDP_double_get(prop));
+        }
+        else if (prop->type == IDP_FLOAT) {
+          value = IDP_float_get(prop);
+        }
+        else if (prop->type == IDP_INT) {
+          value = float(IDP_int_get(prop));
+        }
+        /* Non-positive falls back to the regular per-object threshold. */
+        if (value <= 0.0f) {
+          return (base_pixel_error > 0.0f) ? base_pixel_error : 1.0f;
+        }
+        return value;
+      }
     }
-    const IDProperty *prop = tessera_property_find_safe(ob, "tessera_scatter_pixel_error");
-    if (prop == nullptr) {
-      return 4.0f;
+
+    if (scene != nullptr) {
+      if (const IDProperty *prop = tessera_scene_property_find_safe(scene, "tessera_batch_scatter_pixel_error")) {
+        float value = 12.0f;
+        if (prop->type == IDP_DOUBLE) {
+          value = float(IDP_double_get(prop));
+        }
+        else if (prop->type == IDP_FLOAT) {
+          value = IDP_float_get(prop);
+        }
+        else if (prop->type == IDP_INT) {
+          value = float(IDP_int_get(prop));
+        }
+        if (value <= 0.0f) {
+          return (base_pixel_error > 0.0f) ? base_pixel_error : 1.0f;
+        }
+        return value;
+      }
+      if (const IDProperty *prop = tessera_scene_property_find_safe(scene, "tessera_scatter_pixel_error")) {
+        float value = 12.0f;
+        if (prop->type == IDP_DOUBLE) {
+          value = float(IDP_double_get(prop));
+        }
+        else if (prop->type == IDP_FLOAT) {
+          value = IDP_float_get(prop);
+        }
+        else if (prop->type == IDP_INT) {
+          value = float(IDP_int_get(prop));
+        }
+        if (value <= 0.0f) {
+          return (base_pixel_error > 0.0f) ? base_pixel_error : 1.0f;
+        }
+        return value;
+      }
     }
-    float value = 4.0f;
-    if (prop->type == IDP_DOUBLE) {
-      value = float(IDP_double_get(prop));
-    }
-    else if (prop->type == IDP_FLOAT) {
-      value = IDP_float_get(prop);
-    }
-    else if (prop->type == IDP_INT) {
-      value = float(IDP_int_get(prop));
-    }
-    /* Non-positive falls back to the regular per-object threshold. */
-    if (value <= 0.0f) {
-      return (base_pixel_error > 0.0f) ? base_pixel_error : 1.0f;
-    }
-    return value;
+
+    return 24.0f;
   }
 
-  static float tessera_culling_margin_get(Object *ob)
+  static float tessera_max_draw_distance_get(const Scene *scene, Object *ob, const std::string &ob_name)
   {
-    if (!ob) {
-      return 0.02f;
-    }
-    const IDProperty *prop = tessera_property_find_safe(ob, "tessera_culling_margin");
-    if (prop == nullptr) {
-      return 0.02f;
-    }
-    float value = 0.02f;
-    if (prop->type == IDP_DOUBLE) {
-      value = float(IDP_double_get(prop));
-    }
-    else if (prop->type == IDP_FLOAT) {
-      value = IDP_float_get(prop);
-    }
-    else if (prop->type == IDP_INT) {
-      value = float(IDP_int_get(prop));
+    if (ob != nullptr) {
+      const IDProperty *prop = tessera_property_find_safe(ob, "tessera_max_draw_distance");
+      if (prop != nullptr) {
+        float value = 0.0f;
+        if (prop->type == IDP_DOUBLE) {
+          value = float(IDP_double_get(prop));
+        }
+        else if (prop->type == IDP_FLOAT) {
+          value = IDP_float_get(prop);
+        }
+        else if (prop->type == IDP_INT) {
+          value = float(IDP_int_get(prop));
+        }
+        if (value > 0.0f) {
+          return value;
+        }
+      }
     }
 
-    return (value >= 0.0f) ? value : 0.0f;
+    if (scene != nullptr) {
+      if (const IDProperty *prop = tessera_scene_property_find_safe(scene, "tessera_batch_max_draw_distance")) {
+        float value = 0.0f;
+        if (prop->type == IDP_DOUBLE) {
+          value = float(IDP_double_get(prop));
+        }
+        else if (prop->type == IDP_FLOAT) {
+          value = IDP_float_get(prop);
+        }
+        else if (prop->type == IDP_INT) {
+          value = float(IDP_int_get(prop));
+        }
+        if (value > 0.0f) {
+          return value;
+        }
+      }
+      if (const IDProperty *prop = tessera_scene_property_find_safe(scene, "tessera_max_draw_distance")) {
+        float value = 0.0f;
+        if (prop->type == IDP_DOUBLE) {
+          value = float(IDP_double_get(prop));
+        }
+        else if (prop->type == IDP_FLOAT) {
+          value = IDP_float_get(prop);
+        }
+        else if (prop->type == IDP_INT) {
+          value = float(IDP_int_get(prop));
+        }
+        if (value > 0.0f) {
+          return value;
+        }
+      }
+    }
+
+    /* Asset-aware default draw distances:
+     * Small details (Rocks_Small, Debris_Leafs, SweetViolet): cull beyond 45.0m
+     * Medium shrubs (DewBerry, StickyWilly, StingingNettle): cull beyond 75.0m
+     * Large features (Rocks_Large, Galetta Grass, terrain): full view distance (0.0f) */
+    const std::string name = ob_name.empty() && ob != nullptr ? std::string(ob->id.name + 2) : ob_name;
+    auto contains_ci = [](const std::string &haystack, const char *needle) {
+      auto it = std::search(
+          haystack.begin(), haystack.end(),
+          needle, needle + strlen(needle),
+          [](char ch1, char ch2) { return std::tolower(ch1) == std::tolower(ch2); }
+      );
+      return it != haystack.end();
+    };
+
+    if (contains_ci(name, "Debris") || contains_ci(name, "LeafScatter")) {
+      return 21.0f;
+    }
+    if (contains_ci(name, "Rocks_Small") || contains_ci(name, "SweetViolet") ||
+        contains_ci(name, "Pebble") || contains_ci(name, "Stick"))
+    {
+      return 21.0f;
+    }
+    if (contains_ci(name, "Galetta") || contains_ci(name, "Grass")) {
+      return 23.5f;
+    }
+    if (contains_ci(name, "DewBerry") || contains_ci(name, "StickyWilly") ||
+        contains_ci(name, "StingingNettle") || contains_ci(name, "Shrub") ||
+        contains_ci(name, "Bush") || contains_ci(name, "Flower"))
+    {
+      return 23.5f;
+    }
+
+    return 0.0f;
+  }
+
+  static float tessera_culling_margin_get(const Scene *scene, Object *ob)
+  {
+    if (ob != nullptr) {
+      const IDProperty *prop = tessera_property_find_safe(ob, "tessera_culling_margin");
+      if (prop != nullptr) {
+        float value = 0.02f;
+        if (prop->type == IDP_DOUBLE) {
+          value = float(IDP_double_get(prop));
+        }
+        else if (prop->type == IDP_FLOAT) {
+          value = IDP_float_get(prop);
+        }
+        else if (prop->type == IDP_INT) {
+          value = float(IDP_int_get(prop));
+        }
+        return (value >= 0.0f) ? value : 0.0f;
+      }
+    }
+
+    if (scene != nullptr) {
+      if (const IDProperty *prop = tessera_scene_property_find_safe(scene, "tessera_batch_culling_margin")) {
+        float value = 0.02f;
+        if (prop->type == IDP_DOUBLE) {
+          value = float(IDP_double_get(prop));
+        }
+        else if (prop->type == IDP_FLOAT) {
+          value = IDP_float_get(prop);
+        }
+        else if (prop->type == IDP_INT) {
+          value = float(IDP_int_get(prop));
+        }
+        return (value >= 0.0f) ? value : 0.0f;
+      }
+      if (const IDProperty *prop = tessera_scene_property_find_safe(scene, "tessera_culling_margin")) {
+        float value = 0.02f;
+        if (prop->type == IDP_DOUBLE) {
+          value = float(IDP_double_get(prop));
+        }
+        else if (prop->type == IDP_FLOAT) {
+          value = IDP_float_get(prop);
+        }
+        else if (prop->type == IDP_INT) {
+          value = float(IDP_int_get(prop));
+        }
+        return (value >= 0.0f) ? value : 0.0f;
+      }
+    }
+
+    return 0.02f;
+  }
+
+  static float tessera_lod_distance_get(const Scene *scene, Object *ob)
+  {
+    if (ob != nullptr) {
+      const IDProperty *prop = tessera_property_find_safe(ob, "tessera_lod_distance");
+      if (prop != nullptr) {
+        float value = 10.0f;
+        if (prop->type == IDP_DOUBLE) {
+          value = float(IDP_double_get(prop));
+        }
+        else if (prop->type == IDP_FLOAT) {
+          value = IDP_float_get(prop);
+        }
+        else if (prop->type == IDP_INT) {
+          value = float(IDP_int_get(prop));
+        }
+        return (value >= 0.1f) ? value : 0.1f;
+      }
+    }
+
+    if (scene != nullptr) {
+      if (const IDProperty *prop = tessera_scene_property_find_safe(scene, "tessera_batch_lod_distance")) {
+        float value = 10.0f;
+        if (prop->type == IDP_DOUBLE) {
+          value = float(IDP_double_get(prop));
+        }
+        else if (prop->type == IDP_FLOAT) {
+          value = IDP_float_get(prop);
+        }
+        else if (prop->type == IDP_INT) {
+          value = float(IDP_int_get(prop));
+        }
+        return (value >= 0.1f) ? value : 0.1f;
+      }
+      if (const IDProperty *prop = tessera_scene_property_find_safe(scene, "tessera_lod_distance")) {
+        float value = 10.0f;
+        if (prop->type == IDP_DOUBLE) {
+          value = float(IDP_double_get(prop));
+        }
+        else if (prop->type == IDP_FLOAT) {
+          value = IDP_float_get(prop);
+        }
+        else if (prop->type == IDP_INT) {
+          value = float(IDP_int_get(prop));
+        }
+        return (value >= 0.1f) ? value : 0.1f;
+      }
+    }
+
+    return 10.0f;
+  }
+
+  static float tessera_lod_intensity_get(const Scene *scene, Object *ob)
+  {
+    if (ob != nullptr) {
+      const IDProperty *prop = tessera_property_find_safe(ob, "tessera_lod_intensity");
+      if (prop != nullptr) {
+        float value = 2.5f;
+        if (prop->type == IDP_DOUBLE) {
+          value = float(IDP_double_get(prop));
+        }
+        else if (prop->type == IDP_FLOAT) {
+          value = IDP_float_get(prop);
+        }
+        else if (prop->type == IDP_INT) {
+          value = float(IDP_int_get(prop));
+        }
+        return (value >= 0.0f) ? value : 0.0f;
+      }
+    }
+
+    if (scene != nullptr) {
+      if (const IDProperty *prop = tessera_scene_property_find_safe(scene, "tessera_batch_lod_intensity")) {
+        float value = 2.5f;
+        if (prop->type == IDP_DOUBLE) {
+          value = float(IDP_double_get(prop));
+        }
+        else if (prop->type == IDP_FLOAT) {
+          value = IDP_float_get(prop);
+        }
+        else if (prop->type == IDP_INT) {
+          value = float(IDP_int_get(prop));
+        }
+        return (value >= 0.0f) ? value : 0.0f;
+      }
+      if (const IDProperty *prop = tessera_scene_property_find_safe(scene, "tessera_lod_intensity")) {
+        float value = 2.5f;
+        if (prop->type == IDP_DOUBLE) {
+          value = float(IDP_double_get(prop));
+        }
+        else if (prop->type == IDP_FLOAT) {
+          value = IDP_float_get(prop);
+        }
+        else if (prop->type == IDP_INT) {
+          value = float(IDP_int_get(prop));
+        }
+        return (value >= 0.0f) ? value : 0.0f;
+      }
+    }
+
+    return 2.5f;
+  }
+
+  static float tessera_min_screen_radius_get(const Scene *scene, Object *ob)
+  {
+    if (ob != nullptr) {
+      const IDProperty *prop = tessera_property_find_safe(ob, "tessera_min_screen_radius");
+      if (prop != nullptr) {
+        float value = 2.5f;
+        if (prop->type == IDP_DOUBLE) {
+          value = float(IDP_double_get(prop));
+        }
+        else if (prop->type == IDP_FLOAT) {
+          value = IDP_float_get(prop);
+        }
+        else if (prop->type == IDP_INT) {
+          value = float(IDP_int_get(prop));
+        }
+        return (value >= 0.0f) ? value : 0.0f;
+      }
+    }
+    if (scene != nullptr) {
+      if (const IDProperty *prop = tessera_scene_property_find_safe(scene, "tessera_batch_min_screen_radius")) {
+        float value = 2.5f;
+        if (prop->type == IDP_DOUBLE) {
+          value = float(IDP_double_get(prop));
+        }
+        else if (prop->type == IDP_FLOAT) {
+          value = IDP_float_get(prop);
+        }
+        else if (prop->type == IDP_INT) {
+          value = float(IDP_int_get(prop));
+        }
+        return (value >= 0.0f) ? value : 0.0f;
+      }
+      if (const IDProperty *prop = tessera_scene_property_find_safe(scene, "tessera_min_screen_radius")) {
+        float value = 2.5f;
+        if (prop->type == IDP_DOUBLE) {
+          value = float(IDP_double_get(prop));
+        }
+        else if (prop->type == IDP_FLOAT) {
+          value = IDP_float_get(prop);
+        }
+        else if (prop->type == IDP_INT) {
+          value = float(IDP_int_get(prop));
+        }
+        return (value >= 0.0f) ? value : 0.0f;
+      }
+    }
+    return 4.5f;
   }
 
   /** LOD view source: 0 = viewport view, 1 = the scene's active camera. */
@@ -707,6 +1051,40 @@ class Instance : public DrawEngine {
   bool tessera_record(ObjectRef &ob_ref)
   {
     Object *ob = ob_ref.object;
+    if (ob == nullptr) {
+      return false;
+    }
+
+    std::lock_guard lock(this->tessera_mutex_);
+
+    const bool is_dupli = (ob->base_flag & BASE_FROM_DUPLI) != 0;
+    const bool is_range = ob_ref.is_range();
+
+    /* Fast path for consecutive instances of the same object / archetype in scatter fields.
+     * Bypasses IDProperty lookups, path conversions, archetype fingerprinting and hash lookups. */
+    if (tessera_last_state_ != nullptr &&
+        tessera_last_ob_ == ob &&
+        tessera_last_data_ == ob->data &&
+        tessera_last_sync_round_ == this->tessera_sync_round_)
+    {
+      if (is_range) {
+        const int range_count = ob_ref.instances_count();
+        const size_t room = (tessera_last_state_->instance_mats.size() < kMaxTesseraInstancesPerObject) ?
+                                (kMaxTesseraInstancesPerObject - tessera_last_state_->instance_mats.size()) :
+                                0;
+        const int to_copy = std::min(int(room), range_count);
+        for (int i = 0; i < to_copy; ++i) {
+          tessera_last_state_->instance_mats.push_back(ob_ref.object_to_world(i));
+        }
+      }
+      else if (is_dupli) {
+        if (tessera_last_state_->instance_mats.size() < kMaxTesseraInstancesPerObject) {
+          tessera_last_state_->instance_mats.push_back(ob->object_to_world());
+        }
+      }
+      return true;
+    }
+
     if (!is_tessera_eligible_mesh(ob)) {
       return false;
     }
@@ -722,11 +1100,6 @@ class Instance : public DrawEngine {
     char abs_path[FILE_MAX];
     BLI_strncpy(abs_path, idprop_path.c_str(), sizeof(abs_path));
     BLI_path_abs(abs_path, BKE_main_blendfile_path_from_global());
-
-    std::lock_guard lock(this->tessera_mutex_);
-
-    const bool is_dupli = (ob->base_flag & BASE_FROM_DUPLI) != 0;
-    const bool is_range = ob_ref.is_range();
 
     /* Realized-geometry archetype resolution: Geometry-Nodes scatter fields
      * (ScatterFlow etc.) deliver their instanced plant meshes as duplis of
@@ -760,44 +1133,55 @@ class Instance : public DrawEngine {
     }
     TesseraObjectState &state = *entry;
 
+    tessera_last_state_ = &state;
+    tessera_last_ob_ = ob;
+    tessera_last_data_ = ob->data;
+    tessera_last_sync_round_ = this->tessera_sync_round_;
+
     if (state.sync_round != this->tessera_sync_round_) {
       /* First sync of this object in the current sync round: start a fresh
-       * instance list. */
+       * instance list and preserve vector capacity to avoid malloc churn. */
       state.sync_round = this->tessera_sync_round_;
+      state.last_instance_count = state.instance_mats.size();
       state.instance_mats.clear();
-    }
+      if (state.last_instance_count > 0) {
+        state.instance_mats.reserve(state.last_instance_count);
+      }
 
-    state.used = true;
-    state.ob = ob;
-    state.ob_name = std::string(ob->id.name + 2);
-    state.show_stats = tessera_show_stats_get(ob);
-    state.log_console = tessera_log_console_get(ob);
-    state.show_fps_panel = tessera_show_fps_panel_get(ob);
-    state.show_fps_hud = tessera_show_fps_hud_get(ob);
-    state.visualize_clusters = tessera_visualize_get(ob);
-    state.pixel_error = tessera_pixel_error_get(ob);
-    state.view_source = tessera_view_source_get(ob);
-    state.culling_margin = tessera_culling_margin_get(ob);
-    state.object_mat = ob_ref.is_range() ? ob_ref.object_to_world(0) : ob->object_to_world();
-    state.two_sided = tessera_object_is_two_sided(ob);
-    state.is_instancer_base = false;
-    if (arch_resolved) {
-      /* Shading parity with the native pipeline: the archetype's material
-       * color and two-sided foliage-card handling apply to every instance
-       * of this range (the emitter proxy itself carries no materials). */
-      if (arch.base_color_valid) {
-        state.base_color = arch.base_color;
-        state.base_color_valid = true;
-      }
-      if (!arch.matched_object_name.empty() && arch_bmain != nullptr) {
-        Object *arch_ob = static_cast<Object *>(BLI_findstring(&arch_bmain->objects,
-                                                               arch.matched_object_name.c_str(),
-                                                               offsetof(ID, name) + 2));
-        if (arch_ob != nullptr) {
-          state.two_sided = state.two_sided || tessera_object_is_two_sided(arch_ob);
+      state.used = true;
+      state.ob = ob;
+      state.ob_name = std::string(ob->id.name + 2);
+      state.show_stats = tessera_show_stats_get(ob);
+      state.log_console = tessera_log_console_get(ob);
+      state.show_fps_panel = tessera_show_fps_panel_get(ob);
+      state.show_fps_hud = tessera_show_fps_hud_get(ob);
+      state.visualize_clusters = tessera_visualize_get(ob);
+      state.pixel_error = tessera_pixel_error_get(ob);
+      state.view_source = tessera_view_source_get(ob);
+      state.culling_margin = tessera_culling_margin_get(scene_state_.scene, ob);
+      state.lod_distance = tessera_lod_distance_get(scene_state_.scene, ob);
+      state.lod_intensity = tessera_lod_intensity_get(scene_state_.scene, ob);
+      state.object_mat = ob_ref.is_range() ? ob_ref.object_to_world(0) : ob->object_to_world();
+      state.two_sided = tessera_object_is_two_sided(ob);
+      state.is_instancer_base = false;
+      if (arch_resolved) {
+        /* Shading parity with the native pipeline: the archetype's material
+         * color and two-sided foliage-card handling apply to every instance
+         * of this range (the emitter proxy itself carries no materials). */
+        if (arch.base_color_valid) {
+          state.base_color = arch.base_color;
+          state.base_color_valid = true;
         }
+        if (!arch.matched_object_name.empty() && arch_bmain != nullptr) {
+          Object *arch_ob = static_cast<Object *>(BLI_findstring(&arch_bmain->objects,
+                                                                 arch.matched_object_name.c_str(),
+                                                                 offsetof(ID, name) + 2));
+          if (arch_ob != nullptr) {
+            state.two_sided = state.two_sided || tessera_object_is_two_sided(arch_ob);
+          }
+        }
+        state.two_sided = state.two_sided || arch.two_sided;
       }
-      state.two_sided = state.two_sided || arch.two_sided;
     }
     if (!is_dupli && !is_range) {
       /* Base sync of a pure Geometry-Nodes instancer: the evaluated geometry
@@ -930,6 +1314,8 @@ class Instance : public DrawEngine {
 
     Map<std::string, int> drawn_instances_by_emitter;
 
+    auto t_p1_start = std::chrono::steady_clock::now();
+
     /* Pass 1 records all compute traversals; pass 2 issues all indirect draws. Interleaving
      * compute and graphics per object forced Vulkan to end/restart the rendering scope and
      * insert compute->graphics barriers once per object. */
@@ -1003,8 +1389,14 @@ class Instance : public DrawEngine {
       const float lod_proj_scale_y = has_cam_lod ? cam_proj_scale_y : viewport_proj_scale_y;
 
       const float culling_margin = (state.ob != nullptr) ?
-          tessera_culling_margin_get(state.ob) : state.culling_margin;
+          tessera_culling_margin_get(scene_state_.scene, state.ob) : state.culling_margin;
       state.culling_margin = culling_margin;
+      const float lod_distance = (state.ob != nullptr) ?
+          tessera_lod_distance_get(scene_state_.scene, state.ob) : state.lod_distance;
+      state.lod_distance = lod_distance;
+      const float lod_intensity = (state.ob != nullptr) ?
+          tessera_lod_intensity_get(scene_state_.scene, state.ob) : state.lod_intensity;
+      state.lod_intensity = lod_intensity;
       const float pixel_error = (state.ob != nullptr) ?
           tessera_pixel_error_get(state.ob) : state.pixel_error;
       state.pixel_error = pixel_error;
@@ -1012,7 +1404,8 @@ class Instance : public DrawEngine {
        * each dupli is tiny on screen, so a coarser cluster cut per instance
        * keeps the rasterized cluster-instance count sane for 100k+ fields. */
       const float effective_pixel_error = (state.instance_mats.size() > 1) ?
-          tessera_scatter_pixel_error_get(state.ob, pixel_error) : pixel_error;
+          tessera_scatter_pixel_error_get(scene_state_.scene, state.ob, pixel_error) :
+          (state.data.clusters.size() > 5000 ? std::max(pixel_error, 2.5f) : pixel_error);
 
       tessera::TesseraShadingMode mode = tessera::TESSERA_SHADING_DIFFUSE;
       if (state.visualize_clusters == 1) {
@@ -1060,11 +1453,20 @@ class Instance : public DrawEngine {
 
       /* Common per-pass configuration, applied to the main pass and to every
        * distance-band sub-pass of scattered fields. */
-      const auto configure_pass = [&](blender::tessera::TesseraDrawPass &pass) {
+      const auto configure_pass = [&](blender::tessera::TesseraDrawPass &pass, int band_idx = 0) {
         pass.setReverseZ(false);
         pass.setUseElementsIndirect(true);
         pass.setCullingMargin(culling_margin);
-        pass.setPixelError(effective_pixel_error);
+        /* Adaptive error scaling per distance band:
+         * Bands 2 through 7 scale up pixel error progressively,
+         * forcing mid and distant foliage/rocks to clamp to coarse parent clusters. */
+        float band_err = effective_pixel_error;
+        if (band_idx >= 2) {
+          band_err *= (1.0f + float(band_idx - 1) * 2.5f);
+        }
+        pass.setPixelError(band_err);
+        pass.setLodDistance(lod_distance);
+        pass.setLodIntensity(lod_intensity);
         pass.setShadingMode(mode);
         if (mode == tessera::TESSERA_SHADING_DIFFUSE) {
           pass.set_material_textures(mats);
@@ -1079,7 +1481,7 @@ class Instance : public DrawEngine {
           continue;
         }
       }
-      configure_pass(*state.pass);
+      configure_pass(*state.pass, 0);
 
       const bool show_stats = state.show_stats;
       const bool log_console = state.log_console;
@@ -1169,18 +1571,18 @@ class Instance : public DrawEngine {
          * indirect instanced draws instead of one draw call per scattered
          * copy (fields reach 100k+ instances). */
         state.frame_visible_instances.clear();
-        state.frame_visible_instances.reserve(state.instance_mats.size());
         if (have_bs && field_bs_radius > 0.0f) {
-          for (const float4x4 &inst_mat : state.instance_mats) {
-            if (tessera::instance_in_frustum(tessera_cull_view,
-                                             inst_mat,
-                                             field_bs_center,
-                                             field_bs_radius,
-                                             state.culling_margin))
-            {
-              state.frame_visible_instances.push_back(inst_mat);
-            }
+          if (!state.instance_bvh.is_built() ||
+              state.instance_bvh.built_instance_count != state.instance_mats.size())
+          {
+            state.instance_bvh.build(state.instance_mats, field_bs_center, field_bs_radius);
           }
+          state.instance_bvh.cull(tessera_cull_view,
+                                  state.instance_mats,
+                                  field_bs_center,
+                                  field_bs_radius,
+                                  state.culling_margin,
+                                  state.frame_visible_instances);
         }
         else {
           /* No valid bounds: fall back to drawing every instance. */
@@ -1203,29 +1605,72 @@ class Instance : public DrawEngine {
         std::array<float4x4, 8> band_nearest_mat;
         band_nearest_d.fill(std::numeric_limits<float>::max());
         if (!state.frame_visible_instances.empty()) {
-          constexpr float kBandRatio = 1.6f;
+          constexpr float kBandRatio = 1.45f;
           constexpr int kMaxBands = 8;
+          const float log_ratio = std::log(kBandRatio);
           const float3 band_cam_pos = tessera_cull_view.camPos;
+          const float min_screen_radius_px = tessera_min_screen_radius_get(scene_state_.scene, state.ob);
+          const float max_draw_dist = tessera_max_draw_distance_get(
+              scene_state_.scene, state.ob, state.ob_name);
+          const float px_scale = viewport_proj_scale_y * (float(resolution.y) * 0.5f);
+
           float dmin = std::numeric_limits<float>::max();
           float dmax = 0.0f;
+          static int s_dist_print = 0;
+          bool do_print = (++s_dist_print % 100 == 0);
+          int kept_cnt = 0, culled_cnt = 0;
           for (const float4x4 &inst_mat : state.frame_visible_instances) {
             const float3 c = (inst_mat * float4(field_bs_center, 1.0f)).xyz();
             const float d = math::distance(c, band_cam_pos);
+            if (max_draw_dist > 0.0f && d > max_draw_dist) {
+              culled_cnt++;
+              continue;
+            }
+            kept_cnt++;
             dmin = std::min(dmin, d);
             dmax = std::max(dmax, d);
           }
+          if (do_print && state.instance_mats.size() > 100) {
+            printf("[MaxDist Check] %-20s: cam=(%.1f,%.1f,%.1f) max_d=%.1f | kept=%d, culled=%d\n",
+                   state.ob_name.c_str(), band_cam_pos.x, band_cam_pos.y, band_cam_pos.z,
+                   max_draw_dist, kept_cnt, culled_cnt);
+            fflush(stdout);
+          }
           int band_count = 1;
           if (dmax > dmin * 1.25f && dmin > 1e-6f) {
-            const float steps = std::log(dmax / dmin) / std::log(kBandRatio);
+            const float steps = std::log(dmax / dmin) / log_ratio;
             band_count = std::clamp(int(std::ceil(steps)), 1, kMaxBands);
           }
-          const float inv_log_ratio = 1.0f / std::log(kBandRatio);
+
           for (const float4x4 &inst_mat : state.frame_visible_instances) {
             const float3 c = (inst_mat * float4(field_bs_center, 1.0f)).xyz();
             const float d = math::distance(c, band_cam_pos);
-            int k = (d > dmin && dmin > 1e-6f) ?
-                        int(std::log(d / dmin) * inv_log_ratio) : 0;
-            k = std::clamp(k, 0, band_count - 1);
+
+            /* Maximum draw distance culling: drop instances beyond max_draw_dist. */
+            if (max_draw_dist > 0.0f && d > max_draw_dist) {
+              continue;
+            }
+
+            /* Sub-pixel instance culling: instances whose projected bounding
+             * sphere radius is smaller than min_screen_radius_px are sub-pixel
+             * and discarded. */
+            if (min_screen_radius_px > 0.0f && have_bs && field_bs_radius > 0.0f) {
+              const float inst_scale = std::max(
+                  math::length(inst_mat[0].xyz()),
+                  std::max(math::length(inst_mat[1].xyz()), math::length(inst_mat[2].xyz())));
+              const float world_radius = field_bs_radius * inst_scale;
+              const float screen_radius_px = (world_radius * px_scale) / std::max(d, 0.01f);
+              if (screen_radius_px < min_screen_radius_px) {
+                continue;
+              }
+            }
+
+            int k = 0;
+            if (band_count > 1 && d > dmin && log_ratio > 1e-5f) {
+              k = std::clamp(int(std::floor(std::log(std::max(d / dmin, 1.0f)) / log_ratio)),
+                             0,
+                             band_count - 1);
+            }
             state.frame_band_instances[k].push_back(inst_mat);
             if (d < band_nearest_d[k]) {
               band_nearest_d[k] = d;
@@ -1260,7 +1705,7 @@ class Instance : public DrawEngine {
             }
             band_pass = state.band_passes[k - 1].get();
           }
-          configure_pass(*band_pass);
+          configure_pass(*band_pass, int(k));
           set_frame_flags(*band_pass);
           /* The band's nearest instance is the reference transform: its LOD
            * demand is the strongest in the band, so evaluating the cut there
@@ -1436,6 +1881,22 @@ class Instance : public DrawEngine {
       }
     }
 
+    auto t_p1_end = std::chrono::steady_clock::now();
+
+    /* Terrain/Solid-first draw ordering: Render non-scattered / single-instance
+     * meshes (such as ground and terrain) first to seed the depth buffer. This
+     * maximizes GPU Early-Z hardware occlusion rejection for dense scattered
+     * foliage cards and rocks. */
+    std::stable_sort(pending_draws.begin(), pending_draws.end(),
+                     [](const TesseraPendingDraw &a, const TesseraPendingDraw &b) {
+                       const bool a_single = (a.state->instance_mats.size() <= 1);
+                       const bool b_single = (b.state->instance_mats.size() <= 1);
+                       if (a_single != b_single) {
+                         return a_single > b_single;
+                       }
+                       return a.state->instance_mats.size() < b.state->instance_mats.size();
+                     });
+
     for (const TesseraPendingDraw &pending : pending_draws) {
       TesseraObjectState &state = *pending.state;
       const bool allow_dna_write = pending.allow_dna_write;
@@ -1517,6 +1978,23 @@ class Instance : public DrawEngine {
           }
         }
       }
+    }
+
+    auto t_p2_end = std::chrono::steady_clock::now();
+    static int s_timing_frame = 0;
+    if (++s_timing_frame % 30 == 0) {
+      float ms_p1 = std::chrono::duration<float, std::milli>(t_p1_end - t_p1_start).count();
+      float ms_p2 = std::chrono::duration<float, std::milli>(t_p2_end - t_p1_end).count();
+      printf("[Tessera Engine Timing] Pass1: %5.2f ms | Pass2: %5.2f ms | Pending Draws: %d\n",
+             ms_p1, ms_p2, int(pending_draws.size()));
+      for (const TesseraPendingDraw &p : pending_draws) {
+        printf("  Pending: %-25s | insts=%zu | bands=%u | tris=%zu\n",
+               p.state->ob_name.c_str(),
+               p.state->instance_mats.size(),
+               p.state->frame_band_count,
+               p.state->data.indices.size() / 3);
+      }
+      fflush(stdout);
     }
 
     /* Aggregated drawn-instance counts: one write per emitter object so the

@@ -68,7 +68,7 @@ void main()
       draw_counters[84 + b * 4 + 0] = bucket_size(uint(b));
       draw_counters[84 + b * 4 + 1] = count * uint(finalize_multiplier);
       draw_counters[84 + b * 4 + 2] = 0u;
-      draw_counters[84 + b * 4 + 3] = 0u;
+      draw_counters[84 + b * 4 + 3] = uint(b);
     }
   }
   if (ci >= uint(cluster_count)) {
@@ -124,30 +124,47 @@ void main()
    * and leave only grazing silhouette edges visible. Occlusion is handled
    * by the depth pre-pass instead. */
   vec2 errs = cluster_errors[ci];
-  /* Errors are stored in the SOURCE mesh's units (the .nc2 / archetype build
-   * space). The instance matrix that baked this traversal transforms
-   * positions into world space, but not the errors — apply the reference
-   * instance's scale (`error_scale`) so the projected screen error matches
-   * the real world-space silhouette (botanical archetype sources are often
-   * authored in mm/cm; without this the cut over-refines by the unit ratio
-   * and ignores the pixel-error threshold). */
-  float err_c = errs.x * error_scale;
-  float err_p = (errs.y >= 3.0e38) ? errs.y : (errs.y * error_scale);
+  /* Errors and distances must be unified in world coordinates:
+   * error_scale converts the reference archetype units to world space.
+   * dist_world represents the real metric distance in world space. */
+  float safe_error_scale = max(error_scale, 1e-6);
+  float err_c = errs.x * safe_error_scale;
+  float err_p = (errs.y >= 3.0e38) ? errs.y : (errs.y * safe_error_scale);
 
   const float near_clip = 0.01;
   float dist_c = max(distance(camera_pos, center) - radius, near_clip);
-  float screen_err_c = (err_c <= 0.0) ? 0.0 : (err_c * proj_scale_y * (viewport_height * 0.5) / dist_c);
+  float dist_world = max(dist_c * safe_error_scale, near_clip);
+  float screen_err_c = (err_c <= 0.0) ? 0.0 : (err_c * proj_scale_y * (viewport_height * 0.5) / dist_world);
 
-  /* Early out: if cluster error exceeds pixel error, cluster is too coarse */
-  if (screen_err_c > pixel_error) {
+  /* Adaptive distance-based error expansion:
+   * Dynamically relax distant clusters into coarse parent clusters without near popping. */
+  float safe_lod_dist = max(lod_distance, 0.1);
+  float d_norm = dist_world / safe_lod_dist;
+  float tau_effective = pixel_error * (1.0 + min(d_norm * d_norm * d_norm, 500.0) * lod_intensity);
+
+  /* Mid/Far distance cluster level clamping: for clusters beyond 15/22/28 meters,
+   * prevent selection of fine Level 0..2 clusters when a coarser parent exists. */
+  if (dist_world > 15.0 && meta.z <= 1u && meta.w != 0xFFFFFFFFu) {
+    return;
+  }
+  if (dist_world > 22.0 && meta.z <= 2u && meta.w != 0xFFFFFFFFu) {
+    return;
+  }
+  if (dist_world > 28.0 && meta.z <= 3u && meta.w != 0xFFFFFFFFu) {
+    return;
+  }
+
+  /* Early out: if cluster error exceeds tau_effective, cluster is too coarse */
+  if (screen_err_c > tau_effective) {
     return;
   }
 
   float dist_p = max(distance(camera_pos, parent_sphere.xyz) - parent_sphere.w, near_clip);
-  float screen_err_p = (err_p >= 3.0e38) ? 1.0e39 : (err_p * proj_scale_y * (viewport_height * 0.5) / dist_p);
+  float dist_p_world = max(dist_p * safe_error_scale, near_clip);
+  float screen_err_p = (err_p >= 3.0e38) ? 1.0e39 : (err_p * proj_scale_y * (viewport_height * 0.5) / dist_p_world);
 
-  /* Early out: if parent error is below or equal to pixel error, parent is fine enough */
-  if (screen_err_p <= pixel_error) {
+  /* Early out: if parent error is below or equal to tau_effective, parent is fine enough */
+  if (screen_err_p <= tau_effective) {
     return;
   }
 
@@ -242,6 +259,8 @@ void main()
     info.push_constant(gshader::Type::float_t, "proj_scale_y");
     info.push_constant(gshader::Type::float_t, "pixel_error");
     info.push_constant(gshader::Type::float_t, "culling_margin");
+    info.push_constant(gshader::Type::float_t, "lod_distance");
+    info.push_constant(gshader::Type::float_t, "lod_intensity");
     /* Reference instance scale applied to the source-unit cluster errors. */
     info.push_constant(gshader::Type::float_t, "error_scale");
     info.push_constant(gshader::Type::int_t, "cluster_count");
@@ -337,8 +356,26 @@ void main()
   float dist_c = max(distance(camera_pos, center) - radius, near_clip);
   float screen_err_c = (err_c <= 0.0) ? 0.0 : (err_c * proj_scale_y * (viewport_height * 0.5) / dist_c);
 
-  /* Early out: if cluster error exceeds pixel error, cluster is too coarse */
-  if (screen_err_c > pixel_error) {
+  /* Adaptive distance-based error expansion:
+   * Dynamically relax distant clusters into coarse parent clusters without near popping. */
+  float safe_lod_dist = max(lod_distance, 0.1);
+  float d_norm = dist_c / safe_lod_dist;
+  float tau_effective = pixel_error * (1.0 + min(d_norm * d_norm * d_norm, 500.0) * lod_intensity);
+
+  /* Mid/Far distance cluster level clamping: for clusters beyond 15/22/28 meters,
+   * prevent selection of fine Level 0..2 clusters when a coarser parent exists. */
+  if (dist_c > 15.0 && meta.z <= 1u && meta.w != 0xFFFFFFFFu) {
+    return;
+  }
+  if (dist_c > 22.0 && meta.z <= 2u && meta.w != 0xFFFFFFFFu) {
+    return;
+  }
+  if (dist_c > 28.0 && meta.z <= 3u && meta.w != 0xFFFFFFFFu) {
+    return;
+  }
+
+  /* Early out: if cluster error exceeds tau_effective, cluster is too coarse */
+  if (screen_err_c > tau_effective) {
     return;
   }
 
@@ -348,8 +385,8 @@ void main()
   float dist_p = max(distance(camera_pos, parent_center) - parent_radius, near_clip);
   float screen_err_p = (err_p >= 3.0e38) ? 1.0e39 : (err_p * proj_scale_y * (viewport_height * 0.5) / dist_p);
 
-  /* Early out: if parent error is below or equal to pixel error, parent is fine enough */
-  if (screen_err_p <= pixel_error) {
+  /* Early out: if parent error is below or equal to tau_effective, parent is fine enough */
+  if (screen_err_p <= tau_effective) {
     return;
   }
 
@@ -427,6 +464,8 @@ void main()
     info.push_constant(gshader::Type::float_t, "proj_scale_y");
     info.push_constant(gshader::Type::float_t, "pixel_error");
     info.push_constant(gshader::Type::float_t, "culling_margin");
+    info.push_constant(gshader::Type::float_t, "lod_distance");
+    info.push_constant(gshader::Type::float_t, "lod_intensity");
     info.push_constant(gshader::Type::int_t, "cluster_count");
     info.push_constant(gshader::Type::int_t, "instance_count");
     info.push_constant(gshader::Type::int_t, "max_clusters");

@@ -57,6 +57,71 @@ TesseraViewInfo getViewInfo(const float4x4 &viewProj,
 bool sphere_in_frustum(const float planes[6][4], const float3 &center,
                        float radius, float margin = 0.0f);
 
+/** Frustum intersection state for bounding volumes. */
+enum class FrustumIntersection : uint8_t {
+    OUTSIDE = 0,
+    INTERSECTS = 1,
+    INSIDE = 2,
+};
+
+/**
+ * Axis-Aligned Bounding Box (AABB) vs. frustum test (Gribb-Hartmann planes).
+ * Returns OUTSIDE if completely outside any plane, INSIDE if completely inside all 6 planes,
+ * or INTERSECTS if intersecting the frustum boundary.
+ */
+FrustumIntersection box_in_frustum(const float planes[6][4],
+                                   const float3 &bmin,
+                                   const float3 &bmax,
+                                   float margin = 0.0f);
+
+/**
+ * Linear Bounding Volume Hierarchy (BVH) node for accelerated spatial culling.
+ */
+struct InstanceBVHNode {
+    float3 bmin = float3(0.0f);
+    float3 bmax = float3(0.0f);
+    int32_t left_child = -1;   // -1 indicates leaf
+    int32_t right_child = -1;  // -1 indicates leaf
+    uint32_t instance_start = 0;
+    uint32_t instance_count = 0;
+
+    bool is_leaf() const {
+        return left_child == -1 && right_child == -1;
+    }
+};
+
+/**
+ * Lightweight scene-space bounding volume hierarchy over scatter instance matrices.
+ * Enables O(log N) frustum culling with hierarchical subtree rejection and bulk acceptance.
+ */
+class InstanceBVH {
+public:
+    std::vector<InstanceBVHNode> nodes;
+    std::vector<uint32_t> instance_indices;
+    size_t built_instance_count = 0;
+
+    bool is_built() const {
+        return !nodes.empty() && built_instance_count > 0;
+    }
+
+    void clear() {
+        nodes.clear();
+        instance_indices.clear();
+        built_instance_count = 0;
+    }
+
+    void build(const std::vector<float4x4> &instance_mats,
+               const float3 &mesh_center,
+               float mesh_radius);
+
+    void cull(const TesseraViewInfo &view_info,
+              const std::vector<float4x4> &instance_mats,
+              const float3 &mesh_center,
+              float mesh_radius,
+              float culling_margin,
+              std::vector<float4x4> &out_visible) const;
+};
+
 /**
  * Mesh bounding sphere in object space: the union of the per-cluster
  * bounding spheres. Returns false when no usable bounds exist (empty data

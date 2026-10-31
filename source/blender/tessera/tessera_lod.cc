@@ -164,6 +164,203 @@ bool sphere_in_frustum(const float planes[6][4], const float3 &center,
     return true;
 }
 
+FrustumIntersection box_in_frustum(const float planes[6][4],
+                                   const float3 &bmin,
+                                   const float3 &bmax,
+                                   float margin)
+{
+    const float3 center = (bmin + bmax) * 0.5f;
+    const float3 extent = (bmax - bmin) * 0.5f;
+    bool all_inside = true;
+    for (int p = 0; p < 6; ++p) {
+        const float dist = planes[p][0] * center.x + planes[p][1] * center.y +
+                           planes[p][2] * center.z + planes[p][3];
+        const float radius = std::abs(planes[p][0]) * extent.x +
+                             std::abs(planes[p][1]) * extent.y +
+                             std::abs(planes[p][2]) * extent.z;
+        if (dist < -(radius + margin)) {
+            return FrustumIntersection::OUTSIDE;
+        }
+        if (dist < radius - margin) {
+            all_inside = false;
+        }
+    }
+    return all_inside ? FrustumIntersection::INSIDE : FrustumIntersection::INTERSECTS;
+}
+
+void InstanceBVH::build(const std::vector<float4x4> &instance_mats,
+                        const float3 &mesh_center,
+                        float mesh_radius)
+{
+    clear();
+    const size_t N = instance_mats.size();
+    if (N == 0) {
+        return;
+    }
+    built_instance_count = N;
+    instance_indices.resize(N);
+    for (size_t i = 0; i < N; ++i) {
+        instance_indices[i] = uint32_t(i);
+    }
+
+    struct TempInst {
+        float3 center;
+        float radius;
+    };
+    std::vector<TempInst> inst_data(N);
+    for (size_t i = 0; i < N; ++i) {
+        const float4x4 &mat = instance_mats[i];
+        inst_data[i].center = (mat * float4(mesh_center, 1.0f)).xyz();
+        const float scale = std::max(math::length(mat[0].xyz()),
+                                     std::max(math::length(mat[1].xyz()),
+                                              math::length(mat[2].xyz())));
+        inst_data[i].radius = mesh_radius * scale;
+    }
+
+    nodes.reserve(N * 2);
+
+    struct BuildTask {
+        int32_t node_idx;
+        uint32_t start;
+        uint32_t count;
+    };
+
+    InstanceBVHNode root;
+    root.instance_start = 0;
+    root.instance_count = uint32_t(N);
+    nodes.push_back(root);
+
+    std::vector<BuildTask> stack;
+    stack.push_back({0, 0, uint32_t(N)});
+
+    while (!stack.empty()) {
+        BuildTask task = stack.back();
+        stack.pop_back();
+
+        float3 bmin(std::numeric_limits<float>::max());
+        float3 bmax(std::numeric_limits<float>::lowest());
+        for (uint32_t i = task.start; i < task.start + task.count; ++i) {
+            const TempInst &inst = inst_data[instance_indices[i]];
+            bmin.x = std::min(bmin.x, inst.center.x - inst.radius);
+            bmin.y = std::min(bmin.y, inst.center.y - inst.radius);
+            bmin.z = std::min(bmin.z, inst.center.z - inst.radius);
+            bmax.x = std::max(bmax.x, inst.center.x + inst.radius);
+            bmax.y = std::max(bmax.y, inst.center.y + inst.radius);
+            bmax.z = std::max(bmax.z, inst.center.z + inst.radius);
+        }
+        nodes[task.node_idx].bmin = bmin;
+        nodes[task.node_idx].bmax = bmax;
+        nodes[task.node_idx].instance_start = task.start;
+        nodes[task.node_idx].instance_count = task.count;
+
+        if (task.count <= 16) {
+            nodes[task.node_idx].left_child = -1;
+            nodes[task.node_idx].right_child = -1;
+            continue;
+        }
+
+        const float3 extent = bmax - bmin;
+        int axis = 0;
+        if (extent.y > extent.x && extent.y > extent.z) {
+            axis = 1;
+        }
+        else if (extent.z > extent.x && extent.z > extent.y) {
+            axis = 2;
+        }
+
+        const uint32_t mid = task.start + task.count / 2;
+        std::nth_element(
+            instance_indices.begin() + task.start,
+            instance_indices.begin() + mid,
+            instance_indices.begin() + task.start + task.count,
+            [&](uint32_t a, uint32_t b) {
+                if (axis == 0) return inst_data[a].center.x < inst_data[b].center.x;
+                if (axis == 1) return inst_data[a].center.y < inst_data[b].center.y;
+                return inst_data[a].center.z < inst_data[b].center.z;
+            });
+
+        int32_t left_idx = int32_t(nodes.size());
+        nodes.emplace_back();
+        int32_t right_idx = int32_t(nodes.size());
+        nodes.emplace_back();
+
+        nodes[task.node_idx].left_child = left_idx;
+        nodes[task.node_idx].right_child = right_idx;
+
+        stack.push_back({left_idx, task.start, mid - task.start});
+        stack.push_back({right_idx, mid, task.start + task.count - mid});
+    }
+}
+
+void InstanceBVH::cull(const TesseraViewInfo &view_info,
+                       const std::vector<float4x4> &instance_mats,
+                       const float3 &mesh_center,
+                       float mesh_radius,
+                       float culling_margin,
+                       std::vector<float4x4> &out_visible) const
+{
+    out_visible.clear();
+    const size_t N = instance_mats.size();
+    if (N == 0) {
+        return;
+    }
+    if (!is_built() || N <= 16 || nodes.empty()) {
+        /* Fallback linear culling for small instance counts */
+        out_visible.reserve(N);
+        for (const float4x4 &mat : instance_mats) {
+            if (instance_in_frustum(view_info, mat, mesh_center, mesh_radius, culling_margin)) {
+                out_visible.push_back(mat);
+            }
+        }
+        return;
+    }
+
+    out_visible.reserve(N);
+
+    uint32_t stack[128];
+    int stack_top = 0;
+    stack[stack_top++] = 0;
+
+    while (stack_top > 0) {
+        const uint32_t node_idx = stack[--stack_top];
+        const InstanceBVHNode &node = nodes[node_idx];
+
+        const FrustumIntersection isect = box_in_frustum(
+            view_info.planes, node.bmin, node.bmax, culling_margin);
+
+        if (isect == FrustumIntersection::OUTSIDE) {
+            continue;
+        }
+
+        if (isect == FrustumIntersection::INSIDE) {
+            /* Bulk acceptance: all descendant instances are inside with zero further tests! */
+            const uint32_t end = node.instance_start + node.instance_count;
+            for (uint32_t i = node.instance_start; i < end; ++i) {
+                out_visible.push_back(instance_mats[instance_indices[i]]);
+            }
+            continue;
+        }
+
+        /* Intersects: either test leaves or recurse */
+        if (node.is_leaf()) {
+            const uint32_t end = node.instance_start + node.instance_count;
+            for (uint32_t i = node.instance_start; i < end; ++i) {
+                const uint32_t inst_idx = instance_indices[i];
+                const float4x4 &mat = instance_mats[inst_idx];
+                if (instance_in_frustum(view_info, mat, mesh_center, mesh_radius, culling_margin)) {
+                    out_visible.push_back(mat);
+                }
+            }
+        }
+        else {
+            if (stack_top + 2 < 128) {
+                if (node.right_child >= 0) stack[stack_top++] = uint32_t(node.right_child);
+                if (node.left_child >= 0) stack[stack_top++] = uint32_t(node.left_child);
+            }
+        }
+    }
+}
+
 bool mesh_bounds_sphere(const TesseraData &data, float3 &r_center, float &r_radius)
 {
     if (data.clusters.empty()) {
@@ -464,7 +661,24 @@ std::size_t selectClustersFlat(const TesseraData &data,
                                lod_view.camPos, viewportHeight, lod_view.projScaleY,
                                lod_view.orthographic);
 
-        if (err_c <= params.pixelError && err_p > params.pixelError) {
+        const float dist_c = std::max(math::distance(lod_view.camPos, center) - radius, 0.01f);
+        const float safe_lod_dist = std::max(params.lodDistance, 0.1f);
+        const float d_norm = dist_c / safe_lod_dist;
+        const float tau_effective = params.pixelError * (1.0f + std::min(d_norm * d_norm * d_norm, 500.0f) * params.lodIntensity);
+
+        /* Mid/Far distance cluster level clamping: for clusters beyond 15/22/28 meters,
+         * prevent selection of fine Level 0..2 clusters when a coarser parent exists. */
+        if (dist_c > 15.0f && cluster.level <= 1 && cluster.parentGroup != -1) {
+            continue;
+        }
+        if (dist_c > 22.0f && cluster.level <= 2 && cluster.parentGroup != -1) {
+            continue;
+        }
+        if (dist_c > 28.0f && cluster.level <= 3 && cluster.parentGroup != -1) {
+            continue;
+        }
+
+        if (err_c <= tau_effective && err_p > tau_effective) {
             if (emitted >= maxClusters) {
                 break;
             }

@@ -324,6 +324,11 @@ class TESSERA_PT_object(bpy.types.Panel):
                 prop_col.use_property_decorate = False
                 prop_col.prop(tessera_props, "pixel_error", text="Pixel Error")
                 prop_col.prop(tessera_props, "culling_margin", text="Camera Margin")
+                prop_col.prop(tessera_props, "lod_distance", text="LOD Distance")
+                prop_col.prop(tessera_props, "lod_intensity", text="LOD Intensity")
+                prop_col.prop(tessera_props, "scatter_pixel_error", text="Scatter Pixel Error")
+                prop_col.prop(tessera_props, "min_screen_radius", text="Min Screen Radius")
+                prop_col.prop(tessera_props, "max_draw_distance", text="Max Draw Distance")
                 prop_col.prop(tessera_props, "texture_lod_mode", text="Texture LOD")
                 prop_col.prop(tessera_props, "visualize_clusters")
 
@@ -434,22 +439,61 @@ class TESSERA_PT_batch_controls(bpy.types.Panel):
         if not t_scene:
             return
 
+        # 1. Scene Mesh Statistics Overview
+        stat_box = layout.box()
+        stat_box.label(text="Scene Mesh Overview", icon='MESH_DATA')
+
+        total_meshes = 0
+        tessera_available = 0
+        tessera_enabled = 0
+
+        for ob in scene.objects:
+            if ob.type != 'MESH':
+                continue
+            total_meshes += 1
+            if get_existing_nc2_path(ob) is not None:
+                tessera_available += 1
+            is_en = False
+            if hasattr(ob, "tessera") and getattr(ob.tessera, "enabled", False):
+                is_en = True
+            elif bool(ob.get("tessera_enabled", False)):
+                is_en = True
+            if is_en:
+                tessera_enabled += 1
+
+        stat_col = stat_box.column(align=True)
+        stat_col.label(text=f"Total Mesh Objects: {total_meshes}", icon='OBJECT_DATAMODE')
+        stat_col.label(text=f"Tessera Available (.nc2): {tessera_available} / {total_meshes}", icon='FILE_CACHE')
+        stat_col.label(
+            text=f"Tessera Enabled: {tessera_enabled} / {total_meshes}",
+            icon='CHECKBOX_HLT' if tessera_enabled > 0 else 'CHECKBOX_DEHLT'
+        )
+
+        # 2. Enable / Disable All Buttons (Replacing "Batch Tessera Enabled")
+        row_btn = layout.row(align=True)
+        row_btn.scale_y = 1.3
+        row_btn.operator("tessera.batch_enable_all", text="Enable All Tessera", icon='CHECKBOX_HLT')
+        row_btn.operator("tessera.batch_disable_all", text="Disable All Tessera", icon='CHECKBOX_DEHLT')
+
+        # 3. Batch Scope Box (for Selection-specific actions)
         box = layout.box()
         box.label(text="Batch Scope", icon='VIEWZOOM')
         box.prop(t_scene, "batch_scope", expand=True)
 
-        col = box.column(align=True)
-        if t_scene.batch_scope == 'ALL_SCENE':
-            col.operator("tessera.batch_enable_all", text="Enable All Scene Meshes", icon='CHECKMARK')
-        else:
-            r = col.row(align=True)
+        if t_scene.batch_scope == 'SELECTION':
+            r = box.row(align=True)
             r.operator("tessera.batch_enable_selected", text="Enable Selected", icon='RESTRICT_SELECT_OFF')
             r.operator("tessera.batch_disable_selected", text="Disable Selected", icon='RESTRICT_SELECT_ON')
 
+        # 4. Batch Properties (Tuning Sliders)
         b_col = layout.column(align=True)
-        b_col.prop(t_scene, "batch_enabled", text="Batch Tessera Enabled")
         b_col.prop(t_scene, "batch_pixel_error", text="Batch Pixel Error", slider=True)
         b_col.prop(t_scene, "batch_culling_margin", text="Batch Camera Margin")
+        b_col.prop(t_scene, "batch_lod_distance", text="Batch LOD Distance")
+        b_col.prop(t_scene, "batch_lod_intensity", text="Batch LOD Intensity")
+        b_col.prop(t_scene, "batch_scatter_pixel_error", text="Batch Scatter Pixel Error")
+        b_col.prop(t_scene, "batch_min_screen_radius", text="Batch Min Screen Radius")
+        b_col.prop(t_scene, "batch_max_draw_distance", text="Batch Max Draw Distance")
         b_col.prop(t_scene, "batch_texture_lod_mode", text="Batch Texture LOD")
         b_col.prop(t_scene, "batch_use_camera_view", text="Batch Camera Locked LOD", icon='CAMERA_DATA')
 
@@ -592,7 +636,9 @@ class TESSERA_PT_scene_manager(bpy.types.Panel):
         box = layout.box()
         box.label(text="Batch Controls", icon='GROUP')
         col = box.column(align=True)
-        col.operator("tessera.batch_enable_all", text="Enable All", icon='CHECKMARK')
+        r_all = col.row(align=True)
+        r_all.operator("tessera.batch_enable_all", text="Enable All", icon='CHECKBOX_HLT')
+        r_all.operator("tessera.batch_disable_all", text="Disable All", icon='CHECKBOX_DEHLT')
         row = col.row(align=True)
         row.operator("tessera.batch_enable_selected", text="Enable Selected", icon='RESTRICT_SELECT_OFF')
         row.operator("tessera.batch_disable_selected", text="Disable Selected", icon='RESTRICT_SELECT_ON')
@@ -647,4 +693,4 @@ def unregister():
     from bpy.utils import unregister_class
     for cls in reversed(classes):
         unregister_class(cls)
-
+

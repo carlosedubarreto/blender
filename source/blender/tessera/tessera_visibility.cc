@@ -741,21 +741,13 @@ gpu::Shader *createGbufferShader()
 static const char *FORWARD_VERT_SOURCE = R"(
 void main()
 {
-  /* Bucketed Single Indirect Instanced Draw:
-   * - One draw per index-count bucket b: counter_buf[84 + b*4 .. +3] is the
-   *   GPU-written DrawArraysIndirectCommand {bucket_size, count_b * N, 0, 0}
-   *   and counter_buf[76 + b] (bound as forward_args) the unmultiplied
-   *   visible-cluster count of that bucket. draw_commands holds six bucket
-   *   regions of `cluster_count` entries each.
-   * - gpu_InstanceIndex is the flat instance index (0 .. count_b * N - 1):
-   *     object instance = flat / count_b      (instanced scatter fields)
-   *     cluster slot    = flat % count_b
-   *   In single-matrix mode (instance_count == 0) flat IS the cluster slot.
-   * - in_vid is the local vertex index within the cluster
-   *   (0 .. bucket_size - 1). */
-  uint flat_id = uint(gpu_InstanceIndex);
-  uint count_b = forward_args[76 + uint(bucket_index)];
-  uint region_base = uint(bucket_index) * uint(cluster_count);
+  /* Unified Multi-Draw Indirect Instanced:
+   * gpu_BaseInstance encodes the bucket index b (0..5).
+   * (gpu_InstanceIndex - bucket_idx) is the flat instance index within bucket b. */
+  uint bucket_idx = uint(gpu_BaseInstance);
+  uint flat_id = uint(gpu_InstanceIndex) - bucket_idx;
+  uint count_b = forward_args[76 + bucket_idx];
+  uint region_base = bucket_idx * uint(cluster_count);
   uint obj_index = 0u;
   uint slot_idx = flat_id;
   if (instance_count > 0 && count_b > 0u) {
@@ -789,7 +781,7 @@ void main()
      * pure world->clip projection (no instance baking). */
     mat4 model = instance_mats[obj_index];
     world_pos = model * vec4(pos, 1.0);
-    norm_mat = transpose(inverse(mat3(model)));
+    norm_mat = mat3(model);
     gl_Position = view_proj * world_pos;
   }
   else {
@@ -905,6 +897,7 @@ gpu::Shader *createForwardShader()
 
     ShaderCreateInfo info("pyGPU_Shader");
     info.builtins_ |= BuiltinBits::NO_BUFFER_TYPE_LINTING;
+    info.early_fragment_test(true);
 
     info.vertex_source("tessera_forward");
     info.vertex_source_generated = FORWARD_VERT_SOURCE;
@@ -2137,21 +2130,18 @@ void TesseraVisibilityPass::forward_draw_common(gpu::StorageBuf *command_buf,
                           has_tex_flags.w);
     GPU_shader_uniform_1i(mForwardShader, "instance_count", int(instance_count));
 
-    /* One indirect instanced draw per index-count bucket: counter_buf
-     * [84 + b*4 .. +3] holds a GPU-written DrawArraysIndirectCommand
-     * {bucket_size, count_b * object_instances, 0, 0} (finalized on the GPU
-     * by the traversal compute shader); command_buf holds six bucket regions
-     * of cluster_count visible-cluster indices. Empty buckets draw nothing
-     * (instanceCount 0). No CPU readback, no multi-draw-indirect-count
-     * dependency. */
+    /* Single unified Multi-Draw Indirect pass across all 6 index-count buckets:
+     * counter_buf [84 .. 84 + 6*4 - 1] holds 6 contiguous DrawArraysIndirectCommand
+     * descriptors {bucket_size, count_b * object_instances, 0, b}.
+     * Bucket index b is passed directly via baseInstance to eliminate per-bucket
+     * CPU loop dispatch and uniform rebind overhead. Empty buckets draw nothing (instanceCount 0). */
     GPU_storagebuf_sync_as_indirect_buffer(counter_buf);
     GPU_batch_set_shader(mForwardBatch, mForwardShader);
-    for (int b = 0; b < 6; ++b) {
-        GPU_shader_uniform_1i(mForwardShader, "bucket_index", b);
-        GPU_batch_draw_indirect(mForwardBatch,
-                                counter_buf,
-                                intptr_t((84 + b * 4) * sizeof(uint32_t)));
-    }
+    GPU_batch_multi_draw_indirect(mForwardBatch,
+                                  counter_buf,
+                                  6,
+                                  intptr_t(84 * sizeof(uint32_t)),
+                                  intptr_t(4 * sizeof(uint32_t)));
 }
 
 }  // namespace tessera
