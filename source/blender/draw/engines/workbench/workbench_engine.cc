@@ -148,7 +148,7 @@ class Instance : public DrawEngine {
     /* Identity of the geometry source feeding #data ("base" for the regular
      * .nc2 path, the archetype name for realized-geometry ranges). */
     std::string data_source_key;
-    bool show_stats = true;
+    bool show_stats = false;
     bool log_console = false;
     bool show_fps_panel = false;
     bool show_fps_hud = false;
@@ -859,8 +859,15 @@ class Instance : public DrawEngine {
     return 0; /* Safe default (Viewport Mode). */
   }
 
-  static bool tessera_show_stats_get(Object *ob)
+  static bool tessera_show_stats_get(Object *ob, const Scene *scene = nullptr)
   {
+    if (scene != nullptr) {
+      if (const IDProperty *prop = tessera_scene_property_find_safe(scene, "tessera_show_stats")) {
+        if (prop->type == IDP_INT) {
+          if (IDP_int_get(prop) != 0) return true;
+        } else if (prop->data.val != 0) return true;
+      }
+    }
     if (!ob) {
       return false;
     }
@@ -874,8 +881,15 @@ class Instance : public DrawEngine {
     return prop->data.val != 0;
   }
 
-  static bool tessera_log_console_get(Object *ob)
+  static bool tessera_log_console_get(Object *ob, const Scene *scene = nullptr)
   {
+    if (scene != nullptr) {
+      if (const IDProperty *prop = tessera_scene_property_find_safe(scene, "tessera_log_console")) {
+        if (prop->type == IDP_INT) {
+          if (IDP_int_get(prop) != 0) return true;
+        } else if (prop->data.val != 0) return true;
+      }
+    }
     if (!ob) {
       return false;
     }
@@ -889,8 +903,15 @@ class Instance : public DrawEngine {
     return prop->data.val != 0;
   }
 
-  static bool tessera_show_fps_panel_get(Object *ob)
+  static bool tessera_show_fps_panel_get(Object *ob, const Scene *scene = nullptr)
   {
+    if (scene != nullptr) {
+      if (const IDProperty *prop = tessera_scene_property_find_safe(scene, "tessera_show_fps_panel")) {
+        if (prop->type == IDP_INT) {
+          if (IDP_int_get(prop) != 0) return true;
+        } else if (prop->data.val != 0) return true;
+      }
+    }
     if (!ob) {
       return false;
     }
@@ -904,8 +925,15 @@ class Instance : public DrawEngine {
     return prop->data.val != 0;
   }
 
-  static bool tessera_show_fps_hud_get(Object *ob)
+  static bool tessera_show_fps_hud_get(Object *ob, const Scene *scene = nullptr)
   {
+    if (scene != nullptr) {
+      if (const IDProperty *prop = tessera_scene_property_find_safe(scene, "tessera_show_fps_hud")) {
+        if (prop->type == IDP_INT) {
+          if (IDP_int_get(prop) != 0) return true;
+        } else if (prop->data.val != 0) return true;
+      }
+    }
     if (!ob) {
       return false;
     }
@@ -953,11 +981,8 @@ class Instance : public DrawEngine {
     IDP_AddToGroup(idgroup, bke::idprop::create(name, value).release());
   }
 
-  static void tessera_write_fps_to_object(Object *ob, float fps, float frame_time_ms)
+  static void tessera_write_fps_to_object(Object *ob, Scene *scene, float fps, float frame_time_ms, bool write_scene = true)
   {
-    if (ob == nullptr) {
-      return;
-    }
     auto write_props = [&](ID *id) {
       if (id == nullptr) {
         return;
@@ -966,11 +991,20 @@ class Instance : public DrawEngine {
         idp_float_replace(group, "tessera_stat_fps", fps);
         idp_float_replace(group, "tessera_stat_frametime", frame_time_ms);
       }
+      if (id->orig_id != nullptr && id->orig_id != id) {
+        if (IDProperty *ogroup = IDP_EnsureProperties(id->orig_id)) {
+          idp_float_replace(ogroup, "tessera_stat_fps", fps);
+          idp_float_replace(ogroup, "tessera_stat_frametime", frame_time_ms);
+        }
+      }
     };
 
-    /* Only write to evaluated datablock during rendering; modifying the original
-     * datablock tags the dependency graph as dirty and forces modifier re-evaluation. */
-    write_props(&ob->id);
+    if (ob != nullptr) {
+      write_props(&ob->id);
+    }
+    if (scene != nullptr && write_scene) {
+      write_props(&scene->id);
+    }
   }
 
   static void tessera_write_telemetry_to_object(Object *ob,
@@ -1017,9 +1051,10 @@ class Instance : public DrawEngine {
       }
     };
 
-    /* Only write to evaluated datablock during rendering; modifying the original
-     * datablock tags the dependency graph as dirty and forces modifier re-evaluation. */
     write_props(&ob->id);
+    if (ob->id.orig_id != nullptr && ob->id.orig_id != &ob->id) {
+      write_props(ob->id.orig_id);
+    }
   }
 
   static void tessera_stat_culling_margin_write(Object *ob, float margin)
@@ -1036,9 +1071,10 @@ class Instance : public DrawEngine {
       }
     };
 
-    /* Only write to evaluated datablock during rendering; modifying the original
-     * datablock tags the dependency graph as dirty and forces modifier re-evaluation. */
     write_props(&ob->id);
+    if (ob->id.orig_id != nullptr && ob->id.orig_id != &ob->id) {
+      write_props(ob->id.orig_id);
+    }
   }
 
   /** Write an integer statistic to the object and its original datablock. */
@@ -1056,9 +1092,10 @@ class Instance : public DrawEngine {
       }
     };
 
-    /* Only write to evaluated datablock during rendering; modifying the original
-     * datablock tags the dependency graph as dirty and forces modifier re-evaluation. */
     write_props(&ob->id);
+    if (ob->id.orig_id != nullptr && ob->id.orig_id != &ob->id) {
+      write_props(ob->id.orig_id);
+    }
   }
 
   /**
@@ -1271,10 +1308,10 @@ class Instance : public DrawEngine {
                                                                  state.matched_archetype_name.c_str(),
                                                                  offsetof(ID, name) + 2)) :
                             nullptr;
-      state.show_stats = tessera_show_stats_get(ob);
-      state.log_console = tessera_log_console_get(ob);
-      state.show_fps_panel = tessera_show_fps_panel_get(ob);
-      state.show_fps_hud = tessera_show_fps_hud_get(ob);
+      state.show_stats = tessera_show_stats_get(ob, scene_state_.scene);
+      state.log_console = tessera_log_console_get(ob, scene_state_.scene);
+      state.show_fps_panel = tessera_show_fps_panel_get(ob, scene_state_.scene);
+      state.show_fps_hud = tessera_show_fps_hud_get(ob, scene_state_.scene);
       state.visualize_clusters = tessera_visualize_get(ob);
       state.pixel_error = tessera_pixel_error_get(ob);
       state.view_source = tessera_view_source_get(ob, arch_ob);
@@ -1449,6 +1486,73 @@ class Instance : public DrawEngine {
     };
     Vector<TesseraPendingDraw> pending_draws;
 
+    bool any_fps_requested = tessera_show_fps_panel_get(nullptr, scene_state_.scene) ||
+                             tessera_show_fps_hud_get(nullptr, scene_state_.scene);
+    if (!any_fps_requested) {
+      for (const auto it : tessera_objects_.items()) {
+        if (it.value->show_fps_panel || it.value->show_fps_hud) {
+          any_fps_requested = true;
+          break;
+        }
+      }
+    }
+    float engine_fps = 0.0f;
+    float engine_frame_time_ms = 0.0f;
+    if (any_fps_requested) {
+      auto now_engine = std::chrono::steady_clock::now();
+      if (tessera_engine_last_frame_time_.time_since_epoch().count() == 0) {
+        tessera_engine_last_frame_time_ = now_engine;
+      }
+      else {
+        float dt = std::chrono::duration<float>(now_engine - tessera_engine_last_frame_time_).count();
+        tessera_engine_last_frame_time_ = now_engine;
+        if (dt > 0.0f && dt < 1.0f) {
+          tessera_engine_smoothed_dt_ = (tessera_engine_smoothed_dt_ <= 0.0f) ?
+                                            dt :
+                                            (0.9f * tessera_engine_smoothed_dt_ + 0.1f * dt);
+        }
+      }
+      engine_fps = (tessera_engine_smoothed_dt_ > 1e-5f) ? (1.0f / tessera_engine_smoothed_dt_) : 0.0f;
+      engine_frame_time_ms = tessera_engine_smoothed_dt_ * 1000.0f;
+      tessera_write_fps_to_object(nullptr, scene_state_.scene, engine_fps, engine_frame_time_ms, true);
+    }
+    else {
+      tessera_engine_last_frame_time_ = {};
+      tessera_engine_smoothed_dt_ = 0.0f;
+    }
+
+    uint32_t total_instances = uint32_t(tessera_objects_.size());
+    uint32_t active_instances = 0;
+    for (const auto it : tessera_objects_.items()) {
+      if (it.value->used && !it.value->data.clusters.empty()) {
+        active_instances++;
+      }
+    }
+
+    int vram_budget_mb = 1024;
+    if (scene_state_.scene != nullptr) {
+      if (IDProperty *group = IDP_GetProperties(&scene_state_.scene->id)) {
+        if (IDProperty *prop = IDP_GetPropertyFromGroup(group, "tessera_vram_budget_mb")) {
+          if (prop->type == IDP_INT) {
+            vram_budget_mb = IDP_int_get(prop);
+          }
+        }
+      }
+    }
+    if (vram_budget_mb < 128) {
+      vram_budget_mb = 128;
+    }
+    if (vram_budget_mb > 16384) {
+      vram_budget_mb = 16384;
+    }
+
+    uint64_t scene_total_active_clusters = 0;
+    uint64_t scene_total_active_triangles = 0;
+    uint64_t scene_total_clusters = 0;
+    uint64_t scene_total_triangles = 0;
+    tessera::TesseraMemoryBudget scene_budget{};
+    bool scene_budget_valid = false;
+
     for (auto item : tessera_objects_.items()) {
       TesseraObjectState &state = *item.value;
       if (!state.used || state.data.clusters.empty()) {
@@ -1611,10 +1715,10 @@ class Instance : public DrawEngine {
       }
       configure_pass(*state.pass, 0);
 
-      const bool show_stats = state.show_stats;
-      const bool log_console = state.log_console;
-      const bool show_fps_panel = state.show_fps_panel;
-      const bool show_fps_hud = state.show_fps_hud;
+      const bool show_stats = state.show_stats || tessera_show_stats_get(nullptr, scene_state_.scene);
+      const bool log_console = state.log_console || tessera_log_console_get(nullptr, scene_state_.scene);
+      const bool show_fps_panel = state.show_fps_panel || tessera_show_fps_panel_get(nullptr, scene_state_.scene);
+      const bool show_fps_hud = state.show_fps_hud || tessera_show_fps_hud_get(nullptr, scene_state_.scene);
 
       bool is_navigating = view_moved;
       if (this->draw_ctx != nullptr && this->draw_ctx->rv3d != nullptr) {
@@ -1943,114 +2047,69 @@ class Instance : public DrawEngine {
       }
 
       if (show_fps_panel || show_fps_hud) {
-        auto now = std::chrono::steady_clock::now();
-        if (state.last_frame_time.time_since_epoch().count() == 0) {
-          state.last_frame_time = now;
-        }
-        else {
-          float dt = std::chrono::duration<float>(now - state.last_frame_time).count();
-          state.last_frame_time = now;
-          if (dt > 0.0f && dt < 1.0f) {
-            state.smoothed_dt = (state.smoothed_dt <= 0.0f) ? dt : (0.9f * state.smoothed_dt + 0.1f * dt);
-          }
-        }
-        float fps = (state.smoothed_dt > 1e-5f) ? (1.0f / state.smoothed_dt) : 0.0f;
-        float frame_time_ms = state.smoothed_dt * 1000.0f;
-        if (allow_dna_write && state.ob != nullptr) {
-          tessera_write_fps_to_object(state.ob, fps, frame_time_ms);
+        tessera_write_fps_to_object(state.ob, nullptr, engine_fps, engine_frame_time_ms, false);
+        if (arch_ob != nullptr && arch_ob != state.ob) {
+          tessera_write_fps_to_object(arch_ob, nullptr, engine_fps, engine_frame_time_ms, false);
         }
       }
-      else {
-        state.last_frame_time = {};
-        state.smoothed_dt = 0.0f;
+
+      if (state.pass) {
+        state.pass->setBudget(size_t(vram_budget_mb) * 1024ULL * 1024ULL);
+        state.pass->setInstanceCounts(total_instances, active_instances);
       }
 
-      /* A whole-mesh frustum-culled object has exact (zero) stats without any GPU readback, so
-       * publish them even during navigation. */
-      const bool tessera_culled_out = (state.pass->drawCount() == 0);
-      if ((!is_navigating || tessera_culled_out) && (show_stats || log_console || show_fps_hud)) {
-        if (allow_dna_write || log_console || tessera_culled_out) {
-          const float3 cam_pos = default_view.location();
-          const float3 bounds_min(state.data.header.boundsMin[0],
-                                  state.data.header.boundsMin[1],
-                                  state.data.header.boundsMin[2]);
-          const float3 bounds_max(state.data.header.boundsMax[0],
-                                  state.data.header.boundsMax[1],
-                                  state.data.header.boundsMax[2]);
-          const float3 local_center = 0.5f * (bounds_min + bounds_max);
-          const float3 world_center = (state.object_mat * float4(local_center, 1.0f)).xyz();
-          const float cam_distance = math::distance(cam_pos, world_center);
+      if (show_stats || log_console || show_fps_hud) {
+        const float3 cam_pos = default_view.location();
+        const float3 bounds_min(state.data.header.boundsMin[0],
+                                state.data.header.boundsMin[1],
+                                state.data.header.boundsMin[2]);
+        const float3 bounds_max(state.data.header.boundsMax[0],
+                                state.data.header.boundsMax[1],
+                                state.data.header.boundsMax[2]);
+        const float3 local_center = 0.5f * (bounds_min + bounds_max);
+        const float3 world_center = (state.object_mat * float4(local_center, 1.0f)).xyz();
+        const float cam_distance = math::distance(cam_pos, world_center);
 
-          tessera::TesseraTelemetry telem = state.pass->getTelemetry();
-          telem.cam_distance = cam_distance;
-          telem.pixel_error = state.pass->getPixelError();
-          telem.culling_margin = state.culling_margin;
+        tessera::TesseraTelemetry telem = state.pass->getTelemetry();
+        telem.cam_distance = cam_distance;
+        telem.pixel_error = state.pass->getPixelError();
+        telem.culling_margin = state.culling_margin;
 
-          tessera::TesseraMemoryBudget budget = state.pass ? state.pass->getMemoryBudget() :
-                                                             tessera::TesseraMemoryBudget{};
-          int vram_budget_mb = 1024;
-          if (scene_state_.scene != nullptr) {
-            if (IDProperty *group = IDP_GetProperties(&scene_state_.scene->id)) {
-              if (IDProperty *prop = IDP_GetPropertyFromGroup(group, "tessera_vram_budget_mb")) {
-                if (prop->type == IDP_INT) {
-                  vram_budget_mb = IDP_int_get(prop);
-                }
-              }
-            }
-          }
-          if (vram_budget_mb < 128) {
-            vram_budget_mb = 128;
-          }
-          if (vram_budget_mb > 16384) {
-            vram_budget_mb = 16384;
-          }
-          if (state.pass) {
-            state.pass->setBudget(size_t(vram_budget_mb) * 1024ULL * 1024ULL);
-          }
-          uint32_t total_instances = uint32_t(tessera_objects_.size());
-          uint32_t active_instances = 0;
-          for (const auto it : tessera_objects_.items()) {
-            if (it.value->used && !it.value->data.clusters.empty()) {
-              active_instances++;
-            }
-          }
-          if (state.pass) {
-            state.pass->setInstanceCounts(total_instances, active_instances);
-          }
-          budget = state.pass ? state.pass->getMemoryBudget() : budget;
+        tessera::TesseraMemoryBudget budget = state.pass ? state.pass->getMemoryBudget() :
+                                                           tessera::TesseraMemoryBudget{};
+        if (!scene_budget_valid && state.pass) {
+          scene_budget = budget;
+          scene_budget_valid = true;
+        }
 
-          if ((allow_dna_write || tessera_culled_out) && (show_stats || show_fps_hud) &&
-              state.ob != nullptr)
-          {
+        if (state.pass->drawCount() > 0) {
+          scene_total_active_clusters += telem.active_clusters;
+          scene_total_active_triangles += telem.active_triangles;
+        }
+        scene_total_clusters += telem.total_clusters;
+        scene_total_triangles += telem.total_triangles;
+
+        if (show_stats || show_fps_hud) {
+          if (state.ob != nullptr) {
             tessera_write_telemetry_to_object(state.ob, telem, &budget, total_instances, active_instances);
-            if (arch_ob != nullptr && arch_ob != state.ob) {
-              tessera_write_telemetry_to_object(arch_ob, telem, &budget, total_instances, active_instances);
-            }
-            if (scene_state_.scene != nullptr) {
-              if (IDProperty *sgroup = IDP_EnsureProperties(&scene_state_.scene->id)) {
-                idp_float_replace(sgroup, "tessera_stat_vram_resident_mb", float(budget.current_resident_bytes) / (1024.0f * 1024.0f));
-                idp_float_replace(sgroup, "tessera_stat_vram_budget_mb", float(budget.max_vram_bytes) / (1024.0f * 1024.0f));
-                idp_float_replace(sgroup, "tessera_stat_disk_read_mbs", budget.disk_read_mbs);
-                idp_float_replace(sgroup, "tessera_stat_cache_hit_ratio", budget.cache_hit_ratio);
-                idp_int_replace(sgroup, "tessera_stat_total_instances", int(total_instances));
-                idp_int_replace(sgroup, "tessera_stat_active_instances", int(active_instances));
-              }
-            }
           }
+          if (arch_ob != nullptr && arch_ob != state.ob) {
+            tessera_write_telemetry_to_object(arch_ob, telem, &budget, total_instances, active_instances);
+          }
+        }
 
-          if (log_console) {
-            printf("[Tessera Stats] %s | Dist: %.2fm | LOD: %u-%u | Clusters: %u/%u | Tris: %u/%u | Error: %.1fpx\n",
-                   state.ob ? (state.ob->id.name + 2) : "Object",
-                   telem.cam_distance,
-                   telem.active_lod_min,
-                   telem.active_lod_max,
-                   telem.active_clusters,
-                   telem.total_clusters,
-                   telem.active_triangles,
-                   telem.total_triangles,
-                   telem.pixel_error);
-            fflush(stdout);
-          }
+        if (log_console) {
+          printf("[Tessera Stats] %s | Dist: %.2fm | LOD: %u-%u | Clusters: %u/%u | Tris: %u/%u | Error: %.1fpx\n",
+                 state.ob ? (state.ob->id.name + 2) : "Object",
+                 telem.cam_distance,
+                 telem.active_lod_min,
+                 telem.active_lod_max,
+                 telem.active_clusters,
+                 telem.total_clusters,
+                 telem.active_triangles,
+                 telem.total_triangles,
+                 telem.pixel_error);
+          fflush(stdout);
         }
       }
       if (state.pass->drawCount() != 0) {
@@ -2192,6 +2251,32 @@ class Instance : public DrawEngine {
       }
     }
 
+    const bool show_stats_any = tessera_show_stats_get(nullptr, scene_state_.scene) ||
+                                tessera_show_fps_hud_get(nullptr, scene_state_.scene);
+    if (show_stats_any && scene_state_.scene != nullptr) {
+      auto write_scene_telem = [&](ID *sid) {
+        if (sid == nullptr) {
+          return;
+        }
+        if (IDProperty *sgroup = IDP_EnsureProperties(sid)) {
+          idp_int_replace(sgroup, "tessera_stat_clusters", int(scene_total_active_clusters));
+          idp_int_replace(sgroup, "tessera_stat_triangles", int(scene_total_active_triangles));
+          idp_int_replace(sgroup, "tessera_total_clusters", int(scene_total_clusters));
+          idp_int_replace(sgroup, "tessera_total_triangles", int(scene_total_triangles));
+          idp_float_replace(sgroup, "tessera_stat_vram_resident_mb", float(scene_budget.current_resident_bytes) / (1024.0f * 1024.0f));
+          idp_float_replace(sgroup, "tessera_stat_vram_budget_mb", float(scene_budget.max_vram_bytes) / (1024.0f * 1024.0f));
+          idp_float_replace(sgroup, "tessera_stat_disk_read_mbs", scene_budget.disk_read_mbs);
+          idp_float_replace(sgroup, "tessera_stat_cache_hit_ratio", scene_budget.cache_hit_ratio);
+          idp_int_replace(sgroup, "tessera_stat_total_instances", int(total_instances));
+          idp_int_replace(sgroup, "tessera_stat_active_instances", int(active_instances));
+        }
+      };
+      write_scene_telem(&scene_state_.scene->id);
+      if (scene_state_.scene->id.orig_id != nullptr && scene_state_.scene->id.orig_id != &scene_state_.scene->id) {
+        write_scene_telem(scene_state_.scene->id.orig_id);
+      }
+    }
+
     size_t tot_cached_instances = 0;
     for (const auto it : tessera_objects_.items()) {
       tot_cached_instances += it.value->instance_mats.size();
@@ -2230,6 +2315,8 @@ class Instance : public DrawEngine {
   uint64_t depsgraph_last_update_ = 0;
   bool scene_updated_ = true;
   bool tessera_instances_cached_ = false;
+  std::chrono::steady_clock::time_point tessera_engine_last_frame_time_{};
+  float tessera_engine_smoothed_dt_ = 0.0f;
 
   const char *hair_buffer_overflow_error_ = nullptr;
 

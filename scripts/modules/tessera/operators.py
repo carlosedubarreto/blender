@@ -495,7 +495,23 @@ class TESSERA_OT_restore_mesh(bpy.types.Operator):
         return {'FINISHED'}
 
 
+class TESSERA_OT_sync_status(bpy.types.Operator):
+    """Scan scene mesh objects and synchronize .nc2 cache file status from disk."""
+
+    bl_idname = "tessera.sync_status"
+    bl_label = "Sync Cache Status"
+    bl_description = "Manually scan disk for .nc2 cache files and refresh Tessera UI status"
+    bl_options = {'REGISTER'}
+
+    def execute(self, context):
+        from .ui import sync_scene_nc2_status
+        available, total = sync_scene_nc2_status(context.scene)
+        self.report({'INFO'}, f"Tessera Synced: {available} of {total} meshes have .nc2 caches")
+        return {'FINISHED'}
+
+
 classes = (
+    TESSERA_OT_sync_status,
     TESSERA_OT_batch_enable_all,
     TESSERA_OT_batch_disable_all,
     TESSERA_OT_batch_enable_selected,

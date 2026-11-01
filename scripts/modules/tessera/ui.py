@@ -27,54 +27,98 @@ def is_viewport_in_camera_view(context):
     return False
 
 
+def is_tessera_object(ob):
+    """Check if an object qualifies as a Tessera object."""
+    if not ob or ob.type != 'MESH':
+        return False
+    if hasattr(ob, "tessera") and getattr(ob.tessera, "enabled", False):
+        return True
+    if bool(ob.get("tessera_enabled", False)):
+        return True
+    if ob.get("tessera_nc2") or ob.get("tessera_nc2_path"):
+        return True
+    if _nc2_path_cache.get(ob.name):
+        return True
+    from tessera.ui import get_existing_nc2_path
+    if get_existing_nc2_path(ob):
+        return True
+    return False
+
+
+def _get_prop(target, key, default=0.0):
+    """Safely retrieve statistic property from original or evaluated datablock."""
+    if target is None:
+        return default
+    val = target.get(key)
+    if val is not None:
+        return val
+    try:
+        if hasattr(target, "evaluated_get") and bpy.context and hasattr(bpy.context, "evaluated_depsgraph_get"):
+            eval_target = target.evaluated_get(bpy.context.evaluated_depsgraph_get())
+            if eval_target and key in eval_target:
+                return eval_target[key]
+    except Exception:
+        pass
+    return default
+
 def draw_tessera_hud():
-    """Render on-screen viewport HUD overlay for active Tessera object."""
+    """Render on-screen viewport HUD overlay for active Tessera object or scene."""
     if bpy.app.background:
         return
 
     context = bpy.context
+    scene = getattr(context, "scene", None)
     ob = getattr(context, "active_object", None)
-    if not ob or not ob.get("tessera_enabled", False):
+
+    scene_hud = False
+    if scene:
+        sprops = getattr(scene, "tessera", None)
+        scene_hud = bool(getattr(sprops, "show_fps_hud", False)) or bool(scene.get("tessera_show_fps_hud", 0))
+
+    has_tessera_ob = is_tessera_object(ob)
+    ob_hud = False
+    if has_tessera_ob:
+        oprops = getattr(ob, "tessera", None)
+        ob_hud = bool(getattr(oprops, "show_fps_hud", False)) or bool(_get_prop(ob, "tessera_show_fps_hud", 0))
+
+    if not (scene_hud or ob_hud):
         return
 
-    props = getattr(ob, "tessera", None)
-    if not props or not getattr(props, "show_fps_hud", False):
-        return
+    fps = float(_get_prop(ob if has_tessera_ob else scene, "tessera_stat_fps", _get_prop(scene, "tessera_stat_fps", 0.0)))
+    ft_ms = float(_get_prop(ob if has_tessera_ob else scene, "tessera_stat_frametime", _get_prop(scene, "tessera_stat_frametime", 0.0)))
+    clusters = int(_get_prop(ob if has_tessera_ob else scene, "tessera_stat_clusters", _get_prop(scene, "tessera_stat_clusters", 0)))
+    tris = int(_get_prop(ob if has_tessera_ob else scene, "tessera_stat_triangles", _get_prop(scene, "tessera_stat_triangles", 0)))
 
-    fps = float(ob.get("tessera_stat_fps", 0.0))
-    ft_ms = float(ob.get("tessera_stat_frametime", 0.0))
-    clusters = int(ob.get("tessera_stat_clusters", 0))
-    tris = int(ob.get("tessera_stat_triangles", 0))
+    if has_tessera_ob:
+        from tessera.render import get_effective_margin
+        eff_margin = float(_get_prop(ob, "tessera_stat_culling_margin", get_effective_margin(ob, context)))
+        is_cam_active = (_get_prop(ob, "tessera_view_source", 0) == 1) or is_viewport_in_camera_view(context)
+        mode_str = f"{ob.name} | Camera Locked" if is_cam_active else f"{ob.name} | Viewport Active"
+        scale = float(_get_prop(ob, "tessera_stat_tex_scale", 1.0))
+        scale_pct = int(round(scale * 100))
+        if scale >= 0.99:
+            tex_str = "100% (Full)"
+        elif scale >= 0.49:
+            tex_str = "50% (1/2)"
+        elif scale >= 0.24:
+            tex_str = "25% (1/4)"
+        elif scale >= 0.12:
+            tex_str = "12.5% (1/8)"
+        else:
+            tex_str = f"{scale_pct}%"
+    else:
+        eff_margin = float(_get_prop(scene, "tessera_culling_margin", 0.02))
+        mode_str = "Scene Master"
+        tex_str = "Auto"
 
-    from tessera.render import get_effective_margin
-    eff_margin = float(ob.get("tessera_stat_culling_margin", get_effective_margin(ob, context)))
-    is_cam_active = (ob.get("tessera_view_source", 0) == 1) or is_viewport_in_camera_view(context)
-    mode_str = "Camera Locked" if is_cam_active else "Viewport Active"
-
-    # Position in top-left margin (offset from header/gizmos)
     font_id = 0
     x_offset = 20
     region_h = context.region.height if context.region else 600
-    y_offset = region_h - 60
 
-    scale = float(ob.get("tessera_stat_tex_scale", 1.0))
-    scale_pct = int(round(scale * 100))
-    if scale >= 0.99:
-        tex_str = "100% (Full)"
-    elif scale >= 0.49:
-        tex_str = "50% (1/2)"
-    elif scale >= 0.24:
-        tex_str = "25% (1/4)"
-    elif scale >= 0.12:
-        tex_str = "12.5% (1/8)"
-    else:
-        tex_str = f"{scale_pct}%"
-
-    scene = context.scene
-    vram_res = float(ob.get("tessera_stat_vram_resident_mb", scene.get("tessera_stat_vram_resident_mb", 0.0) if scene else 0.0))
-    budget_mb = float(getattr(scene, "tessera_vram_budget_mb", 1024))
-    tot_inst = int(ob.get("tessera_stat_total_instances", scene.get("tessera_stat_total_instances", 1) if scene else 1))
-    act_inst = int(ob.get("tessera_stat_active_instances", scene.get("tessera_stat_active_instances", 1) if scene else 1))
+    vram_res = float(_get_prop(ob if has_tessera_ob else scene, "tessera_stat_vram_resident_mb", _get_prop(scene, "tessera_stat_vram_resident_mb", 0.0)))
+    budget_mb = float(getattr(scene, "tessera_vram_budget_mb", 1024)) if scene else 1024.0
+    tot_inst = int(_get_prop(ob if has_tessera_ob else scene, "tessera_stat_total_instances", _get_prop(scene, "tessera_stat_total_instances", 1)))
+    act_inst = int(_get_prop(ob if has_tessera_ob else scene, "tessera_stat_active_instances", _get_prop(scene, "tessera_stat_active_instances", 1)))
 
     def format_count(n):
         if n >= 1_000_000:
@@ -91,11 +135,32 @@ def draw_tessera_hud():
             f"Mem: {vram_res:.0f}/{budget_mb:.0f}MB | Inst: {inst_str} ({active_inst_str} vis)")
 
     try:
-        # Optional subtle background pill/box
         blf.size(font_id, 14)
         text_w, text_h = blf.dimensions(font_id, text)
         pad_x = 8
         pad_y = 5
+
+        # Determine HUD placement from object or scene properties
+        sprops = getattr(scene, "tessera", None) if scene else None
+        oprops = getattr(ob, "tessera", None) if has_tessera_ob else None
+        active_props = oprops if (oprops and getattr(oprops, "show_fps_hud", False)) else sprops
+        if active_props is not None:
+            pos = getattr(active_props, "hud_position", 'TOP')
+            margin_y = int(getattr(active_props, "hud_margin_y", 60))
+        elif scene:
+            pos = str(scene.get("tessera_hud_position", "TOP"))
+            margin_y = int(scene.get("tessera_hud_margin_y", 60))
+        else:
+            pos = 'TOP'
+            margin_y = 60
+
+        if pos == 'BOTTOM':
+            y_offset = margin_y + pad_y
+        else:
+            y_offset = region_h - margin_y - int(text_h) - pad_y
+
+        y_offset = max(pad_y + 2, min(region_h - int(text_h) - pad_y - 2, y_offset))
+
         x0 = float(x_offset - pad_x)
         x1 = float(x_offset + text_w + pad_x)
         y0 = float(y_offset - pad_y)
@@ -113,7 +178,7 @@ def draw_tessera_hud():
         gpu.state.blend_set('NONE')
 
         blf.size(font_id, 14)
-        blf.color(font_id, 0.2, 0.9, 0.4, 1.0)  # Green accent
+        blf.color(font_id, 0.2, 0.9, 0.4, 1.0)
         blf.position(font_id, x_offset, y_offset, 0)
         blf.draw(font_id, text)
     except Exception:
@@ -141,14 +206,26 @@ def unregister_hud_handler():
 
 
 def update_hud_state():
-    """Ensure HUD draw handler is registered only when at least one object has HUD enabled."""
+    """Ensure HUD draw handler is registered only when at least one object or the scene has HUD enabled."""
     has_hud = False
     try:
-        for ob in bpy.data.objects:
-            props = getattr(ob, "tessera", None)
-            if props and getattr(props, "show_fps_hud", False):
+        scene = bpy.context.scene if bpy.context else None
+        if scene:
+            sprops = getattr(scene, "tessera", None)
+            if sprops and getattr(sprops, "show_fps_hud", False):
                 has_hud = True
-                break
+            elif bool(scene.get("tessera_show_fps_hud", 0)):
+                has_hud = True
+
+        if not has_hud:
+            for ob in bpy.data.objects:
+                props = getattr(ob, "tessera", None)
+                if props and getattr(props, "show_fps_hud", False):
+                    has_hud = True
+                    break
+                elif bool(ob.get("tessera_show_fps_hud", 0)):
+                    has_hud = True
+                    break
     except Exception:
         pass
 
@@ -159,45 +236,53 @@ def update_hud_state():
 
 
 def _tessera_sidebar_refresh_timer():
-    """Continuous timer keeping sidebar telemetry and progress indicators updated."""
-    context = bpy.context
-    ob = getattr(context, "active_object", None)
-
-    is_building = False
+    """Continuous timer keeping sidebar telemetry and HUD overlay updated dynamically."""
     try:
-        is_building = any(bool(o.get("tessera_building", 0)) for o in bpy.data.objects)
+        context = bpy.context
+        scene = getattr(context, "scene", None)
+        ob = getattr(context, "active_object", None)
+
+        is_building = False
+        try:
+            is_building = any(bool(o.get("tessera_building", 0)) for o in bpy.data.objects)
+        except Exception:
+            pass
+
+        sprops = getattr(scene, "tessera", None) if scene else None
+        has_tessera_ob = is_tessera_object(ob)
+        oprops = getattr(ob, "tessera", None) if has_tessera_ob else None
+
+        scene_stats = bool(getattr(sprops, "show_stats", False)) or bool(scene.get("tessera_show_stats", 0) if scene else 0)
+        scene_fps = bool(getattr(sprops, "show_fps_panel", False)) or bool(scene.get("tessera_show_fps_panel", 0) if scene else 0)
+        scene_hud = bool(getattr(sprops, "show_fps_hud", False)) or bool(scene.get("tessera_show_fps_hud", 0) if scene else 0)
+
+        ob_stats = bool(getattr(oprops, "show_stats", False)) or bool(ob.get("tessera_show_stats", 0) if ob else 0)
+        ob_fps = bool(getattr(oprops, "show_fps_panel", False)) or bool(ob.get("tessera_show_fps_panel", 0) if ob else 0)
+        ob_hud = bool(getattr(oprops, "show_fps_hud", False)) or bool(ob.get("tessera_show_fps_hud", 0) if ob else 0)
+
+        needs_ui = is_building or scene_stats or scene_fps or ob_stats or ob_fps
+        needs_render = scene_hud or ob_hud or scene_fps or ob_fps or scene_stats or ob_stats
+
+        # If telemetry or builds are active, tag regions for smooth redraws
+        if needs_ui or needs_render:
+            wm = getattr(context, "window_manager", None)
+            if wm:
+                for window in wm.windows:
+                    screen = getattr(window, "screen", None)
+                    if screen:
+                        for area in screen.areas:
+                            if area.type == 'VIEW_3D':
+                                for region in area.regions:
+                                    if region.type == 'UI' and needs_ui:
+                                        region.tag_redraw()
+                                    if region.type == 'WINDOW' and needs_render:
+                                        region.tag_redraw()
+            return 0.1  # 10 FPS dynamic refresh rate
     except Exception:
         pass
 
-    needs_stats = False
-    needs_hud = False
-    if ob and bool(ob.get("tessera_enabled", False)):
-        props = getattr(ob, "tessera", None)
-        if props:
-            if getattr(props, "show_stats", False) or getattr(props, "show_fps_panel", False):
-                needs_stats = True
-            if getattr(props, "show_fps_hud", False):
-                needs_hud = True
-                needs_stats = True
-
-    # If building or live stats are active, explicitly redraw the sidebar UI region
-    if is_building or needs_stats:
-        wm = getattr(context, "window_manager", None)
-        if wm:
-            for window in wm.windows:
-                screen = getattr(window, "screen", None)
-                if screen:
-                    for area in screen.areas:
-                        if area.type == 'VIEW_3D':
-                            for region in area.regions:
-                                if region.type == 'UI':
-                                    region.tag_redraw()
-                                elif region.type == 'WINDOW' and needs_hud:
-                                    region.tag_redraw()
-        return 0.08  # ~12 FPS refresh rate for UI readouts (very lightweight)
-
-    # Recheck periodically at low frequency if inactive
-    return 0.5
+    # Completely dormant when all telemetry is disabled
+    return 2.0
 
 
 def register_refresh_timer():
@@ -213,15 +298,108 @@ def unregister_refresh_timer():
 
 
 _nc2_path_cache = {}
+_nc2_size_cache = {}
+_scene_stats_cache = {
+    "total_meshes": 0,
+    "available": 0,
+    "enabled": 0,
+    "synced": False,
+}
 
 
 def clear_nc2_path_cache():
-    """Clear in-memory NC2 path cache."""
+    """Clear in-memory NC2 path and size cache."""
     _nc2_path_cache.clear()
+    _nc2_size_cache.clear()
+    _scene_stats_cache["synced"] = False
+
+
+def sync_scene_nc2_status(scene=None):
+    """Actively inspect all scene objects on disk and update status cache."""
+    if scene is None:
+        scene = getattr(bpy.context, "scene", None)
+    if scene is None:
+        return 0, 0
+
+    clear_nc2_path_cache()
+    blend_dir = bpy.path.abspath("//")
+    cwd = os.getcwd()
+
+    total_meshes = 0
+    tessera_available = 0
+    tessera_enabled = 0
+
+    for ob in scene.objects:
+        if ob.type != 'MESH':
+            continue
+        total_meshes += 1
+
+        nc2_path = None
+        prop_path = ob.get("tessera_nc2", "") or ob.get("tessera_nc2_path", "")
+        if prop_path:
+            abs_p = bpy.path.abspath(prop_path)
+            if os.path.isfile(abs_p) and os.path.getsize(abs_p) > 88:
+                nc2_path = abs_p
+
+        if not nc2_path:
+            mesh = getattr(ob, "data", None)
+            mesh_name = mesh.name if mesh else ""
+            candidates = [
+                os.path.join(blend_dir, f"{ob.name}.nc2"),
+                os.path.join(blend_dir, f"{mesh_name}.nc2") if mesh_name else "",
+                os.path.join(blend_dir, f"{ob.name.replace('.', '_')}.nc2"),
+                os.path.join(blend_dir, f"{mesh_name.replace('.', '_')}.nc2") if mesh_name else "",
+                os.path.join(cwd, f"{ob.name}.nc2"),
+                os.path.join(cwd, f"{mesh_name}.nc2") if mesh_name else "",
+            ]
+            for c in candidates:
+                if not c:
+                    continue
+                abs_p = bpy.path.abspath(c)
+                if os.path.isfile(abs_p) and os.path.getsize(abs_p) > 88:
+                    nc2_path = abs_p
+                    break
+
+        if nc2_path:
+            _nc2_path_cache[ob.name] = nc2_path
+            try:
+                _nc2_size_cache[ob.name] = os.path.getsize(nc2_path) / (1024 * 1024)
+            except Exception:
+                _nc2_size_cache[ob.name] = 0.0
+            tessera_available += 1
+        else:
+            _nc2_path_cache[ob.name] = ""
+            _nc2_size_cache[ob.name] = 0.0
+
+        is_en = False
+        if hasattr(ob, "tessera") and getattr(ob.tessera, "enabled", False):
+            is_en = True
+        elif bool(ob.get("tessera_enabled", False)):
+            is_en = True
+        if is_en:
+            tessera_enabled += 1
+
+    _scene_stats_cache["total_meshes"] = total_meshes
+    _scene_stats_cache["available"] = tessera_available
+    _scene_stats_cache["enabled"] = tessera_enabled
+    _scene_stats_cache["synced"] = True
+
+    wm = getattr(bpy.context, "window_manager", None)
+    if wm:
+        for window in wm.windows:
+            screen = getattr(window, "screen", None)
+            if screen:
+                for area in screen.areas:
+                    if area.type == 'VIEW_3D':
+                        for region in area.regions:
+                            if region.type == 'UI':
+                                region.tag_redraw()
+
+    return tessera_available, total_meshes
 
 
 def get_existing_nc2_path(ob):
-    """Detect whether a valid compiled Tessera .nc2 binary already exists on disk."""
+    """Detect whether a valid compiled Tessera .nc2 binary exists on disk."""
     if ob is None:
         return None
 
@@ -229,13 +407,24 @@ def get_existing_nc2_path(ob):
     if cached is not None:
         return cached if cached else None
 
-    # Check object properties first (fastest)
+    # Check object properties first (fastest, in-memory)
     prop_path = ob.get("tessera_nc2", "") or ob.get("tessera_nc2_path", "")
     if prop_path:
         abs_p = bpy.path.abspath(prop_path)
+        scene = getattr(bpy.context, "scene", None)
+        auto_checks = getattr(getattr(scene, "tessera", None), "auto_file_checks", False) if scene else False
+        if not auto_checks:
+            _nc2_path_cache[ob.name] = abs_p
+            return abs_p
         if os.path.isfile(abs_p) and os.path.getsize(abs_p) > 88:
             _nc2_path_cache[ob.name] = abs_p
             return abs_p
+
+    scene = getattr(bpy.context, "scene", None)
+    auto_checks = getattr(getattr(scene, "tessera", None), "auto_file_checks", False) if scene else False
+    if not auto_checks:
+        _nc2_path_cache[ob.name] = ""
+        return None
 
     blend_dir = bpy.path.abspath("//")
     mesh = getattr(ob, "data", None)
@@ -262,6 +451,100 @@ def get_existing_nc2_path(ob):
     return None
 
 
+class TESSERA_PT_telemetry(bpy.types.Panel):
+    """Realtime telemetry and performance telemetry panel, always visible."""
+
+    bl_label = "Realtime Telemetry"
+    bl_space_type = 'VIEW_3D'
+    bl_region_type = 'UI'
+    bl_category = "Tessera"
+    bl_order = 1
+
+    @classmethod
+    def poll(cls, context):
+        return context.scene is not None
+
+    def draw(self, context):
+        layout = self.layout
+        scene = context.scene
+        sprops = getattr(scene, "tessera", None)
+        ob = getattr(context, "active_object", None)
+        has_tessera_ob = is_tessera_object(ob)
+        oprops = getattr(ob, "tessera", None) if has_tessera_ob else None
+
+        # Telemetry Toggles (Always visible, persistent)
+        t_row = layout.row(align=True)
+        t_row.prop(sprops, "show_stats", text="Live Stats", icon='INFO')
+        t_row.prop(sprops, "log_console", text="Console Log", icon='CONSOLE')
+
+        fps_row = layout.row(align=True)
+        fps_row.prop(sprops, "show_fps_panel", text="Panel FPS", icon='TIME')
+        fps_row.prop(sprops, "show_fps_hud", text="Viewport HUD", icon='RESTRICT_VIEW_OFF')
+
+        show_hud = getattr(sprops, "show_fps_hud", False) or (oprops and getattr(oprops, "show_fps_hud", False))
+        if show_hud:
+            hud_box = layout.box()
+            hud_box.label(text="HUD Settings:", icon='PREFERENCES')
+            h_row = hud_box.row(align=True)
+            target_props = oprops if (has_tessera_ob and getattr(oprops, "show_fps_hud", False)) else sprops
+            h_row.prop(target_props, "hud_position", expand=True)
+            h_row.prop(target_props, "hud_margin_y", text="Distance (px)")
+
+        show_fps = getattr(sprops, "show_fps_panel", False) or (oprops and getattr(oprops, "show_fps_panel", False))
+        show_stats = getattr(sprops, "show_stats", False) or (oprops and getattr(oprops, "show_stats", False))
+
+        if show_fps:
+            box = layout.box()
+            fps = float(_get_prop(ob if has_tessera_ob else scene, "tessera_stat_fps", _get_prop(scene, "tessera_stat_fps", 0.0)))
+            ms = float(_get_prop(ob if has_tessera_ob else scene, "tessera_stat_frametime", _get_prop(scene, "tessera_stat_frametime", 0.0)))
+            col = box.column(align=True)
+            col.label(text=f"Performance: {fps:.1f} FPS ({ms:.2f} ms)", icon='PREFERENCES')
+
+        if show_stats:
+            box = layout.box()
+            col = box.column(align=True)
+
+            tot_clusters = int(_get_prop(scene, "tessera_total_clusters", 0))
+            act_clusters = int(_get_prop(scene, "tessera_stat_clusters", 0))
+            tot_tris = int(_get_prop(scene, "tessera_total_triangles", 0))
+            act_tris = int(_get_prop(scene, "tessera_stat_triangles", 0))
+
+            vram_res = float(_get_prop(scene, "tessera_stat_vram_resident_mb", 0.0))
+            budget_mb = float(getattr(scene, "tessera_vram_budget_mb", 1024))
+            tot_inst = int(_get_prop(scene, "tessera_stat_total_instances", 0))
+            act_inst = int(_get_prop(scene, "tessera_stat_active_instances", 0))
+
+            col.label(text="Scene Live Stats:", icon='SCENE_DATA')
+            if tot_inst > 0:
+                col.label(text=f"Instances: {act_inst:,} active / {tot_inst:,} total", icon='OUTLINER_OB_GROUP_INSTANCE')
+            if act_clusters > 0 or tot_clusters > 0:
+                col.label(text=f"Clusters: {act_clusters:,} active / {tot_clusters:,} total", icon='MOD_SOLIDIFY')
+            if act_tris > 0 or tot_tris > 0:
+                col.label(text=f"Triangles: {act_tris:,} active / {tot_tris:,} total", icon='MESH_DATA')
+            if budget_mb > 0:
+                col.label(text=f"VRAM: {vram_res:.1f} MB / {budget_mb:.0f} MB", icon='DISK_DRIVE')
+
+            if has_tessera_ob:
+                col.separator()
+                col.label(text=f"Active Object: {ob.name}", icon='OBJECT_DATA')
+                lod_min = int(_get_prop(ob, 'tessera_stat_lod_min', 0))
+                lod_max = int(_get_prop(ob, 'tessera_stat_lod_max', 0))
+                col.label(text=f"Active LODs: {lod_min} – {lod_max}", icon='ZOOM_IN')
+
+                active_clusters = int(_get_prop(ob, 'tessera_stat_clusters', 0))
+                total_clusters = int(_get_prop(ob, 'tessera_total_clusters', 0))
+                col.label(text=f"Clusters: {active_clusters:,} / {total_clusters:,}", icon='MOD_SOLIDIFY')
+
+                active_tris = int(_get_prop(ob, 'tessera_stat_triangles', 0))
+                total_tris = int(_get_prop(ob, 'tessera_total_triangles', 0))
+                col.label(text=f"Triangles: {active_tris:,} / {total_tris:,}", icon='MESH_DATA')
+
+                eff_margin = float(_get_prop(ob, "tessera_stat_culling_margin", 0.0))
+                col.label(text=f"Culling Margin: {eff_margin:.2f}m", icon='VIEW_CAMERA')
+            else:
+                col.label(text="(Select a Tessera mesh for per-object LOD details)", icon='INFO')
+
+
 class TESSERA_PT_object(bpy.types.Panel):
     """Tessera options for the active mesh object."""
 
@@ -269,7 +552,7 @@ class TESSERA_PT_object(bpy.types.Panel):
     bl_space_type = 'VIEW_3D'
     bl_region_type = 'UI'
     bl_category = "Tessera"
-    bl_order = 2
+    bl_order = 3
 
     @classmethod
     def poll(cls, context):
@@ -314,11 +597,16 @@ class TESSERA_PT_object(bpy.types.Panel):
             box = layout.box()
             box.label(text="Tessera Cache Found on Disk", icon='CHECKMARK')
 
-            try:
-                file_size_mb = os.path.getsize(nc2_path) / (1024 * 1024)
-                size_str = f"{file_size_mb:.1f} MB"
-            except Exception:
-                size_str = "Available"
+            cached_size = _nc2_size_cache.get(ob.name)
+            if cached_size is not None and cached_size > 0:
+                size_str = f"{cached_size:.1f} MB"
+            else:
+                try:
+                    s_mb = os.path.getsize(nc2_path) / (1024 * 1024)
+                    _nc2_size_cache[ob.name] = s_mb
+                    size_str = f"{s_mb:.1f} MB"
+                except Exception:
+                    size_str = "Available"
             box.label(text=f"File: {os.path.basename(nc2_path)} ({size_str})", icon='FILE_CACHE')
 
             if tessera_props is not None:
@@ -387,24 +675,29 @@ class TESSERA_PT_object(bpy.types.Panel):
                 fps_row.prop(tessera_props, "show_fps_panel", text="Panel FPS", icon='TIME')
                 fps_row.prop(tessera_props, "show_fps_hud", text="Viewport HUD", icon='RESTRICT_VIEW_OFF')
 
+                if tessera_props.show_fps_hud:
+                    h_row = t_box.row(align=True)
+                    h_row.prop(tessera_props, "hud_position", expand=True)
+                    h_row.prop(tessera_props, "hud_margin_y", text="Distance (px)")
+
                 if tessera_props.show_fps_panel:
                     fps_col = t_box.column(align=True)
-                    fps = float(ob.get("tessera_stat_fps", 0.0))
-                    ms = float(ob.get("tessera_stat_frametime", 0.0))
+                    fps = float(_get_prop(ob, "tessera_stat_fps", 0.0))
+                    ms = float(_get_prop(ob, "tessera_stat_frametime", 0.0))
                     fps_col.label(text=f"Performance: {fps:.1f} FPS ({ms:.2f} ms)", icon='PREFERENCES')
 
                 if tessera_props.show_stats:
                     t_col = t_box.column(align=True)
-                    lod_min = ob.get('tessera_stat_lod_min', 0)
-                    lod_max = ob.get('tessera_stat_lod_max', 0)
-                    t_col.label(text=f"Active LODs: {lod_min} \u2013 {lod_max}", icon='ZOOM_IN')
+                    lod_min = _get_prop(ob, 'tessera_stat_lod_min', 0)
+                    lod_max = _get_prop(ob, 'tessera_stat_lod_max', 0)
+                    t_col.label(text=f"Active LODs: {lod_min} – {lod_max}", icon='ZOOM_IN')
 
-                    active_clusters = ob.get('tessera_stat_clusters', 0)
-                    total_clusters = ob.get('tessera_total_clusters', 0)
+                    active_clusters = _get_prop(ob, 'tessera_stat_clusters', 0)
+                    total_clusters = _get_prop(ob, 'tessera_total_clusters', 0)
                     t_col.label(text=f"Visible Clusters: {active_clusters:,} / {total_clusters:,}", icon='MOD_SOLIDIFY')
 
-                    active_tris = ob.get('tessera_stat_triangles', 0)
-                    total_tris = ob.get('tessera_total_triangles', 0)
+                    active_tris = _get_prop(ob, 'tessera_stat_triangles', 0)
+                    total_tris = _get_prop(ob, 'tessera_total_triangles', 0)
                     t_col.label(text=f"Rendered Tris: {active_tris:,} / {total_tris:,}", icon='MESH_DATA')
 
                     scale = float(ob.get("tessera_stat_tex_scale", 1.0))
@@ -462,25 +755,50 @@ class TESSERA_PT_batch_controls(bpy.types.Panel):
 
         # 1. Scene Mesh Statistics Overview
         stat_box = layout.box()
-        stat_box.label(text="Scene Mesh Overview", icon='MESH_DATA')
+        h_row = stat_box.row(align=True)
+        h_row.label(text="Scene Mesh Overview", icon='MESH_DATA')
+        h_row.operator("tessera.sync_status", text="Sync Cache Status", icon='FILE_REFRESH')
 
-        total_meshes = 0
-        tessera_available = 0
-        tessera_enabled = 0
+        auto_checks = getattr(t_scene, "auto_file_checks", False)
 
-        for ob in scene.objects:
-            if ob.type != 'MESH':
-                continue
-            total_meshes += 1
-            if get_existing_nc2_path(ob) is not None:
-                tessera_available += 1
-            is_en = False
-            if hasattr(ob, "tessera") and getattr(ob.tessera, "enabled", False):
-                is_en = True
-            elif bool(ob.get("tessera_enabled", False)):
-                is_en = True
-            if is_en:
-                tessera_enabled += 1
+        if not _scene_stats_cache.get("synced", False) and not auto_checks:
+            total_meshes = 0
+            tessera_available = 0
+            tessera_enabled = 0
+            for ob in scene.objects:
+                if ob.type != 'MESH':
+                    continue
+                total_meshes += 1
+                if ob.get("tessera_nc2") or ob.get("tessera_nc2_path") or _nc2_path_cache.get(ob.name):
+                    tessera_available += 1
+                is_en = False
+                if hasattr(ob, "tessera") and getattr(ob.tessera, "enabled", False):
+                    is_en = True
+                elif bool(ob.get("tessera_enabled", False)):
+                    is_en = True
+                if is_en:
+                    tessera_enabled += 1
+        elif auto_checks:
+            total_meshes = 0
+            tessera_available = 0
+            tessera_enabled = 0
+            for ob in scene.objects:
+                if ob.type != 'MESH':
+                    continue
+                total_meshes += 1
+                if get_existing_nc2_path(ob) is not None:
+                    tessera_available += 1
+                is_en = False
+                if hasattr(ob, "tessera") and getattr(ob.tessera, "enabled", False):
+                    is_en = True
+                elif bool(ob.get("tessera_enabled", False)):
+                    is_en = True
+                if is_en:
+                    tessera_enabled += 1
+        else:
+            total_meshes = _scene_stats_cache.get("total_meshes", 0)
+            tessera_available = _scene_stats_cache.get("available", 0)
+            tessera_enabled = _scene_stats_cache.get("enabled", 0)
 
         stat_col = stat_box.column(align=True)
         stat_col.label(text=f"Total Mesh Objects: {total_meshes}", icon='OBJECT_DATAMODE')
@@ -489,6 +807,9 @@ class TESSERA_PT_batch_controls(bpy.types.Panel):
             text=f"Tessera Enabled: {tessera_enabled} / {total_meshes}",
             icon='CHECKBOX_HLT' if tessera_enabled > 0 else 'CHECKBOX_DEHLT'
         )
+
+        sync_row = stat_box.row(align=True)
+        sync_row.prop(t_scene, "auto_file_checks", text="Auto Check Files (Disk I/O)")
 
         # 2. Enable / Disable All Buttons (Replacing "Batch Tessera Enabled")
         row_btn = layout.row(align=True)
@@ -526,7 +847,7 @@ class TESSERA_PT_tree_view(bpy.types.Panel):
     bl_space_type = 'VIEW_3D'
     bl_region_type = 'UI'
     bl_category = "Tessera"
-    bl_order = 1
+    bl_order = 2
 
     @classmethod
     def poll(cls, context):
@@ -537,12 +858,13 @@ class TESSERA_PT_tree_view(bpy.types.Panel):
         scene = context.scene
         t_scene = getattr(scene, "tessera", None)
 
+        row = layout.row(align=True)
         if t_scene:
-            row = layout.row(align=True)
             row.prop(t_scene, "tree_display_mode", expand=True)
             mode = t_scene.tree_display_mode
         else:
             mode = 'COLLECTIONS'
+        row.operator("tessera.sync_status", text="", icon='FILE_REFRESH')
 
         if mode == 'COLLECTIONS':
             collections = list(scene.collection.children)
@@ -643,7 +965,7 @@ class TESSERA_PT_scene_manager(bpy.types.Panel):
     bl_space_type = 'VIEW_3D'
     bl_region_type = 'UI'
     bl_category = "Tessera"
-    bl_order = 3
+    bl_order = 4
 
     @classmethod
     def poll(cls, context):
@@ -664,8 +986,13 @@ class TESSERA_PT_scene_manager(bpy.types.Panel):
         row.operator("tessera.batch_enable_selected", text="Enable Selected", icon='RESTRICT_SELECT_OFF')
         row.operator("tessera.batch_disable_selected", text="Disable Selected", icon='RESTRICT_SELECT_ON')
 
+        t_scene = getattr(scene, "tessera", None)
+        if t_scene:
+            box.prop(t_scene, "auto_file_checks", text="Auto Check Files")
         box.prop(scene, "tessera_auto_build_missing", text="Auto-Build Missing Caches")
-        box.operator("tessera.batch_build_all", text="Batch Build All Missing .nc2", icon='FILE_CACHE')
+        row_sync = box.row(align=True)
+        row_sync.operator("tessera.sync_status", text="Sync Cache Status", icon='FILE_REFRESH')
+        row_sync.operator("tessera.batch_build_all", text="Batch Build All Missing .nc2", icon='FILE_CACHE')
         prow = box.row(align=True)
         prow.operator("tessera.convert_to_proxy", text="Convert to Proxy (Keep .nc2)", icon='MESH_CUBE')
         prow.operator("tessera.restore_mesh", text="Restore Original Mesh", icon='FILE_REFRESH')
@@ -694,10 +1021,18 @@ class TESSERA_PT_scene_manager(bpy.types.Panel):
 
 classes = (
     TESSERA_PT_batch_controls,
+    TESSERA_PT_telemetry,
     TESSERA_PT_tree_view,
     TESSERA_PT_object,
     TESSERA_PT_scene_manager,
 )
+
+
+@bpy.app.handlers.persistent
+def _on_load_post(dummy):
+    clear_nc2_path_cache()
+    register_refresh_timer()
+    update_hud_state()
 
 
 def register():
@@ -705,10 +1040,14 @@ def register():
     for cls in classes:
         register_class(cls)
     register_refresh_timer()
-    register_hud_handler()
+    update_hud_state()
+    if _on_load_post not in bpy.app.handlers.load_post:
+        bpy.app.handlers.load_post.append(_on_load_post)
 
 
 def unregister():
+    if _on_load_post in bpy.app.handlers.load_post:
+        bpy.app.handlers.load_post.remove(_on_load_post)
     unregister_hud_handler()
     unregister_refresh_timer()
     from bpy.utils import unregister_class

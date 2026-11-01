@@ -31,6 +31,7 @@ from bpy.props import (
     BoolProperty,
     EnumProperty,
     FloatProperty,
+    IntProperty,
     PointerProperty,
     StringProperty,
 )
@@ -241,6 +242,11 @@ def _use_camera_view_update(self, context):
 
 def _show_stats_update(self, context):
     self.id_data["tessera_show_stats"] = int(self.show_stats)
+    try:
+        from tessera.ui import register_refresh_timer
+        register_refresh_timer()
+    except Exception:
+        pass
     _tag_tessera_redraw(self, context)
 
 
@@ -251,16 +257,42 @@ def _log_console_update(self, context):
 
 def _show_fps_panel_update(self, context):
     self.id_data["tessera_show_fps_panel"] = int(self.show_fps_panel)
+    try:
+        from tessera.ui import register_refresh_timer
+        register_refresh_timer()
+    except Exception:
+        pass
     _tag_tessera_redraw(self, context)
 
 
 def _show_fps_hud_update(self, context):
     self.id_data["tessera_show_fps_hud"] = int(self.show_fps_hud)
     try:
-        from tessera.ui import update_hud_state
+        from tessera.ui import update_hud_state, register_refresh_timer
+        register_refresh_timer()
         update_hud_state()
     except Exception:
         pass
+    _tag_tessera_redraw(self, context)
+
+
+def _hud_position_update(self, context):
+    self.id_data["tessera_hud_position"] = self.hud_position
+    _tag_tessera_redraw(self, context)
+
+
+def _hud_margin_y_update(self, context):
+    self.id_data["tessera_hud_margin_y"] = int(self.hud_margin_y)
+    _tag_tessera_redraw(self, context)
+
+
+def _scene_hud_position_update(self, context):
+    self.id_data["tessera_hud_position"] = self.hud_position
+    _tag_tessera_redraw(self, context)
+
+
+def _scene_hud_margin_y_update(self, context):
+    self.id_data["tessera_hud_margin_y"] = int(self.hud_margin_y)
     _tag_tessera_redraw(self, context)
 
 
@@ -434,7 +466,7 @@ class TesseraProperties(bpy.types.PropertyGroup):
     show_stats: BoolProperty(
         name="Show Live Stats",
         description="Display real-time cluster, triangle, and LOD telemetry in the panel",
-        default=True,
+        default=False,
         update=_show_stats_update,
     )
 
@@ -457,6 +489,26 @@ class TesseraProperties(bpy.types.PropertyGroup):
         description="Render a live FPS and frame time overlay directly in the 3D Viewport",
         default=False,
         update=_show_fps_hud_update,
+    )
+
+    hud_position: EnumProperty(
+        name="HUD Position",
+        description="Position of the Viewport HUD overlay",
+        items=[
+            ('TOP', "Top", "Display HUD at the top of the viewport"),
+            ('BOTTOM', "Bottom", "Display HUD at the bottom of the viewport"),
+        ],
+        default='TOP',
+        update=_hud_position_update,
+    )
+
+    hud_margin_y: IntProperty(
+        name="HUD Distance",
+        description="Distance in pixels from the top or bottom viewport border",
+        default=60,
+        min=0,
+        max=1000,
+        update=_hud_margin_y_update,
     )
 
 
@@ -662,6 +714,61 @@ class TesseraSceneSettings(bpy.types.PropertyGroup):
         default='COLLECTIONS',
     )
 
+    auto_file_checks: BoolProperty(
+        name="Auto Check Files",
+        description="Automatically inspect disk for .nc2 cache files on every UI redraw. Keep disabled for best performance in heavy scenes",
+        default=False,
+    )
+
+    # Real-time telemetry toggles for scene
+    show_stats: BoolProperty(
+        name="Show Live Stats",
+        description="Display real-time cluster, triangle, and LOD telemetry in the panel",
+        default=False,
+        update=_show_stats_update,
+    )
+
+    log_console: BoolProperty(
+        name="Log Stats to Console",
+        description="Print real-time draw metrics to the system console",
+        default=False,
+        update=_log_console_update,
+    )
+
+    show_fps_panel: BoolProperty(
+        name="Show FPS in Panel",
+        description="Display frame rate and frame time in the sidebar panel",
+        default=False,
+        update=_show_fps_panel_update,
+    )
+
+    show_fps_hud: BoolProperty(
+        name="Viewport HUD",
+        description="Render a live FPS and frame time overlay directly in the 3D Viewport",
+        default=False,
+        update=_show_fps_hud_update,
+    )
+
+    hud_position: EnumProperty(
+        name="HUD Position",
+        description="Position of the Viewport HUD overlay",
+        items=[
+            ('TOP', "Top", "Display HUD at the top of the viewport"),
+            ('BOTTOM', "Bottom", "Display HUD at the bottom of the viewport"),
+        ],
+        default='TOP',
+        update=_scene_hud_position_update,
+    )
+
+    hud_margin_y: IntProperty(
+        name="HUD Distance",
+        description="Distance in pixels from the top or bottom viewport border",
+        default=60,
+        min=0,
+        max=1000,
+        update=_scene_hud_margin_y_update,
+    )
+
 
 def _budget_update(self, context):
     self["tessera_vram_budget_mb"] = int(self.tessera_vram_budget_mb)
@@ -687,11 +794,38 @@ def register():
     bpy.types.Scene.tessera_auto_build_missing = bpy.props.BoolProperty(
         name="Auto-Build Missing Caches",
         description="Automatically trigger background builds for objects missing .nc2",
-        default=True,
+        default=False,
+    )
+    bpy.types.Scene.tessera_auto_file_checks = bpy.props.BoolProperty(
+        name="Auto Check Files",
+        description="Automatically inspect disk for .nc2 cache files on every UI redraw. Keep disabled for best performance in heavy scenes",
+        default=False,
+    )
+    bpy.types.Scene.tessera_hud_position = bpy.props.EnumProperty(
+        name="HUD Position",
+        description="Position of the Viewport HUD overlay",
+        items=[
+            ('TOP', "Top", "Display HUD at the top of the viewport"),
+            ('BOTTOM', "Bottom", "Display HUD at the bottom of the viewport"),
+        ],
+        default='TOP',
+    )
+    bpy.types.Scene.tessera_hud_margin_y = bpy.props.IntProperty(
+        name="HUD Distance",
+        description="Distance in pixels from the top or bottom viewport border",
+        default=60,
+        min=0,
+        max=1000,
     )
 
 
 def unregister():
+    if hasattr(bpy.types.Scene, "tessera_hud_margin_y"):
+        del bpy.types.Scene.tessera_hud_margin_y
+    if hasattr(bpy.types.Scene, "tessera_hud_position"):
+        del bpy.types.Scene.tessera_hud_position
+    if hasattr(bpy.types.Scene, "tessera_auto_file_checks"):
+        del bpy.types.Scene.tessera_auto_file_checks
     if hasattr(bpy.types.Scene, "tessera_auto_build_missing"):
         del bpy.types.Scene.tessera_auto_build_missing
     if hasattr(bpy.types.Scene, "tessera_vram_budget_mb"):
