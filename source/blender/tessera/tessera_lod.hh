@@ -80,6 +80,7 @@ FrustumIntersection box_in_frustum(const float planes[6][4],
 struct InstanceBVHNode {
     float3 bmin = float3(0.0f);
     float3 bmax = float3(0.0f);
+    float max_instance_radius = 0.0f;
     int32_t left_child = -1;   // -1 indicates leaf
     int32_t right_child = -1;  // -1 indicates leaf
     uint32_t instance_start = 0;
@@ -120,7 +121,9 @@ public:
               float mesh_radius,
               float culling_margin,
               std::vector<float4x4> &out_visible,
-              float max_draw_distance = 0.0f) const;
+              float max_draw_distance = 0.0f,
+              float min_screen_radius_px = 0.0f,
+              float px_scale = 1.0f) const;
 };
 
 /**

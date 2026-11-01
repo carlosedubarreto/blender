@@ -113,6 +113,8 @@
 
 namespace blender {
 
+extern bool DRW_workbench_tessera_instances_cached();
+
 thread_local DRWContext *DRWContext::g_context = nullptr;
 
 DRWContext::DRWContext(Mode mode_,
@@ -1567,19 +1569,27 @@ static void drw_draw_render_loop_3d(DRWContext &draw_ctx, RenderEngineType *engi
     if (!BKE_object_is_visible_in_viewport(v3d, &ob)) {
       return DrawFilter::Skip;
     }
-    if (has_duplis && !depsgraph_dirty && is_workbench) {
+    if (has_duplis) {
       const bool is_selected = (ob.base_flag & BASE_SELECTED) != 0;
-      const bool is_wire = (v3d->shading.type == OB_WIRE);
-      if (!is_selected && !is_wire) {
-        const IDProperty *tess_prop = (ob.id.properties != nullptr) ?
-            IDP_GetPropertyFromGroup(ob.id.properties, "tessera_enabled") :
-            nullptr;
-        const bool tess_enabled = (tess_prop == nullptr) ?
-                                      true :
-                                      ((tess_prop->type == IDP_INT) ?
-                                           (IDP_int_get(tess_prop) != 0) :
-                                           (tess_prop->data.val != 0));
-        if (tess_enabled) {
+      if (!is_selected && blender::DRW_workbench_tessera_instances_cached()) {
+        bool is_tess_instancer = false;
+        if (ob.id.properties != nullptr) {
+          if (IDP_GetPropertyFromGroup(ob.id.properties, "tessera_nc2") != nullptr ||
+              IDP_GetPropertyFromGroup(ob.id.properties, "tessera_nc2_path") != nullptr) {
+            is_tess_instancer = true;
+          }
+          else if (const IDProperty *tprop = IDP_GetPropertyFromGroup(ob.id.properties, "tessera_enabled")) {
+            is_tess_instancer = (tprop->type == IDP_INT) ? (IDP_int_get(tprop) != 0) : (tprop->data.val != 0);
+          }
+        }
+        if (!is_tess_instancer && draw_ctx.scene != nullptr && draw_ctx.scene->id.properties != nullptr) {
+          if (IDP_GetPropertyFromGroup(draw_ctx.scene->id.properties, "scatterflow_anno_enabled") != nullptr ||
+              IDP_GetPropertyFromGroup(draw_ctx.scene->id.properties, "scatterflow_nano") != nullptr ||
+              IDP_GetPropertyFromGroup(draw_ctx.scene->id.properties, "use_scatterflow_nano") != nullptr) {
+            is_tess_instancer = true;
+          }
+        }
+        if (is_tess_instancer) {
           return DrawFilter::DrawSkipDuplis;
         }
       }
@@ -1606,6 +1616,8 @@ static void drw_draw_render_loop_3d(DRWContext &draw_ctx, RenderEngineType *engi
   drw_callbacks_pre_scene(draw_ctx);
   draw_ctx.engines_draw_scene();
   drw_callbacks_post_scene(draw_ctx);
+
+
 
   if (WM_draw_region_get_bound_viewport(draw_ctx.region)) {
     /* Don't unbind the frame-buffer yet in this case and let
@@ -1688,6 +1700,8 @@ void DRW_draw_view(const bContext *C)
     v3d->runtime.last_submission_time = draw_ctx.last_submission_time();
   }
   draw_ctx.release_data();
+
+
 }
 
 void DRW_draw_render_loop_offscreen(Depsgraph *depsgraph,

@@ -212,18 +212,36 @@ def unregister_refresh_timer():
         bpy.app.timers.unregister(_tessera_sidebar_refresh_timer)
 
 
+_nc2_path_cache = {}
+
+
+def clear_nc2_path_cache():
+    """Clear in-memory NC2 path cache."""
+    _nc2_path_cache.clear()
+
+
 def get_existing_nc2_path(ob):
     """Detect whether a valid compiled Tessera .nc2 binary already exists on disk."""
     if ob is None:
         return None
+
+    cached = _nc2_path_cache.get(ob.name)
+    if cached is not None:
+        return cached if cached else None
+
+    # Check object properties first (fastest)
+    prop_path = ob.get("tessera_nc2", "") or ob.get("tessera_nc2_path", "")
+    if prop_path:
+        abs_p = bpy.path.abspath(prop_path)
+        if os.path.isfile(abs_p) and os.path.getsize(abs_p) > 88:
+            _nc2_path_cache[ob.name] = abs_p
+            return abs_p
 
     blend_dir = bpy.path.abspath("//")
     mesh = getattr(ob, "data", None)
     mesh_name = mesh.name if mesh else ""
 
     candidates = [
-        ob.get("tessera_nc2", ""),
-        ob.get("tessera_nc2_path", ""),
         os.path.join(blend_dir, f"{ob.name}.nc2"),
         os.path.join(blend_dir, f"{mesh_name}.nc2") if mesh_name else "",
         os.path.join(blend_dir, f"{ob.name.replace('.', '_')}.nc2"),
@@ -232,12 +250,15 @@ def get_existing_nc2_path(ob):
         os.path.join(os.getcwd(), f"{mesh_name}.nc2") if mesh_name else "",
     ]
 
-    for path in candidates:
-        if not path:
+    for c in candidates:
+        if not c:
             continue
-        abs_p = bpy.path.abspath(path)
+        abs_p = bpy.path.abspath(c)
         if os.path.isfile(abs_p) and os.path.getsize(abs_p) > 88:
+            _nc2_path_cache[ob.name] = abs_p
             return abs_p
+
+    _nc2_path_cache[ob.name] = ""
     return None
 
 

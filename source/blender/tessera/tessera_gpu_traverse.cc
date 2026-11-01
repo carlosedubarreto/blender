@@ -128,8 +128,12 @@ void main()
    * error_scale converts the reference archetype units to world space.
    * dist_world represents the real metric distance in world space. */
   float safe_error_scale = max(error_scale, 1e-6);
-  float err_c = errs.x * safe_error_scale;
-  float err_p = (errs.y >= 3.0e38) ? errs.y : (errs.y * safe_error_scale);
+  /* Clamp simplification error to physical bounding sphere diameter to prevent
+   * synthetic builder penalties (QEM edge penalties > 1000) from locking clusters to LOD 0. */
+  float bound_dia_c = max(radius * 2.0 * safe_error_scale, 0.001);
+  float bound_dia_p = max(parent_sphere.w * 2.0 * safe_error_scale, 0.001);
+  float err_c = min(errs.x * safe_error_scale, bound_dia_c);
+  float err_p = (errs.y >= 3.0e38) ? errs.y : min(errs.y * safe_error_scale, bound_dia_p);
 
   const float near_clip = 0.01;
   float dist_c = max(distance(camera_pos, center) - radius, near_clip);
@@ -144,10 +148,18 @@ void main()
     tau_effective = pixel_error * (1.0 + min(d_rel * d_rel, 100.0) * lod_intensity);
   }
 
-  /* Far-band coarse LOD clamping for scattered clutter/foliage (finalize_multiplier > 1):
-   * Beyond 30m, prevent fine leaf clusters (meta.z < 3) when a coarser parent exists. */
-  if (finalize_multiplier > 1 && dist_world > 30.0 && meta.z < 3u && meta.w != 0xFFFFFFFFu) {
-    return;
+  /* Progressive coarse LOD clamping for scattered clutter/foliage (finalize_multiplier > 1):
+   * Distant foliage clamps to parent levels to eliminate micro-polygon explosion. */
+  if (finalize_multiplier > 1 && meta.w != 0xFFFFFFFFu) {
+    if (dist_world > 5.0 && meta.z == 0u) {
+      return;
+    }
+    if (dist_world > 9.0 && meta.z <= 1u) {
+      return;
+    }
+    if (dist_world > 14.0 && meta.z <= 2u) {
+      return;
+    }
   }
 
   /* Early out: if cluster error exceeds tau_effective, cluster is too coarse */
@@ -167,10 +179,16 @@ void main()
   /* Progressive card thinning for scattered foliage/clutter:
    * Multi-cluster meshes (cluster_count > 500, e.g. Galetta Grass) under scattering
    * thin out distant clusters to control micro-polygon overdraw while preserving silhouette. */
-  if (finalize_multiplier > 1 && cluster_count > 500 && dist_world > 18.0) {
-    uint thin_stride = (dist_world > 28.0) ? 8u : ((dist_world > 22.0) ? 4u : 2u);
-    if ((ci & (thin_stride - 1u)) != 0u) {
-      return;
+  if (finalize_multiplier > 1 && cluster_count > 500) {
+    if (dist_world > 14.0) {
+      if ((ci & 3u) != 0u) {
+        return;
+      }
+    }
+    else if (dist_world > 8.0) {
+      if ((ci & 1u) != 0u) {
+        return;
+      }
     }
   }
 

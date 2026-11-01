@@ -101,18 +101,24 @@ void traverseCluster(const TraversalContext &ctx, uint32_t ci)
     const auto &children = (*ctx.children)[ci];
     const bool has_children = !children.empty();
 
-    const float cluster_screen_err = (cluster.error <= 0.0f)
+    const float bound_dia_c = std::max(cluster.sphere[3] * 2.0f * ctx.error_scale, 0.001f);
+    const float bound_dia_p = std::max(cluster.parentSphere[3] * 2.0f * ctx.error_scale, 0.001f);
+    const float clean_err = std::min(cluster.error * ctx.error_scale, bound_dia_c);
+    const float cluster_screen_err = (clean_err <= 0.0f)
         ? 0.0f
-        : projectedErrorPx(center, cluster.sphere[3], cluster.error * ctx.error_scale,
+        : projectedErrorPx(center, cluster.sphere[3], clean_err,
                            ctx.camPos, ctx.viewportHeight,
                            ctx.projScaleY, ctx.orthographic);
 
     const float3 pcenter(cluster.parentSphere[0], cluster.parentSphere[1], cluster.parentSphere[2]);
+    const float clean_perr = (cluster.parentError >= 1e38f)
+        ? std::numeric_limits<float>::max()
+        : std::min(cluster.parentError * ctx.error_scale, bound_dia_p);
     const float parent_screen_err =
         (cluster.parentError >= 1e38f)
             ? std::numeric_limits<float>::max()
             : projectedErrorPx(pcenter, cluster.parentSphere[3],
-                               cluster.parentError * ctx.error_scale,
+                               clean_perr,
                                ctx.camPos, ctx.viewportHeight,
                                ctx.projScaleY, ctx.orthographic);
 
@@ -239,6 +245,7 @@ void InstanceBVH::build(const std::vector<float4x4> &instance_mats,
 
         float3 bmin(std::numeric_limits<float>::max());
         float3 bmax(std::numeric_limits<float>::lowest());
+        float max_inst_r = 0.0f;
         for (uint32_t i = task.start; i < task.start + task.count; ++i) {
             const TempInst &inst = inst_data[instance_indices[i]];
             bmin.x = std::min(bmin.x, inst.center.x - inst.radius);
@@ -247,9 +254,11 @@ void InstanceBVH::build(const std::vector<float4x4> &instance_mats,
             bmax.x = std::max(bmax.x, inst.center.x + inst.radius);
             bmax.y = std::max(bmax.y, inst.center.y + inst.radius);
             bmax.z = std::max(bmax.z, inst.center.z + inst.radius);
+            max_inst_r = std::max(max_inst_r, inst.radius);
         }
         nodes[task.node_idx].bmin = bmin;
         nodes[task.node_idx].bmax = bmax;
+        nodes[task.node_idx].max_instance_radius = max_inst_r;
         nodes[task.node_idx].instance_start = task.start;
         nodes[task.node_idx].instance_count = task.count;
 
@@ -325,7 +334,9 @@ void InstanceBVH::cull(const TesseraViewInfo &view_info,
                        float mesh_radius,
                        float culling_margin,
                        std::vector<float4x4> &out_visible,
-                       float max_draw_dist) const
+                       float max_draw_dist,
+                       float min_screen_radius_px,
+                       float px_scale) const
 {
     out_visible.clear();
     const size_t N = instance_mats.size();
@@ -340,8 +351,20 @@ void InstanceBVH::cull(const TesseraViewInfo &view_info,
         out_visible.reserve(N);
         for (const float4x4 &mat : instance_mats) {
             const float3 c = (mat * float4(mesh_center, 1.0f)).xyz();
-            if (max_dist_sq > 0.0f && math::distance_squared(c, cam_pos) > max_dist_sq) {
+            const float d_sq = math::distance_squared(c, cam_pos);
+            if (max_dist_sq > 0.0f && d_sq > max_dist_sq) {
                 continue;
+            }
+            if (min_screen_radius_px > 0.0f && px_scale > 0.0f && mesh_radius > 0.0f) {
+                const float d = std::sqrt(std::max(0.0f, d_sq));
+                const float inst_scale = std::max(
+                    math::length(mat[0].xyz()),
+                    std::max(math::length(mat[1].xyz()), math::length(mat[2].xyz())));
+                const float world_radius = mesh_radius * inst_scale;
+                const float screen_radius_px = (world_radius * px_scale) / std::max(d, 0.01f);
+                if (screen_radius_px < min_screen_radius_px) {
+                    continue;
+                }
             }
             if (instance_in_frustum(view_info, mat, mesh_center, mesh_radius, culling_margin)) {
                 out_visible.push_back(mat);
@@ -358,8 +381,19 @@ void InstanceBVH::cull(const TesseraViewInfo &view_info,
         const uint32_t node_idx = stack[--stack_top];
         const InstanceBVHNode &node = nodes[node_idx];
 
-        if (max_dist_sq > 0.0f && aabb_min_dist_sq(cam_pos, node.bmin, node.bmax) > max_dist_sq) {
+        const float min_d_sq = aabb_min_dist_sq(cam_pos, node.bmin, node.bmax);
+        if (max_dist_sq > 0.0f && min_d_sq > max_dist_sq) {
             continue;
+        }
+
+        /* Sub-pixel subtree culling: if the largest instance in this subtree projects to less than
+         * min_screen_radius_px at the closest point of the node AABB, discard ALL descendant
+         * instances in O(1). */
+        if (min_screen_radius_px > 0.0f && px_scale > 0.0f && node.max_instance_radius > 0.0f) {
+            const float r_scaled = node.max_instance_radius * px_scale;
+            if ((r_scaled * r_scaled) < (min_screen_radius_px * min_screen_radius_px) * std::max(min_d_sq, 0.0001f)) {
+                continue;
+            }
         }
 
         const FrustumIntersection isect = box_in_frustum(
@@ -372,7 +406,7 @@ void InstanceBVH::cull(const TesseraViewInfo &view_info,
         const bool all_within_dist = (max_dist_sq <= 0.0f) ||
                                      (aabb_max_dist_sq(cam_pos, node.bmin, node.bmax) <= max_dist_sq);
 
-        if (isect == FrustumIntersection::INSIDE && all_within_dist) {
+        if (isect == FrustumIntersection::INSIDE && all_within_dist && min_screen_radius_px <= 0.0f) {
             /* Bulk acceptance: all descendant instances are inside with zero further tests! */
             const uint32_t end = node.instance_start + node.instance_count;
             for (uint32_t i = node.instance_start; i < end; ++i) {
@@ -388,8 +422,19 @@ void InstanceBVH::cull(const TesseraViewInfo &view_info,
                 const uint32_t inst_idx = instance_indices[i];
                 const float4x4 &mat = instance_mats[inst_idx];
                 const float3 c = (mat * float4(mesh_center, 1.0f)).xyz();
-                if (max_dist_sq > 0.0f && math::distance_squared(c, cam_pos) > max_dist_sq) {
+                const float d_sq = math::distance_squared(c, cam_pos);
+                if (max_dist_sq > 0.0f && d_sq > max_dist_sq) {
                     continue;
+                }
+                if (min_screen_radius_px > 0.0f && px_scale > 0.0f && mesh_radius > 0.0f) {
+                    const float inst_scale_sq = std::max(
+                        math::length_squared(mat[0].xyz()),
+                        std::max(math::length_squared(mat[1].xyz()), math::length_squared(mat[2].xyz())));
+                    const float r_sq = (mesh_radius * mesh_radius) * inst_scale_sq;
+                    const float r_scaled_sq = r_sq * (px_scale * px_scale);
+                    if (r_scaled_sq < (min_screen_radius_px * min_screen_radius_px) * std::max(d_sq, 0.0001f)) {
+                        continue;
+                    }
                 }
                 if (isect == FrustumIntersection::INSIDE ||
                     instance_in_frustum(view_info, mat, mesh_center, mesh_radius, culling_margin))
@@ -693,17 +738,23 @@ std::size_t selectClustersFlat(const TesseraData &data,
          *   projectedError(cluster) <= tau  AND  projectedError(parent) > tau
          */
         const float scale = params.errorScale > 0.0f ? params.errorScale : 1.0f;
-        const float err_c = (cluster.error <= 0.0f)
+        const float pradius = cluster.parentSphere[3];
+        const float bound_dia_c = std::max(radius * 2.0f * scale, 0.001f);
+        const float bound_dia_p = std::max(pradius * 2.0f * scale, 0.001f);
+        const float clean_err = std::min(cluster.error * scale, bound_dia_c);
+        const float err_c = (clean_err <= 0.0f)
             ? 0.0f
-            : projectedErrorPx(center, radius, cluster.error * scale,
+            : projectedErrorPx(center, radius, clean_err,
                                lod_view.camPos, viewportHeight, lod_view.projScaleY,
                                lod_view.orthographic);
 
         const float3 pcenter(cluster.parentSphere[0], cluster.parentSphere[1], cluster.parentSphere[2]);
-        const float pradius = cluster.parentSphere[3];
+        const float clean_perr = (cluster.parentError >= 1e38f)
+            ? std::numeric_limits<float>::max()
+            : std::min(cluster.parentError * scale, bound_dia_p);
         const float err_p = (cluster.parentError >= 1e38f)
             ? std::numeric_limits<float>::max()
-            : projectedErrorPx(pcenter, pradius, cluster.parentError * scale,
+            : projectedErrorPx(pcenter, pradius, clean_perr,
                                lod_view.camPos, viewportHeight, lod_view.projScaleY,
                                lod_view.orthographic);
 
@@ -712,15 +763,15 @@ std::size_t selectClustersFlat(const TesseraData &data,
         const float d_norm = dist_c / safe_lod_dist;
         const float tau_effective = params.pixelError * (1.0f + std::min(d_norm * d_norm * d_norm, 500.0f) * params.lodIntensity);
 
-        /* Mid/Far distance cluster level clamping: for clusters beyond 15/22/28 meters,
+        /* Mid/Far distance cluster level clamping: for clusters beyond 5/9/14 meters,
          * prevent selection of fine Level 0..2 clusters when a coarser parent exists. */
-        if (dist_c > 15.0f && cluster.level <= 1 && cluster.parentGroup != -1) {
+        if (dist_c > 5.0f && cluster.level == 0 && cluster.parentGroup != -1) {
             continue;
         }
-        if (dist_c > 22.0f && cluster.level <= 2 && cluster.parentGroup != -1) {
+        if (dist_c > 9.0f && cluster.level <= 1 && cluster.parentGroup != -1) {
             continue;
         }
-        if (dist_c > 28.0f && cluster.level <= 3 && cluster.parentGroup != -1) {
+        if (dist_c > 14.0f && cluster.level <= 2 && cluster.parentGroup != -1) {
             continue;
         }
 

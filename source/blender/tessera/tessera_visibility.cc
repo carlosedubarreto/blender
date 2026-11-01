@@ -874,9 +874,9 @@ void main()
    * color texture alpha channel; reject transparent texel borders so foliage
    * renders as solid, fully-shaped leaves instead of rectangular quads or
    * faint outlines.
-   * Gated to < 28m: beyond 28m, distant cards are treated as opaque, enabling
+   * Gated to < 20m: beyond 20m, distant cards are treated as opaque, enabling
    * full-rate hardware Early-Z to eliminate quad-overdraw. */
-  if (has_alpha_mask != 0 && distance(camera_pos, v_world_pos) < 28.0) {
+  if (has_alpha_mask != 0 && distance(camera_pos, v_world_pos) < 20.0) {
     float slot_has_d = (v_mat == 0u) ? has_tex_flags.x :
                        (v_mat == 1u) ? has_tex_flags.y :
                        (v_mat == 2u) ? has_tex_flags.z : has_tex_flags.w;
