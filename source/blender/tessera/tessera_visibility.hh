@@ -172,6 +172,37 @@ class TesseraVisibilityPass
                                   const float4 &base_color = float4(0.8f, 0.8f, 0.8f, 1.0f),
                                   gpu::StorageBuf *counter_buf = nullptr);
 
+    /**
+     * Direct instanced G-Buffer MRT rasterization for scattered fields in
+     * EEVEE Next (Material Preview & Render View). Draws all visible clusters
+     * across all instances directly into EEVEE's G-Buffer framebuffer in one
+     * indirect multi-draw call, eliminating fullscreen visibility passes.
+     */
+    void render_gbuffer_instances(gpu::StorageBuf *command_buf,
+                                  size_t draw_count,
+                                  const float4x4 *instance_mats,
+                                  size_t instance_count,
+                                  const float4x4 &viewProj,
+                                  const float3 &cam_pos,
+                                  int viewport_width,
+                                  int viewport_height,
+                                  gpu::StorageBuf *counter_buf = nullptr);
+
+    /**
+     * Direct instanced Reverse-Z depth prepass rasterization for scattered
+     * instance fields in EEVEE Next. Writes depth for all visible clusters
+     * across instances directly into EEVEE's prepass framebuffer with alpha cutout.
+     */
+    void render_depth_instances(gpu::StorageBuf *command_buf,
+                                size_t draw_count,
+                                const float4x4 *instance_mats,
+                                size_t instance_count,
+                                const float4x4 &viewProj,
+                                const float3 &cam_pos,
+                                int viewport_width,
+                                int viewport_height,
+                                gpu::StorageBuf *counter_buf = nullptr);
+
     void set_material_textures(const std::vector<TesseraMaterialTextures> &materials)
     {
         mMaterials = materials;
@@ -244,8 +275,11 @@ class TesseraVisibilityPass
     gpu::Shader *mVisShader = nullptr;
     gpu::Shader *mMaterialShader = nullptr;
     gpu::Shader *mDepthPrepassShader = nullptr;
+    gpu::Shader *mDepthPrepassAlphaShader = nullptr;
     gpu::Shader *mGbufferShader = nullptr;
     gpu::Shader *mForwardShader = nullptr;
+    gpu::Shader *mForwardGbufferShader = nullptr;
+    gpu::Shader *mForwardDepthShader = nullptr;
 
     // Visibility targets.
     gpu::Texture *mVisTexture = nullptr;

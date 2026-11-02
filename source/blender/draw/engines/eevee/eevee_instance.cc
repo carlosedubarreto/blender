@@ -236,6 +236,18 @@ void Instance::init(const int2 &output_res,
   volume.init();
   lookdev.init(&lookdev_rect);
 
+  const uint64_t current_depsgraph_update = depsgraph ? DEG_get_update_count(depsgraph) : 0;
+  if (current_depsgraph_update != depsgraph_last_update_ || !tessera.has_valid_cache()) {
+    tessera.instances_cache_invalidate();
+  }
+  if (is_viewport()) {
+    static int s_last_shading_type = -1;
+    if (v3d && v3d->shading.type != s_last_shading_type) {
+      s_last_shading_type = v3d->shading.type;
+      tessera.instances_cache_invalidate();
+    }
+  }
+
   /* Request static shaders */
   ShaderGroups shader_request = DEFERRED_LIGHTING_SHADERS | SHADOW_SHADERS | FILM_SHADERS |
                                 HIZ_SHADERS | SPHERE_PROBE_SHADERS | VOLUME_PROBE_SHADERS |
@@ -392,13 +404,26 @@ void Instance::begin_sync()
   }
 }
 
-void Instance::object_sync(ObjectRef &ob_ref, Manager & /*manager*/)
+void Instance::object_sync(ObjectRef &ob_ref, Manager &manager)
 {
   if (skip_render_) {
     return;
   }
 
   Object *ob = ob_ref.object;
+  if (!DRW_object_is_renderable(ob)) {
+    return;
+  }
+
+  if (tessera.is_enabled(scene, ob)) {
+    if (!tessera.instances_cached()) {
+      tessera.record(ob_ref);
+    }
+    ObjectHandle ob_handle = sync.sync_object(ob_ref, manager.unique_handle(ob_ref));
+    shadows.sync_object(ob_handle, false, false, false);
+    return;
+  }
+
   const bool is_renderable_type = ELEM(ob->type,
                                        OB_CURVES,
                                        OB_GREASE_PENCIL,
@@ -480,6 +505,7 @@ void Instance::end_sync()
   subsurface.end_sync();
   film.end_sync();
   cryptomatte.end_sync();
+  tessera.end_sync();
   pipelines.end_sync();
   light_probes.end_sync();
   sphere_probes.end_sync();

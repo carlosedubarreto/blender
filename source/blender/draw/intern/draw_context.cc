@@ -114,6 +114,12 @@
 namespace blender {
 
 extern bool DRW_workbench_tessera_instances_cached();
+extern void DRW_workbench_tessera_instances_cache_invalidate();
+
+namespace eevee {
+extern bool DRW_eevee_tessera_instances_cached();
+extern void DRW_eevee_tessera_instances_cache_invalidate();
+}
 
 thread_local DRWContext *DRWContext::g_context = nullptr;
 
@@ -1555,6 +1561,14 @@ static void drw_draw_render_loop_3d(DRWContext &draw_ctx, RenderEngineType *engi
                                 gpencil_engine_needed;
 
   const bool is_workbench = (engine_type == &DRW_engine_viewport_workbench_type);
+  const bool is_eevee = (engine_type == &DRW_engine_viewport_eevee_type);
+  static const RenderEngineType *s_last_engine_type = nullptr;
+  const bool engine_changed = (engine_type != s_last_engine_type);
+  if (engine_changed) {
+    s_last_engine_type = engine_type;
+    blender::DRW_workbench_tessera_instances_cache_invalidate();
+    blender::eevee::DRW_eevee_tessera_instances_cache_invalidate();
+  }
   static const Depsgraph *s_last_depsgraph = nullptr;
   static uint64_t s_last_depsgraph_update = 0;
   const uint64_t current_depsgraph_update = depsgraph ? DEG_get_update_count(depsgraph) : 0;
@@ -1563,6 +1577,8 @@ static void drw_draw_render_loop_3d(DRWContext &draw_ctx, RenderEngineType *engi
   if (depsgraph_dirty) {
     s_last_depsgraph = depsgraph;
     s_last_depsgraph_update = current_depsgraph_update;
+    blender::DRW_workbench_tessera_instances_cache_invalidate();
+    blender::eevee::DRW_eevee_tessera_instances_cache_invalidate();
   }
 
   auto should_draw_object = [&](Object &ob, bool has_duplis) -> DrawFilter {
@@ -1571,7 +1587,9 @@ static void drw_draw_render_loop_3d(DRWContext &draw_ctx, RenderEngineType *engi
     }
     if (has_duplis) {
       const bool is_selected = (ob.base_flag & BASE_SELECTED) != 0;
-      if (!is_selected && blender::DRW_workbench_tessera_instances_cached()) {
+      const bool instances_cached = (is_workbench && blender::DRW_workbench_tessera_instances_cached()) ||
+                                    (is_eevee && blender::eevee::DRW_eevee_tessera_instances_cached());
+      if (!is_selected && instances_cached) {
         bool is_tess_instancer = false;
         if (ob.id.properties != nullptr) {
           if (IDP_GetPropertyFromGroup(ob.id.properties, "tessera_nc2") != nullptr ||

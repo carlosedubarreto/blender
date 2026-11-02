@@ -80,6 +80,11 @@ bool DRW_workbench_tessera_instances_cached()
   return g_workbench_tessera_instances_cached;
 }
 
+void DRW_workbench_tessera_instances_cache_invalidate()
+{
+  g_workbench_tessera_instances_cached = false;
+}
+
 namespace workbench {
 
 using namespace draw;
@@ -313,7 +318,16 @@ class Instance : public DrawEngine {
     }
     if (scene != nullptr) {
       if (const IDProperty *sprop = tessera_scene_property_find_safe(scene, "tessera_enabled")) {
-        return (sprop->type == IDP_INT) ? (IDP_int_get(sprop) != 0) : (sprop->data.val != 0);
+        const bool sen = (sprop->type == IDP_INT) ? (IDP_int_get(sprop) != 0) : (sprop->data.val != 0);
+        if (!sen) {
+          return false;
+        }
+      }
+      if (const IDProperty *sprop = tessera_scene_property_find_safe(scene, "tessera_batch_enabled")) {
+        const bool sben = (sprop->type == IDP_INT) ? (IDP_int_get(sprop) != 0) : (sprop->data.val != 0);
+        if (!sben) {
+          return false;
+        }
       }
       if (const IDProperty *sprop = tessera_scene_property_find_safe(scene, "scatterflow_anno_enabled")) {
         if ((sprop->type == IDP_INT && IDP_int_get(sprop) != 0) || sprop->data.val != 0) {
@@ -331,20 +345,12 @@ class Instance : public DrawEngine {
         }
       }
     }
-    /* If the object has a valid .nc2 asset path, activate Tessera automatically so
-     * scenes loaded with baked tessera_enabled=0 still get full Tessera acceleration. */
-    std::string path;
-    if (tessera_path_get(ob, path) && !path.empty()) {
-      return true;
-    }
     const IDProperty *prop = tessera_property_find_safe(ob, "tessera_enabled");
-    if (prop == nullptr) {
-      return true;
+    if (prop != nullptr) {
+      return (prop->type == IDP_INT) ? (IDP_int_get(prop) != 0) : (prop->data.val != 0);
     }
-    if (prop->type == IDP_INT) {
-      return IDP_int_get(prop) != 0;
-    }
-    return prop->data.val != 0;
+    std::string path;
+    return tessera_path_get(ob, path) && !path.empty();
   }
 
   static bool tessera_is_enabled(const Scene *scene, Object *ob)
@@ -1605,11 +1611,10 @@ class Instance : public DrawEngine {
       const bool has_explicit_cull_cam = (tessera_property_find_safe(ob, "tessera_cull_camera") !=
                                           nullptr) ||
                                          (arch_ob != nullptr && tessera_property_find_safe(arch_ob, "tessera_cull_camera") != nullptr);
-      const bool is_cam_view = in_user_perspective ?
-                                   has_explicit_cull_cam :
-                                   ((state.view_source != 0) ||
-                                    (this->draw_ctx != nullptr && this->draw_ctx->rv3d != nullptr &&
-                                     this->draw_ctx->rv3d->persp == RV3D_CAMOB));
+      const bool is_cam_view = (state.view_source != 0) ||
+                               has_explicit_cull_cam ||
+                               (!in_user_perspective && (this->draw_ctx != nullptr && this->draw_ctx->rv3d != nullptr &&
+                                this->draw_ctx->rv3d->persp == RV3D_CAMOB));
       bool has_cam_lod = false;
       if (is_cam_view) {
         if (tessera_camera_persmat(

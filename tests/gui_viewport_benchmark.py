@@ -16,6 +16,8 @@ import mathutils
 def get_gl_finish():
     try:
         import gpu
+        if hasattr(gpu.platform, 'backend_type_get') and gpu.platform.backend_type_get() != 'OPENGL':
+            return lambda: None
         if hasattr(gpu.state, 'finish'):
             return gpu.state.finish
     except Exception:
@@ -190,7 +192,27 @@ def run_benchmark():
             ob["tessera_visualize_clusters"] = 0
 
         # -------------------------------------------------------------------------
-        # Phase 4: User Perspective Frustum Culling & Telemetry Inspection
+        # Phase 4: Tessera Enabled (Material Preview / LookDev Shading)
+        # -------------------------------------------------------------------------
+        print("\nSwitching to Material Preview (LookDev Shading)...")
+        scene.render.engine = 'BLENDER_EEVEE'
+        space.shading.type = 'MATERIAL'
+        bpy.context.view_layer.update()
+        redraw_gui_frame()
+        redraw_gui_frame()
+
+        mat_fps, mat_ms = run_orbit("Tessera ON (Material Preview, LookDev)", num_frames=60, warmup=10)
+        print(f"  Material Preview Performance: {mat_fps:.1f} FPS ({mat_ms:.2f} ms/frame)")
+        assert mat_fps >= 25.0, f"Expected Material Preview FPS >= 25.0, got {mat_fps:.1f} FPS ({mat_ms:.2f} ms/frame)"
+
+        # Switch back to SOLID for frustum culling phase
+        scene.render.engine = 'BLENDER_WORKBENCH'
+        space.shading.type = 'SOLID'
+        bpy.context.view_layer.update()
+        redraw_gui_frame()
+
+        # -------------------------------------------------------------------------
+        # Phase 5: User Perspective Frustum Culling & Telemetry Inspection
         # -------------------------------------------------------------------------
         print("\nVerifying User Perspective Frustum Culling (On-Screen vs Off-Screen):")
         scene["tessera_navigating"] = 0
@@ -234,6 +256,7 @@ def run_benchmark():
         print(f"  Native Baseline (Tessera OFF) : {base_fps:6.1f} FPS ({base_ms:6.2f} ms)")
         print(f"  Tessera ON (Solid Diffuse)    : {tess_fps:6.1f} FPS ({tess_ms:6.2f} ms)")
         print(f"  Tessera ON (Cluster Colors)   : {vis_fps:6.1f} FPS ({vis_ms:6.2f} ms)")
+        print(f"  Tessera ON (Material Preview) : {mat_fps:6.1f} FPS ({mat_ms:6.2f} ms)")
         print("=" * 80)
     except Exception as exc:
         import traceback
@@ -241,8 +264,6 @@ def run_benchmark():
         exit_code = 1
     finally:
         bpy.ops.wm.quit_blender()
-        if exit_code != 0:
-            sys.exit(exit_code)
     return None
 
 

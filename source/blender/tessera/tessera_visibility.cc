@@ -1010,6 +1010,411 @@ gpu::Shader *createForwardShader()
     return GPU_shader_create_from_info_python(raw);
 }
 
+
+static const char *FORWARD_GBUFFER_VERT_SOURCE = R"(
+void main()
+{
+  uint bucket_idx = uint(gpu_BaseInstance);
+  uint flat_id = uint(gpu_InstanceIndex) - bucket_idx;
+  uint count_b = forward_args[76 + bucket_idx];
+  uint region_base = bucket_idx * uint(cluster_count);
+  uint obj_index = 0u;
+  uint slot_idx = flat_id;
+  if (instance_count > 0 && count_b > 0u) {
+    obj_index = flat_id / count_b;
+    slot_idx = flat_id - obj_index * count_b;
+  }
+  uint cluster_idx = visible_clusters[region_base + slot_idx];
+  uvec4 meta = cluster_meta[cluster_idx];
+  uint local_vid = in_vid;
+  if (local_vid >= meta.y) {
+    gl_Position = vec4(2.0, 2.0, 2.0, 0.0);
+    v_world_pos = vec3(0.0);
+    v_world_normal = vec3(0.0, 0.0, 1.0);
+    v_uv = vec2(0.0);
+    v_mat = 0u;
+    v_cluster_id = 0u;
+    return;
+  }
+
+  uint v_idx = tri_indices[meta.x + local_vid];
+  vec4 v0 = packed_verts[v_idx * 2u + 0u];
+  vec4 v1 = packed_verts[v_idx * 2u + 1u];
+  vec3 pos = v0.xyz;
+  vec3 nor = vec3(v0.w, v1.xy);
+
+  vec4 world_pos;
+  mat3 norm_mat;
+  if (instance_count > 0) {
+    mat4 model = instance_mats[obj_index];
+    world_pos = model * vec4(pos, 1.0);
+    norm_mat = mat3(model);
+    gl_Position = view_proj * world_pos;
+
+    /* Distance LOD is handled continuously by hierarchical DAG traversal */
+  }
+  else {
+    world_pos = model_mat * vec4(pos, 1.0);
+    gl_Position = view_proj * world_pos;
+    norm_mat = normal_mat;
+  }
+
+  vec3 n = norm_mat * nor;
+  float len_n = length(n);
+  v_world_normal = (len_n > 1e-6) ? (n / len_n) : nor;
+  v_world_pos = world_pos.xyz;
+  v_cluster_id = cluster_idx;
+  v_uv = v1.zw;
+  uint mat_idx = meta.w;
+  if (mat_idx >= 4u) {
+    mat_idx = 0u;
+  }
+  v_mat = mat_idx;
+}
+)";
+
+static const char *FORWARD_GBUFFER_FRAG_SOURCE = R"(
+vec2 normal_pack(vec3 N)
+{
+  N /= (abs(N.x) + abs(N.y) + abs(N.z));
+  vec2 s = sign(N.xy);
+  s.x = (s.x == 0.0) ? 1.0 : s.x;
+  s.y = (s.y == 0.0) ? 1.0 : s.y;
+  N.xy = (N.z >= 0.0) ? N.xy : ((1.0 - abs(N.yx)) * s);
+  return N.xy * 0.5 + 0.5;
+}
+
+vec4 closure_color_pack(vec3 color)
+{
+  float max_comp = max(color.x, max(color.y, color.z));
+  float exponent = (max_comp > 1.0) ? ((max_comp > 2.0) ? ((max_comp > 4.0) ? 3.0 : 2.0) : 1.0) : 0.0;
+  return vec4(color / exp2(exponent), exponent / 3.0);
+}
+
+uint geometry_normal_pack(vec3 Ng, vec3 N)
+{
+  const float quantization_multiplier = 1.360;
+  vec3 Ng_quantize = normalize(round(quantization_multiplier * Ng));
+  if (dot(N, Ng) > dot(Ng, Ng_quantize)) {
+    return 0u;
+  }
+  uint data = 0u;
+  data |= (Ng_quantize.x > 0.0) ? (1u << 0u) : 0u;
+  data |= (Ng_quantize.y > 0.0) ? (1u << 1u) : 0u;
+  data |= (Ng_quantize.z > 0.0) ? (1u << 2u) : 0u;
+  data |= (Ng_quantize.x < 0.0) ? (1u << 3u) : 0u;
+  data |= (Ng_quantize.y < 0.0) ? (1u << 4u) : 0u;
+  data |= (Ng_quantize.z < 0.0) ? (1u << 5u) : 0u;
+  return data << 20u;
+}
+
+void main()
+{
+  uint mat_idx = v_mat;
+  if (mat_idx >= 4u) {
+    mat_idx = 0u;
+  }
+
+  vec4 base_col = material_params[mat_idx * 4u + 0u];
+  vec4 props = material_params[mat_idx * 4u + 1u];
+  vec4 rough_params = material_params[mat_idx * 4u + 2u];
+  vec4 extra_params = material_params[mat_idx * 4u + 3u];
+
+  bool has_d = (props.x > 0.5);
+  bool has_n = (props.y > 0.5);
+  bool has_r = (props.z > 0.5);
+  float spec_level = props.w;
+  float metallic = base_col.w;
+  float has_spec_tint = extra_params.y;
+
+  float rough_val = rough_params.x;
+  float rough_gamma = rough_params.y;
+  float rough_scale = rough_params.z;
+  float rough_offset = rough_params.w;
+
+  vec4 tex_diff = vec4(1.0);
+  vec3 tex_norm = vec3(0.5, 0.5, 1.0);
+  float tex_rough = rough_val;
+
+  if (mat_idx == 0u) {
+    if (has_d) tex_diff = texture(tex_diffuse_0, v_uv);
+    if (has_n) tex_norm = texture(tex_normal_0, v_uv).xyz;
+    if (has_r) tex_rough = texture(tex_rough_0, v_uv).r;
+  }
+  else if (mat_idx == 1u) {
+    if (has_d) tex_diff = texture(tex_diffuse_1, v_uv);
+    if (has_n) tex_norm = texture(tex_normal_1, v_uv).xyz;
+    if (has_r) tex_rough = texture(tex_rough_1, v_uv).r;
+  }
+  else if (mat_idx == 2u) {
+    if (has_d) tex_diff = texture(tex_diffuse_2, v_uv);
+    if (has_n) tex_norm = texture(tex_normal_2, v_uv).xyz;
+    if (has_r) tex_rough = texture(tex_rough_2, v_uv).r;
+  }
+  else {
+    if (has_d) tex_diff = texture(tex_diffuse_3, v_uv);
+    if (has_n) tex_norm = texture(tex_normal_3, v_uv).xyz;
+    if (has_r) tex_rough = texture(tex_rough_3, v_uv).r;
+  }
+
+  /* Alpha cutout for foliage cards */
+  if (has_alpha_mask != 0 && has_d && tex_diff.a < 0.33) {
+    discard;
+  }
+
+  if (has_r) {
+    if (abs(rough_gamma - 1.0) > 1e-4) {
+      tex_rough = pow(max(tex_rough, 0.0), rough_gamma);
+    }
+    tex_rough = tex_rough * rough_scale + rough_offset;
+  }
+
+  vec4 albedo = has_d ? (tex_diff * vec4(base_col.rgb, 1.0)) : vec4(base_col.rgb, 1.0);
+  float roughness = clamp(has_r ? tex_rough : rough_val, 0.001, 1.0);
+
+  vec3 N = normalize(v_world_normal);
+  if (!gl_FrontFacing) {
+    N = -N;
+  }
+
+  /* Tangent frame from screen derivatives */
+  vec3 dp1 = dFdx(v_world_pos);
+  vec3 dp2 = dFdy(v_world_pos);
+  vec2 duv1 = dFdx(v_uv);
+  vec2 duv2 = dFdy(v_uv);
+  vec3 dp2perp = cross(dp2, N);
+  vec3 dp1perp = cross(N, dp1);
+  vec3 T = dp2perp * duv1.x + dp1perp * duv2.x;
+  vec3 B = dp2perp * duv1.y + dp1perp * duv2.y;
+  float invmax = inversesqrt(max(dot(T, T), dot(B, B)));
+  vec3 shaded_nor = N;
+  if (has_n && invmax > 1e-6) {
+    mat3 TBN = mat3(T * invmax, B * invmax, N);
+    vec3 n_mapped = tex_norm * 2.0 - 1.0;
+    shaded_nor = normalize(TBN * n_mapped);
+  }
+  if (!gl_FrontFacing) {
+    shaded_nor = -shaded_nor;
+  }
+
+  vec3 Ng = cross(dp1, dp2);
+  float ng_len = length(Ng);
+  Ng = (ng_len > 1e-12) ? (Ng / ng_len) : N;
+  if (!gl_FrontFacing) {
+    Ng = -Ng;
+  }
+
+  if (shading_mode == 1) { /* Cluster visualization */
+    uint cid = v_cluster_id;
+    uint h = cid * 747796405u + 2891336453u;
+    h = ((h >> ((h >> 28u) + 4u)) ^ h) * 277803737u;
+    h = (h >> 22u) ^ h;
+    albedo.rgb = vec3(float((h >> 16u) & 0xFFu) / 255.0,
+                      float((h >> 8u) & 0xFFu) / 255.0,
+                      float(h & 0xFFu) / 255.0);
+  }
+
+  uint geo_norm_bits = geometry_normal_pack(Ng, shaded_nor);
+  uint header = 0x31u | geo_norm_bits;
+
+  float f0 = mix(0.08 * spec_level, 1.0, metallic);
+  if (has_spec_tint > 0.5) {
+    f0 *= clamp(dot(albedo.rgb, vec3(0.299, 0.587, 0.114)), 0.0, 1.0);
+  }
+
+  out_radiance = vec4(0.0);
+  out_header = header;
+  out_normal = normal_pack(shaded_nor);
+  out_closure1 = closure_color_pack(albedo.rgb);
+  out_closure2 = vec4(roughness, 0.0, f0, 0.0);
+}
+)";
+
+/** Create the direct instanced G-Buffer MRT rasterization shader for EEVEE Next. */
+gpu::Shader *createForwardGbufferShader()
+{
+    using namespace blender::gpu::shader;
+
+    ShaderCreateInfo info("pyGPU_Shader");
+    info.builtins_ |= BuiltinBits::NO_BUFFER_TYPE_LINTING;
+    info.builtins_ |= BuiltinBits::CLIP_CONTROL;
+
+    info.vertex_source("tessera_forward_gbuffer");
+    info.vertex_source_generated = FORWARD_GBUFFER_VERT_SOURCE;
+    info.fragment_source("tessera_forward_gbuffer");
+    info.fragment_source_generated = FORWARD_GBUFFER_FRAG_SOURCE;
+
+    info.vertex_in(0, Type::uint_t, "in_vid");
+    info.fragment_out(0, Type::float4_t, "out_radiance");
+    info.fragment_out(1, Type::uint_t, "out_header");
+    info.fragment_out(2, Type::float2_t, "out_normal");
+    info.fragment_out(3, Type::float4_t, "out_closure1");
+    info.fragment_out(4, Type::float4_t, "out_closure2");
+
+    info.storage_buf(0, Qualifier::read, "uint", "visible_clusters[]");
+    info.storage_buf(1, Qualifier::read, "uvec4", "cluster_meta[]");
+    info.storage_buf(2, Qualifier::read, "uint", "tri_indices[]");
+    info.storage_buf(3, Qualifier::read, "vec4", "packed_verts[]");
+    info.storage_buf(4, Qualifier::read, "mat4", "instance_mats[]");
+    info.storage_buf(5, Qualifier::read, "uint", "forward_args[]");
+    info.storage_buf(6, Qualifier::read, "vec4", "material_params[]");
+
+    info.sampler(0, ImageType::Float2D, "tex_diffuse_0");
+    info.sampler(1, ImageType::Float2D, "tex_diffuse_1");
+    info.sampler(2, ImageType::Float2D, "tex_diffuse_2");
+    info.sampler(3, ImageType::Float2D, "tex_diffuse_3");
+
+    info.sampler(4, ImageType::Float2D, "tex_normal_0");
+    info.sampler(5, ImageType::Float2D, "tex_normal_1");
+    info.sampler(6, ImageType::Float2D, "tex_normal_2");
+    info.sampler(7, ImageType::Float2D, "tex_normal_3");
+
+    info.sampler(8, ImageType::Float2D, "tex_rough_0");
+    info.sampler(9, ImageType::Float2D, "tex_rough_1");
+    info.sampler(10, ImageType::Float2D, "tex_rough_2");
+    info.sampler(11, ImageType::Float2D, "tex_rough_3");
+
+    info.push_constant(Type::float4x4_t, "view_proj");
+    info.push_constant(Type::float4x4_t, "model_mat");
+    info.push_constant(Type::float3x3_t, "normal_mat");
+    info.push_constant(Type::float3_t, "camera_pos");
+    info.push_constant(Type::float4_t, "base_color");
+    info.push_constant(Type::int_t, "shading_mode");
+    info.push_constant(Type::int_t, "lighting_type");
+    info.push_constant(Type::int_t, "cluster_count");
+    info.push_constant(Type::int_t, "debug_clusters");
+    info.push_constant(Type::int_t, "has_alpha_mask");
+    info.push_constant(Type::float4_t, "has_tex_flags");
+    info.push_constant(Type::int_t, "instance_count");
+    info.push_constant(Type::int_t, "bucket_index");
+
+    StageInterfaceInfo iface("tessera_forward_gbuffer_iface", "");
+    iface.smooth(Type::float3_t, "v_world_pos");
+    iface.smooth(Type::float3_t, "v_world_normal");
+    iface.smooth(Type::float2_t, "v_uv");
+    iface.flat(Type::uint_t, "v_mat");
+    iface.flat(Type::uint_t, "v_cluster_id");
+    info.vertex_out(iface);
+
+    const GPUShaderCreateInfo *raw = reinterpret_cast<const GPUShaderCreateInfo *>(&info);
+    return GPU_shader_create_from_info_python(raw);
+}
+
+static const char *FORWARD_DEPTH_VERT_SOURCE = R"(
+void main()
+{
+  uint bucket_idx = uint(gpu_BaseInstance);
+  uint flat_id = uint(gpu_InstanceIndex) - bucket_idx;
+  uint count_b = forward_args[76 + bucket_idx];
+  uint region_base = bucket_idx * uint(cluster_count);
+  uint obj_index = 0u;
+  uint slot_idx = flat_id;
+  if (instance_count > 0 && count_b > 0u) {
+    obj_index = flat_id / count_b;
+    slot_idx = flat_id - obj_index * count_b;
+  }
+  uint cluster_idx = visible_clusters[region_base + slot_idx];
+  uvec4 meta = cluster_meta[cluster_idx];
+  uint local_vid = in_vid;
+  if (local_vid >= meta.y) {
+    gl_Position = vec4(2.0, 2.0, 2.0, 0.0);
+    v_uv = vec2(0.0);
+    v_mat = 0u;
+    return;
+  }
+
+  uint v_idx = tri_indices[meta.x + local_vid];
+  vec4 v0 = packed_verts[v_idx * 2u + 0u];
+  vec4 v1 = packed_verts[v_idx * 2u + 1u];
+  vec3 pos = v0.xyz;
+
+  vec4 world_pos;
+  if (instance_count > 0) {
+    mat4 model = instance_mats[obj_index];
+    world_pos = model * vec4(pos, 1.0);
+    gl_Position = view_proj * world_pos;
+
+    /* Distance LOD is handled continuously by hierarchical DAG traversal */
+  }
+  else {
+    world_pos = model_mat * vec4(pos, 1.0);
+    gl_Position = view_proj * world_pos;
+  }
+
+  v_uv = v1.zw;
+  uint mat_idx = meta.w;
+  if (mat_idx >= 4u) {
+    mat_idx = 0u;
+  }
+  v_mat = mat_idx;
+}
+)";
+
+static const char *FORWARD_DEPTH_FRAG_SOURCE = R"(
+void main()
+{
+  if (has_alpha_mask != 0) {
+    float slot_has_d = (v_mat == 0u) ? has_tex_flags.x :
+                       (v_mat == 1u) ? has_tex_flags.y :
+                       (v_mat == 2u) ? has_tex_flags.z : has_tex_flags.w;
+    if (slot_has_d > 0.5) {
+      vec4 tex_col = (v_mat == 0u) ? texture(tex_diffuse_0, v_uv) :
+                     (v_mat == 1u) ? texture(tex_diffuse_1, v_uv) :
+                     (v_mat == 2u) ? texture(tex_diffuse_2, v_uv) :
+                                     texture(tex_diffuse_3, v_uv);
+      if (tex_col.a < 0.33) {
+        discard;
+      }
+    }
+  }
+}
+)";
+
+/** Create the direct instanced depth prepass shader for scattered fields in EEVEE Next. */
+gpu::Shader *createForwardDepthShader()
+{
+    using namespace blender::gpu::shader;
+
+    ShaderCreateInfo info("pyGPU_Shader");
+    info.builtins_ |= BuiltinBits::NO_BUFFER_TYPE_LINTING;
+    info.builtins_ |= BuiltinBits::CLIP_CONTROL;
+
+    info.vertex_source("tessera_forward_depth");
+    info.vertex_source_generated = FORWARD_DEPTH_VERT_SOURCE;
+    info.fragment_source("tessera_forward_depth");
+    info.fragment_source_generated = FORWARD_DEPTH_FRAG_SOURCE;
+
+    info.vertex_in(0, Type::uint_t, "in_vid");
+
+    info.storage_buf(0, Qualifier::read, "uint", "visible_clusters[]");
+    info.storage_buf(1, Qualifier::read, "uvec4", "cluster_meta[]");
+    info.storage_buf(2, Qualifier::read, "uint", "tri_indices[]");
+    info.storage_buf(3, Qualifier::read, "vec4", "packed_verts[]");
+    info.storage_buf(4, Qualifier::read, "mat4", "instance_mats[]");
+    info.storage_buf(5, Qualifier::read, "uint", "forward_args[]");
+
+    info.sampler(0, ImageType::Float2D, "tex_diffuse_0");
+    info.sampler(1, ImageType::Float2D, "tex_diffuse_1");
+    info.sampler(2, ImageType::Float2D, "tex_diffuse_2");
+    info.sampler(3, ImageType::Float2D, "tex_diffuse_3");
+
+    info.push_constant(Type::float4x4_t, "view_proj");
+    info.push_constant(Type::float4x4_t, "model_mat");
+    info.push_constant(Type::float3_t, "camera_pos");
+    info.push_constant(Type::int_t, "cluster_count");
+    info.push_constant(Type::int_t, "has_alpha_mask");
+    info.push_constant(Type::float4_t, "has_tex_flags");
+    info.push_constant(Type::int_t, "instance_count");
+
+    StageInterfaceInfo iface("tessera_forward_depth_iface", "");
+    iface.smooth(Type::float2_t, "v_uv");
+    iface.flat(Type::uint_t, "v_mat");
+    info.vertex_out(iface);
+
+    const GPUShaderCreateInfo *raw = reinterpret_cast<const GPUShaderCreateInfo *>(&info);
+    return GPU_shader_create_from_info_python(raw);
+}
+
 }  // namespace
 
 TesseraVisibilityPass::~TesseraVisibilityPass()
@@ -1120,6 +1525,8 @@ void TesseraVisibilityPass::terminate()
     GPU_SHADER_FREE_SAFE(mDepthPrepassShader);
     GPU_SHADER_FREE_SAFE(mGbufferShader);
     GPU_SHADER_FREE_SAFE(mForwardShader);
+    GPU_SHADER_FREE_SAFE(mForwardGbufferShader);
+    GPU_SHADER_FREE_SAFE(mForwardDepthShader);
     if (mPackedVertsBuf != nullptr) { GPU_storagebuf_free(mPackedVertsBuf); mPackedVertsBuf = nullptr; }
     if (mPositionsBuf != nullptr) { GPU_storagebuf_free(mPositionsBuf); mPositionsBuf = nullptr; }
     if (mNormalsBuf != nullptr) { GPU_storagebuf_free(mNormalsBuf); mNormalsBuf = nullptr; }
@@ -1304,7 +1711,7 @@ void TesseraVisibilityPass::render(gpu::StorageBuf *command_buf,
     GPU_clip_control_unit_range(reverse_z);
     GPU_depth_test(reverse_z ? GPU_DEPTH_GREATER_EQUAL : GPU_DEPTH_LESS_EQUAL);
     GPU_depth_mask(true);
-    GPU_face_culling(GPU_CULL_NONE);
+    GPU_face_culling(mTwoSided ? GPU_CULL_NONE : GPU_CULL_BACK);
     GPU_blend(GPU_BLEND_NONE);
     GPU_color_mask(true, true, true, true);
 
@@ -1532,7 +1939,7 @@ void TesseraVisibilityPass::render_depth_prepass(gpu::StorageBuf *command_buf,
     GPU_color_mask(false, false, false, false);
     /* Face culling stays disabled: two-sided foliage cards must rasterize
      * their back faces, and occlusion is resolved by depth. */
-    GPU_face_culling(GPU_CULL_NONE);
+    GPU_face_culling(mTwoSided ? GPU_CULL_NONE : GPU_CULL_BACK);
     GPU_blend(GPU_BLEND_NONE);
 
     GPU_shader_bind(mDepthPrepassShader);
@@ -1644,7 +2051,7 @@ void TesseraVisibilityPass::render_gbuffer(gpu::StorageBuf *command_buf,
     GPU_clip_control_unit_range(reverse_z);
     GPU_depth_test(reverse_z ? GPU_DEPTH_GREATER_EQUAL : GPU_DEPTH_LESS_EQUAL);
     GPU_depth_mask(true);
-    GPU_face_culling(GPU_CULL_NONE);
+    GPU_face_culling(mTwoSided ? GPU_CULL_NONE : GPU_CULL_BACK);
     GPU_blend(GPU_BLEND_NONE);
     GPU_color_mask(true, true, true, true);
 
@@ -2207,6 +2614,305 @@ void TesseraVisibilityPass::forward_draw_common(gpu::StorageBuf *command_buf,
                                   6,
                                   intptr_t(84 * sizeof(uint32_t)),
                                   intptr_t(4 * sizeof(uint32_t)));
+}
+
+
+void TesseraVisibilityPass::render_gbuffer_instances(gpu::StorageBuf *command_buf,
+                                                     size_t draw_count,
+                                                     const float4x4 *instance_mats,
+                                                     size_t instance_count,
+                                                     const float4x4 &viewProj,
+                                                     const float3 &cam_pos,
+                                                     int viewport_width,
+                                                     int viewport_height,
+                                                     gpu::StorageBuf *counter_buf)
+{
+    if (command_buf == nullptr || counter_buf == nullptr || draw_count == 0 ||
+        instance_mats == nullptr || instance_count == 0 || mForwardBatch == nullptr ||
+        mPackedVertsBuf == nullptr || mIndicesBuf == nullptr || mClusterMetaBuf == nullptr)
+    {
+        return;
+    }
+    if (viewport_width <= 0 || viewport_height <= 0) {
+        return;
+    }
+    if (mForwardGbufferShader == nullptr) {
+        mForwardGbufferShader = createForwardGbufferShader();
+        if (mForwardGbufferShader == nullptr) {
+            return;
+        }
+    }
+
+    const size_t needed_bytes = instance_count * sizeof(float4x4);
+    if (mInstanceMatsBuf == nullptr || mInstanceMatsCapacity < needed_bytes) {
+        if (mInstanceMatsBuf != nullptr) {
+            GPU_storagebuf_free(mInstanceMatsBuf);
+        }
+        mInstanceMatsCapacity = std::max<size_t>(needed_bytes * 2, 1024 * sizeof(float4x4));
+        mInstanceMatsBuf = GPU_storagebuf_create_ex(mInstanceMatsCapacity,
+                                                    nullptr,
+                                                    GPU_USAGE_DYNAMIC,
+                                                    "tessera_instance_mats");
+        if (mInstanceMatsBuf == nullptr) {
+            mInstanceMatsCapacity = 0;
+            return;
+        }
+    }
+    GPU_storagebuf_usage_size_set(mInstanceMatsBuf, needed_bytes);
+    GPU_storagebuf_update(mInstanceMatsBuf, instance_mats->ptr());
+
+    bool alpha_mask_active = false;
+    float4 has_tex_flags(0.0f);
+    if (mAlphaMask) {
+        for (int s = 0; s < 4; ++s) {
+            const bool slot_has_diffuse = (s < int(mMaterials.size())) &&
+                                          mMaterials[s].has_diffuse &&
+                                          (mMaterials[s].diffuse != nullptr);
+            if (slot_has_diffuse) {
+                has_tex_flags[s] = 1.0f;
+                alpha_mask_active = true;
+            }
+        }
+    }
+
+    /* Upload material parameters: 4 vec4 per slot (base_color, props, rough_params, extra) */
+    float mat_params[4 * 16] = {};
+    for (int s = 0; s < 4; ++s) {
+        if (s < int(mMaterials.size())) {
+            const auto &m = mMaterials[s];
+            mat_params[s * 16 + 0] = m.base_color.x;
+            mat_params[s * 16 + 1] = m.base_color.y;
+            mat_params[s * 16 + 2] = m.base_color.z;
+            mat_params[s * 16 + 3] = m.metallic_value;
+            mat_params[s * 16 + 4] = (m.has_diffuse && m.diffuse != nullptr) ? 1.0f : 0.0f;
+            mat_params[s * 16 + 5] = (m.has_normal && m.normal != nullptr) ? 1.0f : 0.0f;
+            mat_params[s * 16 + 6] = (m.has_roughness && m.roughness != nullptr) ? 1.0f : 0.0f;
+            mat_params[s * 16 + 7] = m.specular_value;
+            mat_params[s * 16 + 8] = m.roughness_value;
+            mat_params[s * 16 + 9] = m.roughness_gamma;
+            mat_params[s * 16 + 10] = m.roughness_scale;
+            mat_params[s * 16 + 11] = m.roughness_offset;
+            mat_params[s * 16 + 12] = m.diffuse_is_srgb ? 1.0f : 0.0f;
+            mat_params[s * 16 + 13] = m.has_specular_tint ? 1.0f : 0.0f;
+            mat_params[s * 16 + 14] = 0.0f;
+            mat_params[s * 16 + 15] = 0.0f;
+        } else {
+            mat_params[s * 16 + 0] = 0.8f;
+            mat_params[s * 16 + 1] = 0.8f;
+            mat_params[s * 16 + 2] = 0.8f;
+            mat_params[s * 16 + 3] = 0.0f;
+            mat_params[s * 16 + 4] = 0.0f;
+            mat_params[s * 16 + 5] = 0.0f;
+            mat_params[s * 16 + 6] = 0.0f;
+            mat_params[s * 16 + 7] = 0.5f;
+            mat_params[s * 16 + 8] = 0.5f;
+            mat_params[s * 16 + 9] = 1.0f;
+            mat_params[s * 16 + 10] = 1.0f;
+            mat_params[s * 16 + 11] = 0.0f;
+            mat_params[s * 16 + 12] = 0.0f;
+            mat_params[s * 16 + 13] = 0.0f;
+            mat_params[s * 16 + 14] = 0.0f;
+            mat_params[s * 16 + 15] = 0.0f;
+        }
+    }
+    if (mMaterialParamsBuf == nullptr) {
+        mMaterialParamsBuf = GPU_storagebuf_create_ex(
+            sizeof(mat_params), mat_params, GPU_USAGE_DYNAMIC, "tessera_mat_params");
+    } else {
+        GPU_storagebuf_update(mMaterialParamsBuf, mat_params);
+    }
+
+    GPU_clip_control_unit_range(true);
+    GPU_depth_test(GPU_DEPTH_GREATER_EQUAL);
+    GPU_depth_mask(true);
+    GPU_color_mask(true, true, true, true);
+    GPU_face_culling(mTwoSided ? GPU_CULL_NONE : GPU_CULL_BACK);
+    GPU_blend(GPU_BLEND_NONE);
+
+    GPU_shader_bind(mForwardGbufferShader);
+    GPU_storagebuf_bind(command_buf, 0);
+    GPU_storagebuf_bind(mClusterMetaBuf, 1);
+    GPU_storagebuf_bind(mIndicesBuf, 2);
+    GPU_storagebuf_bind(mPackedVertsBuf, 3);
+    GPU_storagebuf_bind(mInstanceMatsBuf, 4);
+    GPU_storagebuf_bind(counter_buf, 5);
+    GPU_storagebuf_bind(mMaterialParamsBuf, 6);
+
+    for (int s = 0; s < 4; ++s) {
+        const bool slot_has_diffuse = (s < int(mMaterials.size())) &&
+                                      mMaterials[s].has_diffuse &&
+                                      (mMaterials[s].diffuse != nullptr);
+        gpu::Texture *diff = slot_has_diffuse ? mMaterials[s].diffuse : mDefaultWhiteTex;
+        if (diff != nullptr) {
+            GPU_texture_bind(diff, s);
+        }
+    }
+    for (int s = 0; s < 4; ++s) {
+        const bool slot_has_normal = (s < int(mMaterials.size())) &&
+                                     mMaterials[s].has_normal &&
+                                     (mMaterials[s].normal != nullptr);
+        gpu::Texture *nor = slot_has_normal ? mMaterials[s].normal : mDefaultNormalTex;
+        if (nor != nullptr) {
+            GPU_texture_bind(nor, 4 + s);
+        }
+    }
+    for (int s = 0; s < 4; ++s) {
+        const bool slot_has_rough = (s < int(mMaterials.size())) &&
+                                    mMaterials[s].has_roughness &&
+                                    (mMaterials[s].roughness != nullptr);
+        gpu::Texture *rough = slot_has_rough ? mMaterials[s].roughness : mDefaultRoughTex;
+        if (rough != nullptr) {
+            GPU_texture_bind(rough, 8 + s);
+        }
+    }
+
+    GPU_shader_uniform_mat4(mForwardGbufferShader, "view_proj", viewProj.ptr());
+    GPU_shader_uniform_3f(mForwardGbufferShader, "camera_pos", cam_pos.x, cam_pos.y, cam_pos.z);
+    GPU_shader_uniform_4f(mForwardGbufferShader, "base_color", 1.0f, 1.0f, 1.0f, 1.0f);
+    GPU_shader_uniform_1i(mForwardGbufferShader, "cluster_count", int(mClusterCount));
+    GPU_shader_uniform_1i(mForwardGbufferShader, "shading_mode", 0);
+    GPU_shader_uniform_1i(mForwardGbufferShader, "has_alpha_mask", alpha_mask_active ? 1 : 0);
+    GPU_shader_uniform_4f(mForwardGbufferShader,
+                          "has_tex_flags",
+                          has_tex_flags.x,
+                          has_tex_flags.y,
+                          has_tex_flags.z,
+                          has_tex_flags.w);
+    GPU_shader_uniform_1i(mForwardGbufferShader, "instance_count", int(instance_count));
+
+    GPU_storagebuf_sync_as_indirect_buffer(counter_buf);
+    GPU_batch_set_shader(mForwardBatch, mForwardGbufferShader);
+    GPU_batch_multi_draw_indirect(mForwardBatch,
+                                  counter_buf,
+                                  6,
+                                  intptr_t(84 * sizeof(uint32_t)),
+                                  intptr_t(4 * sizeof(uint32_t)));
+
+    GPU_texture_unbind_all();
+    if (command_buf != nullptr) GPU_storagebuf_unbind(command_buf);
+    if (mClusterMetaBuf != nullptr) GPU_storagebuf_unbind(mClusterMetaBuf);
+    if (mIndicesBuf != nullptr) GPU_storagebuf_unbind(mIndicesBuf);
+    if (mPackedVertsBuf != nullptr) GPU_storagebuf_unbind(mPackedVertsBuf);
+    if (mInstanceMatsBuf != nullptr) GPU_storagebuf_unbind(mInstanceMatsBuf);
+    if (counter_buf != nullptr) GPU_storagebuf_unbind(counter_buf);
+    if (mMaterialParamsBuf != nullptr) GPU_storagebuf_unbind(mMaterialParamsBuf);
+    GPU_shader_unbind();
+}
+
+void TesseraVisibilityPass::render_depth_instances(gpu::StorageBuf *command_buf,
+                                                   size_t draw_count,
+                                                   const float4x4 *instance_mats,
+                                                   size_t instance_count,
+                                                   const float4x4 &viewProj,
+                                                   const float3 &cam_pos,
+                                                   int viewport_width,
+                                                   int viewport_height,
+                                                   gpu::StorageBuf *counter_buf)
+{
+    if (command_buf == nullptr || counter_buf == nullptr || draw_count == 0 ||
+        instance_mats == nullptr || instance_count == 0 || mForwardBatch == nullptr ||
+        mPackedVertsBuf == nullptr || mIndicesBuf == nullptr || mClusterMetaBuf == nullptr)
+    {
+        return;
+    }
+    if (viewport_width <= 0 || viewport_height <= 0) {
+        return;
+    }
+    if (mForwardDepthShader == nullptr) {
+        mForwardDepthShader = createForwardDepthShader();
+        if (mForwardDepthShader == nullptr) {
+            return;
+        }
+    }
+
+    const size_t needed_bytes = instance_count * sizeof(float4x4);
+    if (mInstanceMatsBuf == nullptr || mInstanceMatsCapacity < needed_bytes) {
+        if (mInstanceMatsBuf != nullptr) {
+            GPU_storagebuf_free(mInstanceMatsBuf);
+        }
+        mInstanceMatsCapacity = std::max<size_t>(needed_bytes * 2, 1024 * sizeof(float4x4));
+        mInstanceMatsBuf = GPU_storagebuf_create_ex(mInstanceMatsCapacity,
+                                                    nullptr,
+                                                    GPU_USAGE_DYNAMIC,
+                                                    "tessera_instance_mats");
+        if (mInstanceMatsBuf == nullptr) {
+            mInstanceMatsCapacity = 0;
+            return;
+        }
+    }
+    GPU_storagebuf_usage_size_set(mInstanceMatsBuf, needed_bytes);
+    GPU_storagebuf_update(mInstanceMatsBuf, instance_mats->ptr());
+
+    bool alpha_mask_active = false;
+    float4 has_tex_flags(0.0f);
+    if (mAlphaMask) {
+        for (int s = 0; s < 4; ++s) {
+            const bool slot_has_diffuse = (s < int(mMaterials.size())) &&
+                                          mMaterials[s].has_diffuse &&
+                                          (mMaterials[s].diffuse != nullptr);
+            if (slot_has_diffuse) {
+                has_tex_flags[s] = 1.0f;
+                alpha_mask_active = true;
+            }
+        }
+    }
+
+    GPU_clip_control_unit_range(true);
+    GPU_depth_test(GPU_DEPTH_GREATER_EQUAL);
+    GPU_depth_mask(true);
+    GPU_color_mask(false, false, false, false);
+    GPU_face_culling(mTwoSided ? GPU_CULL_NONE : GPU_CULL_BACK);
+    GPU_blend(GPU_BLEND_NONE);
+
+    GPU_shader_bind(mForwardDepthShader);
+    GPU_storagebuf_bind(command_buf, 0);
+    GPU_storagebuf_bind(mClusterMetaBuf, 1);
+    GPU_storagebuf_bind(mIndicesBuf, 2);
+    GPU_storagebuf_bind(mPackedVertsBuf, 3);
+    GPU_storagebuf_bind(mInstanceMatsBuf, 4);
+    GPU_storagebuf_bind(counter_buf, 5);
+
+    for (int s = 0; s < 4; ++s) {
+        const bool slot_has_diffuse = (s < int(mMaterials.size())) &&
+                                      mMaterials[s].has_diffuse &&
+                                      (mMaterials[s].diffuse != nullptr);
+        gpu::Texture *diff = slot_has_diffuse ? mMaterials[s].diffuse : mDefaultWhiteTex;
+        if (diff != nullptr) {
+            GPU_texture_bind(diff, s);
+        }
+    }
+
+    GPU_shader_uniform_mat4(mForwardDepthShader, "view_proj", viewProj.ptr());
+    GPU_shader_uniform_mat4(mForwardDepthShader, "model_mat", float4x4::identity().ptr());
+    GPU_shader_uniform_3f(mForwardDepthShader, "camera_pos", cam_pos.x, cam_pos.y, cam_pos.z);
+    GPU_shader_uniform_1i(mForwardDepthShader, "cluster_count", int(mClusterCount));
+    GPU_shader_uniform_1i(mForwardDepthShader, "has_alpha_mask", alpha_mask_active ? 1 : 0);
+    GPU_shader_uniform_4f(mForwardDepthShader,
+                          "has_tex_flags",
+                          has_tex_flags.x,
+                          has_tex_flags.y,
+                          has_tex_flags.z,
+                          has_tex_flags.w);
+    GPU_shader_uniform_1i(mForwardDepthShader, "instance_count", int(instance_count));
+
+    GPU_storagebuf_sync_as_indirect_buffer(counter_buf);
+    GPU_batch_set_shader(mForwardBatch, mForwardDepthShader);
+    GPU_batch_multi_draw_indirect(mForwardBatch,
+                                  counter_buf,
+                                  6,
+                                  intptr_t(84 * sizeof(uint32_t)),
+                                  intptr_t(4 * sizeof(uint32_t)));
+
+    GPU_texture_unbind_all();
+    if (command_buf != nullptr) GPU_storagebuf_unbind(command_buf);
+    if (mClusterMetaBuf != nullptr) GPU_storagebuf_unbind(mClusterMetaBuf);
+    if (mIndicesBuf != nullptr) GPU_storagebuf_unbind(mIndicesBuf);
+    if (mPackedVertsBuf != nullptr) GPU_storagebuf_unbind(mPackedVertsBuf);
+    if (mInstanceMatsBuf != nullptr) GPU_storagebuf_unbind(mInstanceMatsBuf);
+    if (counter_buf != nullptr) GPU_storagebuf_unbind(counter_buf);
+    GPU_shader_unbind();
+
+    GPU_color_mask(true, true, true, true);
 }
 
 }  // namespace tessera

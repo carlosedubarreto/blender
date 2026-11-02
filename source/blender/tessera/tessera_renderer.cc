@@ -942,8 +942,9 @@ void TesseraRenderer::draw_forward_instances(const float4x4 *instance_mats,
     /* Pure world->clip projection: the camera position for studio lighting is
      * derived from it in world space (no object/instance baking). */
     const TesseraViewInfo view = getViewInfo(view_proj, 0.0f, mLastProjScaleY);
-    gpu::StorageBuf *param_buf = (mAsyncReadCounterIndex >= 0) ? mCounterBuf[mAsyncReadCounterIndex] :
-                                                                 nullptr;
+    gpu::StorageBuf *param_buf = (mAsyncReadCounterIndex >= 0 && mCounterBuf[mAsyncReadCounterIndex] != nullptr) ?
+                                     mCounterBuf[mAsyncReadCounterIndex] :
+                                     mCounterBuf[0];
     mVisibilityPass.render_forward_instances(mDrawBuffer,
                                              mDrawCount,
                                              instance_mats,
@@ -956,6 +957,76 @@ void TesseraRenderer::draw_forward_instances(const float4x4 *instance_mats,
                                              lighting_type,
                                              base_color,
                                              param_buf);
+}
+
+void TesseraRenderer::draw_gbuffer_instances(const float4x4 *instance_mats,
+                                             size_t instance_count,
+                                             int viewportWidth,
+                                             int viewportHeight,
+                                             const float4x4 &view_proj)
+{
+    if (mDrawBuffer == nullptr || mDrawCount == 0 || instance_mats == nullptr ||
+        instance_count == 0)
+    {
+        return;
+    }
+    if (!mVisibilityInitialized) {
+        if (!mVisibilityPass.init()) {
+            return;
+        }
+        mVisibilityInitialized = true;
+    }
+    if (mLastData != nullptr) {
+        mVisibilityPass.set_data(*mLastData);
+    }
+    const TesseraViewInfo view = getViewInfo(view_proj, 0.0f, mLastProjScaleY);
+    gpu::StorageBuf *param_buf = (mAsyncReadCounterIndex >= 0 && mCounterBuf[mAsyncReadCounterIndex] != nullptr) ?
+                                     mCounterBuf[mAsyncReadCounterIndex] :
+                                     mCounterBuf[0];
+    mVisibilityPass.render_gbuffer_instances(mDrawBuffer,
+                                             mDrawCount,
+                                             instance_mats,
+                                             instance_count,
+                                             view_proj,
+                                             view.camPos,
+                                             viewportWidth,
+                                             viewportHeight,
+                                             param_buf);
+}
+
+void TesseraRenderer::draw_depth_instances(const float4x4 *instance_mats,
+                                           size_t instance_count,
+                                           int viewportWidth,
+                                           int viewportHeight,
+                                           const float4x4 &view_proj)
+{
+    if (mDrawBuffer == nullptr || mDrawCount == 0 || instance_mats == nullptr ||
+        instance_count == 0)
+    {
+        return;
+    }
+    if (!mVisibilityInitialized) {
+        if (!mVisibilityPass.init()) {
+            return;
+        }
+        mVisibilityInitialized = true;
+    }
+    if (mLastData != nullptr) {
+        mVisibilityPass.set_data(*mLastData);
+    }
+    const TesseraViewInfo view = getViewInfo(view_proj, 0.0f, mLastProjScaleY);
+    gpu::StorageBuf *param_buf = (mAsyncReadCounterIndex >= 0 && mCounterBuf[mAsyncReadCounterIndex] != nullptr) ?
+                                     mCounterBuf[mAsyncReadCounterIndex] :
+                                     mCounterBuf[0];
+    mVisibilityPass.render_depth_instances(mDrawBuffer,
+                                           mDrawCount,
+                                           instance_mats,
+                                           instance_count,
+                                           view_proj,
+                                           view.camPos,
+                                           viewportWidth,
+                                           viewportHeight,
+                                           param_buf);
 }
 
 void TesseraRenderer::getLevelCounts(const TesseraData &data,

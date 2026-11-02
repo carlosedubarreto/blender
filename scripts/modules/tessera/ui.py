@@ -403,10 +403,6 @@ def get_existing_nc2_path(ob):
     if ob is None:
         return None
 
-    cached = _nc2_path_cache.get(ob.name)
-    if cached is not None:
-        return cached if cached else None
-
     # Check object properties first (fastest, in-memory)
     prop_path = ob.get("tessera_nc2", "") or ob.get("tessera_nc2_path", "")
     if prop_path:
@@ -419,6 +415,10 @@ def get_existing_nc2_path(ob):
         if os.path.isfile(abs_p) and os.path.getsize(abs_p) > 88:
             _nc2_path_cache[ob.name] = abs_p
             return abs_p
+
+    cached = _nc2_path_cache.get(ob.name)
+    if cached is not None:
+        return cached if cached else None
 
     scene = getattr(bpy.context, "scene", None)
     auto_checks = getattr(getattr(scene, "tessera", None), "auto_file_checks", False) if scene else False
@@ -1033,6 +1033,25 @@ def _on_load_post(dummy):
     clear_nc2_path_cache()
     register_refresh_timer()
     update_hud_state()
+    # Strictly respect the saved state on file load!
+    for ob in bpy.data.objects:
+        if ob.type == 'MESH':
+            if "tessera_enabled" in ob:
+                saved_state = bool(ob["tessera_enabled"])
+                if hasattr(ob, "tessera"):
+                    try:
+                        ob.tessera.enabled = saved_state
+                    except Exception:
+                        pass
+    scene = getattr(bpy.context, "scene", None)
+    if scene:
+        if "tessera_batch_enabled" in scene:
+            saved_batch = bool(scene["tessera_batch_enabled"])
+            if hasattr(scene, "tessera"):
+                try:
+                    scene.tessera.batch_enabled = saved_batch
+                except Exception:
+                    pass
 
 
 def register():

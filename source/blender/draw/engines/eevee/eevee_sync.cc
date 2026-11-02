@@ -213,72 +213,19 @@ void SyncModule::sync_mesh(const ObjectRef &ob_ref)
     return;
   }
 
+  if (inst_.tessera.is_enabled(inst_.scene, ob_ref.object)) {
+    if (!inst_.tessera.instances_cached()) {
+      inst_.tessera.record(ob_ref);
+    }
+    ObjectHandle ob_handle = sync_object(ob_ref, inst_.manager->unique_handle(ob_ref));
+    inst_.shadows.sync_object(ob_handle, false, false, false);
+    return;
+  }
+
   if ((ob_ref.object->dt < OB_SOLID) &&
       (inst_.is_viewport() && inst_.v3d->shading.type != OB_RENDER))
   {
     /** Do not render objects with display type lower than solid when in material preview mode. */
-    return;
-  }
-
-  if (inst_.tessera.is_enabled(ob_ref.object)) {
-    /* 1. Register with Tessera GPU streaming pipeline. For Geometry-Nodes /
-     * dupli instance ranges, extract the full 4x4 matrix of every instance
-     * from the ObjectRef range so each scattered copy is drawn and culled
-     * individually. */
-    const bool is_dupli = (ob_ref.object->base_flag & BASE_FROM_DUPLI) != 0;
-    const bool is_range = ob_ref.is_range();
-    const float4x4 object_mat = is_range ? ob_ref.object_to_world(0) :
-                                           ob_ref.object->object_to_world();
-    const int instance_count = ob_ref.instances_count();
-    blender::Vector<float4x4> inst_mats;
-    const float4x4 *inst_mats_ptr = nullptr;
-    if (is_range && instance_count >= 1) {
-      inst_mats.reserve(instance_count);
-      for (int i = 0; i < instance_count; ++i) {
-        inst_mats.append(ob_ref.object_to_world(i));
-      }
-      inst_mats_ptr = inst_mats.data();
-    }
-
-    /* Resolve the realized-geometry archetype for this dupli range so EEVEE
-     * draws the actual plant mesh (not the low-poly emitter proxy) with the
-     * correct material color. */
-    tessera::TesseraArchetype arch;
-    if (is_dupli || is_range) {
-      if (const ID *range_data = static_cast<const ID *>(ob_ref.object->data)) {
-        Main *arch_bmain = (inst_.draw_ctx != nullptr && inst_.draw_ctx->depsgraph != nullptr)
-                               ? DEG_get_bmain(inst_.draw_ctx->depsgraph)
-                               : nullptr;
-        const char *blend_path = BKE_main_blendfile_path_from_global();
-        arch = tessera::ArchetypeResolver::global().resolve(
-            arch_bmain, blend_path, ob_ref.object, range_data);
-      }
-    }
-
-    bool is_instancer_base = false;
-    if (!is_dupli && !is_range) {
-      if (ob_ref.object->runtime && ob_ref.object->runtime->geometry_set_eval &&
-          ob_ref.object->runtime->geometry_set_eval->has_instances())
-      {
-        is_instancer_base = true;
-      }
-    }
-
-    inst_.tessera.record(ob_ref.object,
-                         object_mat,
-                         inst_mats_ptr,
-                         instance_count,
-                         arch.valid ? &arch : nullptr,
-                         is_instancer_base);
-
-    /* 2. Register transform and bounding boxes for scene bounds */
-    ObjectHandle ob_handle = sync_object(ob_ref, inst_.manager->unique_handle(ob_ref));
-
-    /* 3. Register object for shadow map generation */
-    inst_.shadows.sync_object(ob_handle, false, false, false);
-
-    /* CRITICAL FIX: DO NOT bind material.shading or geometry_call for the main view!
-     * Exit before adding standard mesh draw calls to EEVEE's G-Buffer / forward lists. */
     return;
   }
 
@@ -336,7 +283,7 @@ void SyncModule::sync_mesh(const ObjectRef &ob_ref)
 
 bool SyncModule::sync_sculpt(const ObjectRef &ob_ref)
 {
-  if (!inst_.use_surfaces || inst_.tessera.is_enabled(ob_ref.object)) {
+  if (!inst_.use_surfaces || inst_.tessera.is_enabled(inst_.scene, ob_ref.object)) {
     return false;
   }
 

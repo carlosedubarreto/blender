@@ -226,6 +226,34 @@ void TesseraDrawPass::draw_forward_instances(const float4x4 *instance_mats,
                                      view_proj);
 }
 
+void TesseraDrawPass::draw_gbuffer_instances(const float4x4 *instance_mats,
+                                             size_t instance_count,
+                                             int viewportWidth,
+                                             int viewportHeight,
+                                             const float4x4 &view_proj) const
+{
+    const_cast<TesseraRenderer &>(renderer_).draw_gbuffer_instances(
+        instance_mats,
+        instance_count,
+        viewportWidth,
+        viewportHeight,
+        view_proj);
+}
+
+void TesseraDrawPass::draw_depth_instances(const float4x4 *instance_mats,
+                                           size_t instance_count,
+                                           int viewportWidth,
+                                           int viewportHeight,
+                                           const float4x4 &view_proj) const
+{
+    const_cast<TesseraRenderer &>(renderer_).draw_depth_instances(
+        instance_mats,
+        instance_count,
+        viewportWidth,
+        viewportHeight,
+        view_proj);
+}
+
 size_t TesseraDrawPass::drawCount(uint32_t material_index) const
 {
     return renderer_.drawCount(material_index);

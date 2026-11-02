@@ -1633,6 +1633,83 @@ def test_foliage_scatter_two_sided_rendering():
 
 
 # ---------------------------------------------------------------------------
+# Test 14: Saved Disabled State Persistence
+# ---------------------------------------------------------------------------
+
+def test_saved_disabled_state_persistence():
+    """Regression Test 14: Honor saved Tessera enable/disable state on file load."""
+    print("\n" + "="*80)
+    print("RUNNING TEST 14: test_saved_disabled_state_persistence")
+    print("="*80)
+
+    import bpy
+
+    # Start from factory settings
+    bpy.ops.wm.read_factory_settings(use_empty=True)
+    scene = bpy.context.scene
+
+    cam_data = bpy.data.cameras.new("TestPersistenceCam")
+    cam_ob = bpy.data.objects.new("TestPersistenceCamera", cam_data)
+    scene.collection.objects.link(cam_ob)
+    scene.camera = cam_ob
+
+    mesh = bpy.data.meshes.new("TestPersistenceMesh")
+    ob = bpy.data.objects.new("TestPersistenceObject", mesh)
+    scene.collection.objects.link(ob)
+
+    # Assign an nc2 file, but disable tessera explicitly
+    ob["tessera_nc2"] = NC2_GROUND_09
+    ob["tessera_enabled"] = 0
+    if hasattr(ob, "tessera"):
+        ob.tessera.enabled = False
+    scene["tessera_batch_enabled"] = 0
+
+    temp_dir = tempfile.gettempdir()
+    test_filepath = os.path.join(temp_dir, "tessera_persistence_test.blend")
+    try:
+        bpy.ops.wm.save_mainfile(filepath=test_filepath)
+        print(f"  ✓ Saved test blend file: {test_filepath}")
+
+        # Reload the saved file
+        bpy.ops.wm.open_mainfile(filepath=test_filepath)
+        reloaded_scene = bpy.context.scene
+        reloaded_ob = reloaded_scene.objects.get("TestPersistenceObject")
+        assert reloaded_ob is not None, "Reloaded object not found"
+
+        # Check saved properties
+        assert int(reloaded_ob.get("tessera_enabled", 1)) == 0, \
+            f"Expected ob['tessera_enabled'] == 0, got {reloaded_ob.get('tessera_enabled')}"
+        if hasattr(reloaded_ob, "tessera"):
+            assert not reloaded_ob.tessera.enabled, \
+                f"Expected ob.tessera.enabled == False, got {reloaded_ob.tessera.enabled}"
+        assert int(reloaded_scene.get("tessera_batch_enabled", 1)) == 0, \
+            f"Expected scene['tessera_batch_enabled'] == 0, got {reloaded_scene.get('tessera_batch_enabled')}"
+
+        print("  ✓ Reloaded state strictly preserved: tessera_enabled=0, tessera_batch_enabled=0.")
+
+        # Test switching to EEVEE
+        reloaded_scene.render.engine = 'BLENDER_EEVEE'
+        reloaded_scene.render.resolution_x = 160
+        reloaded_scene.render.resolution_y = 120
+        bpy.context.view_layer.update()
+        bpy.ops.render.render(write_still=False)
+
+        assert int(reloaded_ob.get("tessera_stat_drawn_instances", 0)) == 0, \
+            "Disabled object must not draw instances"
+        print("  ✓ EEVEE render confirms disabled state honored without instance draw.")
+
+    finally:
+        if os.path.exists(test_filepath):
+            try:
+                os.remove(test_filepath)
+            except Exception:
+                pass
+
+    print("PASS: test_saved_disabled_state_persistence passed successfully.")
+    return True
+
+
+# ---------------------------------------------------------------------------
 # Test Runner & Entry Point
 # ---------------------------------------------------------------------------
 
@@ -1663,6 +1740,7 @@ def run_suite():
         ("test_scatterflow_instancer_isolation", test_scatterflow_instancer_isolation),
         ("test_collection_batch_enable_disable", test_collection_batch_enable_disable),
         ("test_foliage_scatter_two_sided_rendering", test_foliage_scatter_two_sided_rendering),
+        ("test_saved_disabled_state_persistence", test_saved_disabled_state_persistence),
     ]
 
     for name, test_fn in tests:

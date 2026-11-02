@@ -215,6 +215,18 @@ public:
                                 const float4 &base_color = float4(0.8f, 0.8f, 0.8f, 1.0f),
                                 const float4x4 &view_proj = float4x4::identity()) const;
 
+    void draw_gbuffer_instances(const float4x4 *instance_mats,
+                                size_t instance_count,
+                                int viewportWidth,
+                                int viewportHeight,
+                                const float4x4 &view_proj = float4x4::identity()) const;
+
+    void draw_depth_instances(const float4x4 *instance_mats,
+                              size_t instance_count,
+                              int viewportWidth,
+                              int viewportHeight,
+                              const float4x4 &view_proj = float4x4::identity()) const;
+
     /** Two-sided / foliage-card mode (see TesseraVisibilityPass). */
     void set_two_sided(bool two_sided)
     {
