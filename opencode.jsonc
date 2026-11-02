@@ -1,0 +1,37 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+
+  // 1. Aggressively ignore build artifacts, third-party libraries, and tests
+  "watcher": {
+    "ignore": [
+      "**/build/**",
+      "**/build_*/**",
+      "**/bin/**",
+      "**/lib/**",
+      "**/extern/**",
+      "**/tests/**",
+      "**/.git/**",
+      "**/release/datafiles/**"
+    ]
+  },
+
+  // 2. Prevent context pollution from large tool/diff outputs
+  "compaction": {
+    "auto": true,
+    "prune": true,
+    "buffer": "20%",
+    "keep": {
+      "tokens": 8000
+    }
+  },
+
+  // 3. LSP tuning (clangd handles indexing much better than raw regex search)
+  "lsp": true,
+
+  // 4. Guard against accidental massive writes or unsafe CMake/make runs
+  "permission": {
+    "edit": "allow",
+    "write": "ask",
+    "bash": "ask"
+  }
+}

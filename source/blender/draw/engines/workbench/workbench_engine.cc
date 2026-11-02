@@ -1325,7 +1325,13 @@ class Instance : public DrawEngine {
       state.lod_distance = tessera_lod_distance_get(scene_state_.scene, ob);
       state.lod_intensity = tessera_lod_intensity_get(scene_state_.scene, ob);
       state.object_mat = ob_ref.is_range() ? ob_ref.object_to_world(0) : ob->object_to_world();
-      state.two_sided = tessera_object_is_two_sided(ob);
+      /* Respect the viewport shading backface-culling flag: native Blender treats
+       * objects as two-sided (back faces rasterize with flipped normals) unless
+       * the user explicitly enables Backface Culling in the Viewport Shading
+       * popover (v3d->shading.flag & V3D_SHADING_BACKFACE_CULLING). */
+      bool cull_backfaces = (this->draw_ctx != nullptr && this->draw_ctx->v3d != nullptr) &&
+                            (this->draw_ctx->v3d->shading.flag & V3D_SHADING_BACKFACE_CULLING);
+      state.two_sided = !cull_backfaces || tessera_object_is_two_sided(ob);
       state.is_instancer_base = false;
       if (arch_resolved) {
         /* Shading parity with the native pipeline: the archetype's material

@@ -1737,7 +1737,7 @@ void TesseraVisibilityPass::render(gpu::StorageBuf *command_buf,
     GPU_clip_control_unit_range(reverse_z);
     GPU_depth_test(reverse_z ? GPU_DEPTH_GREATER_EQUAL : GPU_DEPTH_LESS_EQUAL);
     GPU_depth_mask(true);
-    GPU_face_culling(mTwoSided ? GPU_CULL_NONE : GPU_CULL_BACK);
+    GPU_face_culling(GPU_CULL_NONE);
     GPU_blend(GPU_BLEND_NONE);
     GPU_color_mask(true, true, true, true);
 
@@ -1965,7 +1965,7 @@ void TesseraVisibilityPass::render_depth_prepass(gpu::StorageBuf *command_buf,
     GPU_color_mask(false, false, false, false);
     /* Face culling stays disabled: two-sided foliage cards must rasterize
      * their back faces, and occlusion is resolved by depth. */
-    GPU_face_culling(mTwoSided ? GPU_CULL_NONE : GPU_CULL_BACK);
+    GPU_face_culling(GPU_CULL_NONE);
     GPU_blend(GPU_BLEND_NONE);
 
     GPU_shader_bind(mDepthPrepassShader);
@@ -2077,7 +2077,7 @@ void TesseraVisibilityPass::render_gbuffer(gpu::StorageBuf *command_buf,
     GPU_clip_control_unit_range(reverse_z);
     GPU_depth_test(reverse_z ? GPU_DEPTH_GREATER_EQUAL : GPU_DEPTH_LESS_EQUAL);
     GPU_depth_mask(true);
-    GPU_face_culling(mTwoSided ? GPU_CULL_NONE : GPU_CULL_BACK);
+    GPU_face_culling(GPU_CULL_NONE);
     GPU_blend(GPU_BLEND_NONE);
     GPU_color_mask(true, true, true, true);
 
@@ -2752,7 +2752,7 @@ void TesseraVisibilityPass::render_gbuffer_instances(gpu::StorageBuf *command_bu
     GPU_depth_test(GPU_DEPTH_GREATER_EQUAL);
     GPU_depth_mask(true);
     GPU_color_mask(true, true, true, true);
-    GPU_face_culling(mTwoSided ? GPU_CULL_NONE : GPU_CULL_BACK);
+    GPU_face_culling(GPU_CULL_NONE);
     GPU_blend(GPU_BLEND_NONE);
 
     GPU_shader_bind(mForwardGbufferShader);
@@ -2887,7 +2887,7 @@ void TesseraVisibilityPass::render_depth_instances(gpu::StorageBuf *command_buf,
     GPU_depth_test(GPU_DEPTH_GREATER_EQUAL);
     GPU_depth_mask(true);
     GPU_color_mask(false, false, false, false);
-    GPU_face_culling(mTwoSided ? GPU_CULL_NONE : GPU_CULL_BACK);
+    GPU_face_culling(GPU_CULL_NONE);
     GPU_blend(GPU_BLEND_NONE);
 
     GPU_shader_bind(mForwardDepthShader);

@@ -1491,7 +1491,12 @@ bool TesseraModule::record(const draw::ObjectRef &ob_ref)
     state.view_source = tessera_view_source_get(ob);
     state.culling_margin = tessera_culling_margin_get(ob);
     state.object_mat = ob_ref.is_range() ? ob_ref.object_to_world(0) : ob->object_to_world();
-    state.two_sided = tessera_object_is_two_sided(ob) || (arch_resolved && arch.two_sided);
+    /* Respect the viewport shading backface-culling flag: native Blender treats
+     * objects as two-sided (back faces rasterize with flipped normals) unless
+     * the user explicitly enables Backface Culling in the Viewport Shading
+     * popover (v3d->shading.flag & V3D_SHADING_BACKFACE_CULLING). */
+    bool cull_backfaces = (inst_.v3d != nullptr) && (inst_.v3d->shading.flag & V3D_SHADING_BACKFACE_CULLING);
+    state.two_sided = !cull_backfaces || tessera_object_is_two_sided(ob) || (arch_resolved && arch.two_sided);
     state.is_instancer_base = false;
     if (arch_resolved && arch.base_color_valid) {
       state.base_color = arch.base_color;
