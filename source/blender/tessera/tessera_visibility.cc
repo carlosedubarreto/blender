@@ -69,6 +69,14 @@ void main()
   vec3 pos = vec3(positions[idx * 3u], positions[idx * 3u + 1u],
                   positions[idx * 3u + 2u]);
   gl_Position = view_proj * vec4(pos, 1.0);
+  /* EEVEE Next stores reverse-Z depth by negating the clip-space z in the vertex
+   * entry point (see reverse_z::transform in eevee_reverse_z_lib.bsl.hh) together
+   * with GL_ZERO_TO_ONE clip control. Tessera's visibility passes must use the
+   * same convention so EEVEE's depth_tx and its nearest-wins GREATER_EQUAL
+   * resolve pick the correct surface (no inverted occlusion). */
+  if (reverse_z != 0) {
+    gl_Position.z = -gl_Position.z;
+  }
 
   bary = vec2(corner == 0u ? 1.0 : 0.0, corner == 1u ? 1.0 : 0.0);
   tri_id = (global_idx / 3u) + 1u;
@@ -517,6 +525,12 @@ void main()
   vec3 pos = vec3(positions[idx * 3u], positions[idx * 3u + 1u],
                   positions[idx * 3u + 2u]);
   gl_Position = view_proj * vec4(pos, 1.0);
+  /* EEVEE Next prepass depth is reverse-Z (see reverse_z::transform in
+   * eevee_reverse_z_lib.bsl.hh); this pass rasterizes into EEVEE's depth_tx,
+   * so it must follow the same convention. */
+  if (reverse_z != 0) {
+    gl_Position.z = -gl_Position.z;
+  }
 
   uint mat_idx = tri_materials[global_idx / 3u];
   if (mat_idx >= 4u) {
@@ -846,6 +860,10 @@ void main()
     norm_mat = normal_mat;
   }
 
+  /* EEVEE Next G-Buffer target writes reverse-Z depth (see reverse_z::transform);
+   * this pass feeds EEVEE's depth_tx, so it must follow the same convention. */
+  gl_Position.z = -gl_Position.z;
+
   vec3 n = norm_mat * nor;
   float len_n = length(n);
   v_world_normal = (len_n > 1e-6) ? (n / len_n) : nor;
@@ -1071,6 +1089,10 @@ void main()
   }
   v_mat = mat_idx;
 }
+
+  /* EEVEE Next G-Buffer target writes reverse-Z depth (see reverse_z::transform);
+   * this pass feeds EEVEE's depth_tx, so it must follow the same convention. */
+  gl_Position.z = -gl_Position.z;
 )";
 
 static const char *FORWARD_GBUFFER_FRAG_SOURCE = R"(
@@ -1340,6 +1362,10 @@ void main()
     world_pos = model_mat * vec4(pos, 1.0);
     gl_Position = view_proj * world_pos;
   }
+
+  /* EEVEE Next G-Buffer target writes reverse-Z depth (see reverse_z::transform);
+   * this pass feeds EEVEE's depth_tx, so it must follow the same convention. */
+  gl_Position.z = -gl_Position.z;
 
   v_uv = v1.zw;
   uint mat_idx = meta.w;
