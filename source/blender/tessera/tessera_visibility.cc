@@ -806,7 +806,9 @@ void main()
 
   /* EEVEE Next G-Buffer target writes reverse-Z depth (see reverse_z::transform);
    * this pass feeds EEVEE's depth_tx, so it must follow the same convention. */
-  gl_Position.z = -gl_Position.z;
+  if (reverse_z != 0) {
+    gl_Position.z = -gl_Position.z;
+  }
 
   vec3 n = norm_mat * nor;
   float len_n = length(n);
@@ -959,6 +961,9 @@ gpu::Shader *createForwardShader()
     info.push_constant(Type::int_t, "instance_count");
     /* Index-count bucket of this draw (0..5; see the traversal shader). */
     info.push_constant(Type::int_t, "bucket_index");
+    /* Whether the destination depth buffer is normal-Z (Workbench) or reverse-Z
+     * (EEVEE Next); the forward shaders negate Z only when reverse_z is set. */
+    info.push_constant(Type::int_t, "reverse_z");
 
     StageInterfaceInfo iface("tessera_forward_iface", "");
     iface.smooth(Type::float3_t, "v_world_pos");
@@ -1023,7 +1028,9 @@ void main()
 
   /* EEVEE Next G-Buffer target writes reverse-Z depth (see reverse_z::transform);
    * this pass feeds EEVEE's depth_tx, so it must follow the same convention. */
-  gl_Position.z = -gl_Position.z;
+  if (reverse_z != 0) {
+    gl_Position.z = -gl_Position.z;
+  }
 
   vec3 n = norm_mat * nor;
   float len_n = length(n);
@@ -1253,6 +1260,7 @@ gpu::Shader *createForwardGbufferShader()
     info.push_constant(Type::float4_t, "has_tex_flags");
     info.push_constant(Type::int_t, "instance_count");
     info.push_constant(Type::int_t, "bucket_index");
+    info.push_constant(Type::int_t, "reverse_z");
 
     StageInterfaceInfo iface("tessera_forward_gbuffer_iface", "");
     iface.smooth(Type::float3_t, "v_world_pos");
@@ -1309,7 +1317,9 @@ void main()
 
   /* EEVEE Next G-Buffer target writes reverse-Z depth (see reverse_z::transform);
    * this pass feeds EEVEE's depth_tx, so it must follow the same convention. */
-  gl_Position.z = -gl_Position.z;
+  if (reverse_z != 0) {
+    gl_Position.z = -gl_Position.z;
+  }
 
   v_uv = v1.zw;
   uint mat_idx = meta.w;
@@ -1375,6 +1385,7 @@ gpu::Shader *createForwardDepthShader()
     info.push_constant(Type::int_t, "has_alpha_mask");
     info.push_constant(Type::float4_t, "has_tex_flags");
     info.push_constant(Type::int_t, "instance_count");
+    info.push_constant(Type::int_t, "reverse_z");
 
     StageInterfaceInfo iface("tessera_forward_depth_iface", "");
     iface.smooth(Type::float2_t, "v_uv");
@@ -2335,6 +2346,7 @@ void TesseraVisibilityPass::render_forward(gpu::StorageBuf *command_buf,
                                           const float4 &base_color,
                                           const std::vector<uint32_t> *material_counts,
                                           uint32_t max_commands_per_material,
+                                          bool reverse_z,
                                           gpu::StorageBuf *counter_buf)
 {
     if (command_buf == nullptr || counter_buf == nullptr || draw_count == 0 ||
@@ -2396,6 +2408,7 @@ void TesseraVisibilityPass::render_forward(gpu::StorageBuf *command_buf,
                         base_color,
                         has_tex_flags,
                         alpha_mask_active,
+                        reverse_z,
                         0);
 }
 
@@ -2410,6 +2423,7 @@ void TesseraVisibilityPass::render_forward_instances(gpu::StorageBuf *command_bu
                                                      int shading_mode,
                                                      int lighting_type,
                                                      const float4 &base_color,
+                                                     bool reverse_z,
                                                      gpu::StorageBuf *counter_buf)
 {
     if (command_buf == nullptr || counter_buf == nullptr || draw_count == 0 ||
@@ -2482,6 +2496,7 @@ void TesseraVisibilityPass::render_forward_instances(gpu::StorageBuf *command_bu
                         base_color,
                         has_tex_flags,
                         alpha_mask_active,
+                        reverse_z,
                         instance_count);
 }
 
@@ -2498,13 +2513,14 @@ void TesseraVisibilityPass::forward_draw_common(gpu::StorageBuf *command_buf,
                                                 const float4 &base_color,
                                                 const float4 &has_tex_flags,
                                                 bool alpha_mask_active,
+                                                bool reverse_z,
                                                 size_t instance_count)
 {
     (void)viewport_width;
     (void)viewport_height;
 
     GPU_clip_control_unit_range(false);
-    GPU_depth_test(GPU_DEPTH_LESS_EQUAL);
+    GPU_depth_test(reverse_z ? GPU_DEPTH_GREATER_EQUAL : GPU_DEPTH_LESS_EQUAL);
     GPU_depth_mask(true);
     GPU_color_mask(true, true, true, true);
     GPU_face_culling(GPU_CULL_NONE);
@@ -2571,6 +2587,7 @@ void TesseraVisibilityPass::forward_draw_common(gpu::StorageBuf *command_buf,
                           has_tex_flags.z,
                           has_tex_flags.w);
     GPU_shader_uniform_1i(mForwardShader, "instance_count", int(instance_count));
+    GPU_shader_uniform_1i(mForwardShader, "reverse_z", reverse_z ? 1 : 0);
 
     /* Single unified Multi-Draw Indirect pass across all 6 index-count buckets:
      * counter_buf [84 .. 84 + 6*4 - 1] holds 6 contiguous DrawArraysIndirectCommand
@@ -2595,6 +2612,7 @@ void TesseraVisibilityPass::render_gbuffer_instances(gpu::StorageBuf *command_bu
                                                      const float3 &cam_pos,
                                                      int viewport_width,
                                                      int viewport_height,
+                                                     bool reverse_z,
                                                      gpu::StorageBuf *counter_buf)
 {
     if (command_buf == nullptr || counter_buf == nullptr || draw_count == 0 ||
@@ -2692,8 +2710,8 @@ void TesseraVisibilityPass::render_gbuffer_instances(gpu::StorageBuf *command_bu
         GPU_storagebuf_update(mMaterialParamsBuf, mat_params);
     }
 
-    GPU_clip_control_unit_range(true);
-    GPU_depth_test(GPU_DEPTH_GREATER_EQUAL);
+    GPU_clip_control_unit_range(reverse_z);
+    GPU_depth_test(reverse_z ? GPU_DEPTH_GREATER_EQUAL : GPU_DEPTH_LESS_EQUAL);
     GPU_depth_mask(true);
     GPU_color_mask(true, true, true, true);
     GPU_face_culling(GPU_CULL_NONE);
@@ -2749,6 +2767,7 @@ void TesseraVisibilityPass::render_gbuffer_instances(gpu::StorageBuf *command_bu
                           has_tex_flags.z,
                           has_tex_flags.w);
     GPU_shader_uniform_1i(mForwardGbufferShader, "instance_count", int(instance_count));
+    GPU_shader_uniform_1i(mForwardGbufferShader, "reverse_z", reverse_z ? 1 : 0);
 
     GPU_storagebuf_sync_as_indirect_buffer(counter_buf);
     GPU_batch_set_shader(mForwardBatch, mForwardGbufferShader);
@@ -2777,6 +2796,7 @@ void TesseraVisibilityPass::render_depth_instances(gpu::StorageBuf *command_buf,
                                                    const float3 &cam_pos,
                                                    int viewport_width,
                                                    int viewport_height,
+                                                   bool reverse_z,
                                                    gpu::StorageBuf *counter_buf)
 {
     if (command_buf == nullptr || counter_buf == nullptr || draw_count == 0 ||
@@ -2827,8 +2847,8 @@ void TesseraVisibilityPass::render_depth_instances(gpu::StorageBuf *command_buf,
         }
     }
 
-    GPU_clip_control_unit_range(true);
-    GPU_depth_test(GPU_DEPTH_GREATER_EQUAL);
+    GPU_clip_control_unit_range(reverse_z);
+    GPU_depth_test(reverse_z ? GPU_DEPTH_GREATER_EQUAL : GPU_DEPTH_LESS_EQUAL);
     GPU_depth_mask(true);
     GPU_color_mask(false, false, false, false);
     GPU_face_culling(GPU_CULL_NONE);
@@ -2864,6 +2884,7 @@ void TesseraVisibilityPass::render_depth_instances(gpu::StorageBuf *command_buf,
                           has_tex_flags.z,
                           has_tex_flags.w);
     GPU_shader_uniform_1i(mForwardDepthShader, "instance_count", int(instance_count));
+    GPU_shader_uniform_1i(mForwardDepthShader, "reverse_z", reverse_z ? 1 : 0);
 
     GPU_storagebuf_sync_as_indirect_buffer(counter_buf);
     GPU_batch_set_shader(mForwardBatch, mForwardDepthShader);
@@ -2887,3 +2908,4 @@ void TesseraVisibilityPass::render_depth_instances(gpu::StorageBuf *command_buf,
 
 }  // namespace tessera
 }  // namespace blender
+

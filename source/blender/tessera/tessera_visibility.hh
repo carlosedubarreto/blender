@@ -140,6 +140,7 @@ class TesseraVisibilityPass
                         const float4 &base_color = float4(0.8f, 0.8f, 0.8f, 1.0f),
                         const std::vector<uint32_t> *material_counts = nullptr,
                         uint32_t max_commands_per_material = 0,
+                        bool reverse_z = false,
                         gpu::StorageBuf *counter_buf = nullptr);
 
     /**
@@ -170,6 +171,7 @@ class TesseraVisibilityPass
                                   int shading_mode = 0,
                                   int lighting_type = 1,
                                   const float4 &base_color = float4(0.8f, 0.8f, 0.8f, 1.0f),
+                                  bool reverse_z = false,
                                   gpu::StorageBuf *counter_buf = nullptr);
 
     /**
@@ -186,6 +188,7 @@ class TesseraVisibilityPass
                                   const float3 &cam_pos,
                                   int viewport_width,
                                   int viewport_height,
+                                  bool reverse_z = false,
                                   gpu::StorageBuf *counter_buf = nullptr);
 
     /**
@@ -201,6 +204,7 @@ class TesseraVisibilityPass
                                 const float3 &cam_pos,
                                 int viewport_width,
                                 int viewport_height,
+                                bool reverse_z = false,
                                 gpu::StorageBuf *counter_buf = nullptr);
 
     void set_material_textures(const std::vector<TesseraMaterialTextures> &materials)
@@ -269,6 +273,7 @@ class TesseraVisibilityPass
                              const float4 &base_color,
                              const float4 &has_tex_flags,
                              bool alpha_mask_active,
+                             bool reverse_z,
                              size_t instance_count);
 
     // Shaders (created lazily with an active context).
@@ -342,3 +347,4 @@ class TesseraVisibilityPass
 
 }  // namespace tessera
 }  // namespace blender
+

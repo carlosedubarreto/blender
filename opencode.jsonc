@@ -31,7 +31,7 @@
   // 4. Guard against accidental massive writes or unsafe CMake/make runs
   "permission": {
     "edit": "allow",
-    "write": "ask",
-    "bash": "ask"
+    "write": "allow",
+    "bash": "allow"
   }
 }

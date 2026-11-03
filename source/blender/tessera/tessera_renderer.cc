@@ -906,6 +906,7 @@ void TesseraRenderer::draw_forward(const float4x4 &model_mat,
                                    base_color,
                                    &mMaterialDrawCounts,
                                    mMaxCommandsPerMaterial,
+                                   mReverseZ,
                                    param_buf);
 #ifdef WITH_OPENGL_BACKEND
     if (use_gl_queries) {
@@ -956,6 +957,7 @@ void TesseraRenderer::draw_forward_instances(const float4x4 *instance_mats,
                                              int(mShadingMode),
                                              lighting_type,
                                              base_color,
+                                             mReverseZ,
                                              param_buf);
 }
 
@@ -991,6 +993,7 @@ void TesseraRenderer::draw_gbuffer_instances(const float4x4 *instance_mats,
                                              view.camPos,
                                              viewportWidth,
                                              viewportHeight,
+                                             mReverseZ,
                                              param_buf);
 }
 
@@ -1026,6 +1029,7 @@ void TesseraRenderer::draw_depth_instances(const float4x4 *instance_mats,
                                            view.camPos,
                                            viewportWidth,
                                            viewportHeight,
+                                           mReverseZ,
                                            param_buf);
 }
 
@@ -1054,3 +1058,4 @@ void TesseraRenderer::getLevelCounts(const TesseraData &data,
 
 }  // namespace tessera
 }  // namespace blender
+
