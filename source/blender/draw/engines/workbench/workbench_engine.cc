@@ -150,6 +150,10 @@ class Instance : public DrawEngine {
      * scattered foliage whose emitter proxy carries no materials). */
     float4 base_color = float4(0.8f, 0.8f, 0.8f, 1.0f);
     bool base_color_valid = false;
+    /* Archetype material roughness/metallic (Workbench studio-shading parity:
+     * forwarded to the Tessera forward shader's workbench_light material slot). */
+    float tessera_roughness = 0.4f;
+    float tessera_metallic = 0.0f;
     /* Identity of the geometry source feeding #data ("base" for the regular
      * .nc2 path, the archetype name for realized-geometry ranges). */
     std::string data_source_key;
@@ -1341,6 +1345,8 @@ class Instance : public DrawEngine {
           state.base_color = arch.base_color;
           state.base_color_valid = true;
         }
+        state.tessera_roughness = arch.roughness_value;
+        state.tessera_metallic = arch.metallic_value;
         if (arch_ob != nullptr) {
           state.two_sided = state.two_sided || tessera_object_is_two_sided(arch_ob);
         }
@@ -1714,6 +1720,26 @@ class Instance : public DrawEngine {
         if (mode == tessera::TESSERA_SHADING_DIFFUSE) {
           pass.set_material_textures(mats);
         }
+        /* Exact Workbench studio/matcap lighting parity: the forward shader
+         * evaluates the same shading model as the native deferred pipeline
+         * (see FORWARD_FRAG_SOURCE). WorldData light directions are already
+         * view-space; N/I are rotated in the shader with #view_rot. */
+        blender::tessera::TesseraWorkbenchLight wb_light = {};
+        const auto &wb_world = this->resources_.world_buf;
+        for (int wb_i = 0; wb_i < 4; wb_i++) {
+          wb_light.light_dir[wb_i] = wb_world.lights[wb_i].direction;
+          wb_light.diffuse_color_wrap[wb_i] = wb_world.lights[wb_i].diffuse_color_wrap;
+          wb_light.specular_color[wb_i] = wb_world.lights[wb_i].specular_color;
+        }
+        wb_light.material = float4(state.tessera_roughness,
+                                   state.tessera_metallic,
+                                   wb_world.use_specular ? 1.0f : 0.0f,
+                                   float(wb_world.matcap_orientation));
+        wb_light.ambient = wb_world.ambient_color;
+        wb_light.ambient.w = default_view.is_persp() ? 1.0f : 0.0f;
+        pass.set_workbench_lighting(wb_light, true);
+        pass.set_view_rotation(float3x3(default_view.viewmat()));
+        pass.set_matcap(this->resources_.matcap_tx.gpu_texture());
       };
 
       if (state.pass == nullptr) {
@@ -2150,7 +2176,10 @@ class Instance : public DrawEngine {
                             tessera_object_revalidate(this->draw_ctx, state.matched_archetype_name) :
                             nullptr;
       {
-        int lighting_type = (scene_state_.shading.light == V3D_LIGHTING_FLAT) ? 0 : 1;
+        /* Forward shader lighting model: 0=flat, 1=studio, 2=matcap. */
+        int lighting_type = (scene_state_.shading.light == V3D_LIGHTING_FLAT)   ? 0
+                          : (scene_state_.shading.light == V3D_LIGHTING_MATCAP) ? 2
+                                                                               : 1;
         float4 base_col(0.8f, 0.8f, 0.8f, 1.0f);
         if (scene_state_.shading.color_type == V3D_SHADING_SINGLE_COLOR) {
           base_col = float4(scene_state_.shading.single_color[0],

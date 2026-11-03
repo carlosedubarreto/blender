@@ -832,6 +832,12 @@ void main()
 )";
 
 static const char *FORWARD_FRAG_SOURCE = R"(
+/* Exact replica of workbench::fast_rcp (workbench_world_light.bsl.hh) so the
+ * wrapped-lighting terms match the native Workbench pixels bit-for-bit. */
+vec4 tess_fast_rcp(vec4 v)
+{
+  return intBitsToFloat(0x7eef370b - floatBitsToInt(v));
+}
 void main()
 {
   /* Alpha cutout: leaf / grass cards carry their silhouette in the base
@@ -898,9 +904,117 @@ void main()
   if (lighting_type == 0) {
     /* Flat shading */
     out_color = base_color;
+    return;
+  }
+  if (studio_match != 0) {
+    /* Exact Workbench parity: port of workbench::get_world_lighting /
+     * get_matcap_lighting (workbench_world_light.bsl.hh,
+     * workbench_matcap.bsl.hh), evaluated in view space like the native
+     * deferred pipeline. workbench_light[] (14 vec4):
+     *   [0..3] light direction (view space)
+     *   [4..7] light diffuse_color_wrap (rgb + a wrap)
+     *   [8..11] light specular_color (rgb)
+     *   [12] (roughness, metallic, use_specular, matcap flip X)
+     *   [13] ambient rgb (w: 1 = perspective camera)
+     */
+    float tess_roughness = workbench_light[12].x;
+    float tess_metallic = workbench_light[12].y;
+    bool tess_specular = workbench_light[12].z > 0.5;
+    vec3 tess_ambient = workbench_light[13].rgb;
+    vec3 tess_N = normalize(view_rot * N);
+    vec3 tess_I = (workbench_light[13].w > 0.5)
+                  ? normalize(view_rot * (camera_pos - v_world_pos))
+                  : vec3(0.0, 0.0, 1.0);
+    if (lighting_type == 2) { /* Workbench MATCAP */
+      /* matcap_uv_compute (view-space N and incident vector) */
+      float a = 1.0 / (1.0 + tess_I.z);
+      float b = -tess_I.x * tess_I.y * a;
+      vec3 b1 = vec3(1.0 - tess_I.x * tess_I.x * a, b, -tess_I.x);
+      vec3 b2 = vec3(b, 1.0 - tess_I.y * tess_I.y * a, -tess_I.y);
+      vec2 muv = vec2(dot(b1, tess_N), dot(b2, tess_N));
+      if (workbench_light[12].w != 0.0) {
+        muv.x = -muv.x;
+      }
+      muv = muv * 0.496 + 0.5;
+      vec3 mc_diffuse = textureLod(tex_matcap, vec3(muv, 0.0), 0.0).rgb;
+      vec3 mc_specular = textureLod(tex_matcap, vec3(muv, 1.0), 0.0).rgb;
+      out_color = vec4(mc_diffuse * base_color.rgb +
+                       mc_specular * float(tess_specular), base_color.a);
+      return;
+    }
+    /* Workbench STUDIO (get_world_lighting) */
+    vec3 tess_diffuse_color, tess_spec_color;
+    if (tess_specular) {
+      tess_diffuse_color = mix(base_color.rgb, vec3(0.0), vec3(tess_metallic));
+      tess_spec_color = mix(vec3(0.05), base_color.rgb, vec3(tess_metallic));
+    }
+    else {
+      tess_diffuse_color = base_color.rgb;
+      tess_spec_color = vec3(0.0);
+    }
+    vec4 tess_wrap = vec4(workbench_light[4].a, workbench_light[5].a,
+                          workbench_light[6].a, workbench_light[7].a);
+    vec3 tess_spec_light = tess_ambient;
+    vec3 tess_diff_light = tess_ambient;
+    if (tess_specular) {
+      vec3 tess_L0 = workbench_light[0].xyz;
+      vec3 tess_L1 = workbench_light[1].xyz;
+      vec3 tess_L2 = workbench_light[2].xyz;
+      vec3 tess_L3 = workbench_light[3].xyz;
+      vec3 tess_R = -reflect(tess_I, tess_N);
+      vec3 tess_h0 = normalize(tess_L0 + tess_I);
+      vec3 tess_h1 = normalize(tess_L1 + tess_I);
+      vec3 tess_h2 = normalize(tess_L2 + tess_I);
+      vec3 tess_h3 = normalize(tess_L3 + tess_I);
+      vec4 tess_wrapped_NL = vec4(dot(tess_L0, tess_R), dot(tess_L1, tess_R),
+                                  dot(tess_L2, tess_R), dot(tess_L3, tess_R));
+      vec4 tess_spec_angle = clamp(vec4(dot(tess_h0, tess_N), dot(tess_h1, tess_N),
+                                        dot(tess_h2, tess_N), dot(tess_h3, tess_N)),
+                                   0.0, 1.0);
+      vec4 tess_spec_NL = clamp(vec4(dot(tess_L0, tess_N), dot(tess_L1, tess_N),
+                                     dot(tess_L2, tess_N), dot(tess_L3, tess_N)),
+                                0.0, 1.0);
+      vec4 tess_gloss = vec4(1.0 - tess_roughness);
+      tess_gloss *= 1.0 - tess_wrap;
+      vec4 tess_shininess = exp2(10.0 * tess_gloss + 1.0);
+      /* Normalized Blinn shading */
+      vec4 tess_norm_factor = tess_shininess * 0.125 + 1.0;
+      vec4 tess_spec = pow(tess_spec_angle, tess_shininess) *
+                       tess_spec_NL * tess_norm_factor;
+      vec4 tess_w = mix(tess_wrap, vec4(1.0), vec4(tess_roughness));
+      vec4 tess_w1 = tess_w + 1.0;
+      /* wrapped_lighting (fast_rcp replica for bit-exact parity) */
+      vec4 tess_spec_env = clamp((tess_wrapped_NL + tess_w) *
+                                 tess_fast_rcp(tess_w1 * tess_w1),
+                                 0.0, 1.0);
+      tess_spec = mix(tess_spec, tess_spec_env, tess_wrap * tess_wrap);
+      tess_spec_light += tess_spec.x * workbench_light[8].rgb;
+      tess_spec_light += tess_spec.y * workbench_light[9].rgb;
+      tess_spec_light += tess_spec.z * workbench_light[10].rgb;
+      tess_spec_light += tess_spec.w * workbench_light[11].rgb;
+      float tess_NV = clamp(dot(tess_N, tess_I), 0.0, 1.0);
+      /* brdf_approx */
+      float tess_fresnel = exp2(-8.35 * tess_NV) * (1.0 - tess_roughness);
+      tess_spec_color = mix(tess_spec_color, vec3(1.0), vec3(tess_fresnel));
+    }
+    tess_spec_light *= tess_spec_color;
+    vec4 tess_diff_NL = vec4(dot(workbench_light[0].xyz, tess_N),
+                             dot(workbench_light[1].xyz, tess_N),
+                             dot(workbench_light[2].xyz, tess_N),
+                             dot(workbench_light[3].xyz, tess_N));
+    vec4 tess_dw1 = tess_wrap + 1.0;
+    vec4 tess_diff = clamp((tess_diff_NL + tess_wrap) * tess_fast_rcp(tess_dw1 * tess_dw1),
+                           0.0, 1.0);
+    tess_diff_light += tess_diff.x * workbench_light[4].rgb;
+    tess_diff_light += tess_diff.y * workbench_light[5].rgb;
+    tess_diff_light += tess_diff.z * workbench_light[6].rgb;
+    tess_diff_light += tess_diff.w * workbench_light[7].rgb;
+    float tess_spec_energy = dot(tess_spec_color, vec3(0.33333));
+    tess_diff_light *= tess_diffuse_color * (1.0 - tess_spec_energy);
+    out_color = vec4(tess_diff_light + tess_spec_light, base_color.a);
   }
   else {
-    /* Studio / Headlight shading */
+    /* Headlight approximation (EEVEE Next Material Preview). */
     vec3 L = normalize(camera_pos - v_world_pos);
     float NdotL = clamp(dot(N, L), 0.0, 1.0);
     vec3 H = normalize(L + vec3(0.2, 0.3, 0.1));
@@ -939,11 +1053,17 @@ gpu::Shader *createForwardShader()
     /* The renderer's counter buffer: [72..75] is the GPU-written
      * DrawArraysIndirectCommand, [77] the visible-cluster count. */
     info.storage_buf(5, Qualifier::read, "uint", "forward_args[]");
+    /* Workbench studio/matcap parity lighting (14 vec4; see FORWARD_FRAG):
+     * bound to zeros when the exact-parity mode is off. */
+    info.storage_buf(6, Qualifier::read, "vec4", "workbench_light[]");
 
     info.sampler(0, ImageType::Float2D, "tex_diffuse_0");
     info.sampler(1, ImageType::Float2D, "tex_diffuse_1");
     info.sampler(2, ImageType::Float2D, "tex_diffuse_2");
     info.sampler(3, ImageType::Float2D, "tex_diffuse_3");
+    /* Workbench matcap (layer 0: diffuse, layer 1: specular). Bound to a
+     * 1x1 zero texture when Workbench matcap shading is not active. */
+    info.sampler(4, ImageType::Float2DArray, "tex_matcap");
 
     info.push_constant(Type::float4x4_t, "view_proj");
     info.push_constant(Type::float4x4_t, "model_mat");
@@ -964,6 +1084,11 @@ gpu::Shader *createForwardShader()
     /* Whether the destination depth buffer is normal-Z (Workbench) or reverse-Z
      * (EEVEE Next); the forward shaders negate Z only when reverse_z is set. */
     info.push_constant(Type::int_t, "reverse_z");
+    /* World->view rotation for exact Workbench studio/matcap parity (see
+     * FORWARD_FRAG); identity when studio_match is off. */
+    info.push_constant(Type::float3x3_t, "view_rot");
+    /* Non-zero = shade with the exact Workbench studio/matcap model. */
+    info.push_constant(Type::int_t, "studio_match");
 
     StageInterfaceInfo iface("tessera_forward_iface", "");
     iface.smooth(Type::float3_t, "v_world_pos");
@@ -1428,6 +1553,14 @@ bool TesseraVisibilityPass::init()
                                              gpu::TextureFormat::UNORM_8_8_8_8,
                                              GPU_TEXTURE_USAGE_SHADER_READ,
                                              rough);
+    /* Matcap fallback: two zero layers (diffuse + specular) so the matcap
+     * sampler descriptor is always valid even without Workbench matcaps. */
+    const float zero_layers[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+    mDefaultMatcapTex = GPU_texture_create_2d_array("tessera_def_matcap",
+                                                    1, 1, 2, 1,
+                                                    gpu::TextureFormat::SFLOAT_32_32_32_32,
+                                                    GPU_TEXTURE_USAGE_SHADER_READ,
+                                                    zero_layers);
 
     /* One-matrix fallback bound to the instance-matrix slot when drawing in
      * single (non-instanced) mode, so the descriptor is always valid. */
@@ -1492,6 +1625,7 @@ void TesseraVisibilityPass::terminate()
     GPU_TEXTURE_FREE_SAFE(mDefaultWhiteTex);
     GPU_TEXTURE_FREE_SAFE(mDefaultNormalTex);
     GPU_TEXTURE_FREE_SAFE(mDefaultRoughTex);
+    GPU_TEXTURE_FREE_SAFE(mDefaultMatcapTex);
     /* The batches own their vertex/index buffers; discarding
      * the batch frees the VBO/IBO — discarding it again would double-free. */
     GPU_BATCH_DISCARD_SAFE(mFullscreenBatch);
@@ -1521,6 +1655,7 @@ void TesseraVisibilityPass::terminate()
     if (mInstanceMatsBuf != nullptr) { GPU_storagebuf_free(mInstanceMatsBuf); mInstanceMatsBuf = nullptr; }
     mInstanceMatsCapacity = 0;
     if (mDummyInstanceBuf != nullptr) { GPU_storagebuf_free(mDummyInstanceBuf); mDummyInstanceBuf = nullptr; }
+    if (mWorkbenchLightBuf != nullptr) { GPU_storagebuf_free(mWorkbenchLightBuf); mWorkbenchLightBuf = nullptr; }
     mCachedVisData = nullptr;
     mVisResourcesDirty = false;
     mMaxClusterIndices = 384;
@@ -2543,6 +2678,45 @@ void TesseraVisibilityPass::forward_draw_common(gpu::StorageBuf *command_buf,
     if (counter_buf != nullptr) {
         GPU_storagebuf_bind(counter_buf, 5);
     }
+    /* Exact Workbench studio/matcap parity lighting and matcap texture: bound
+     * unconditionally so the declared interfaces stay valid in both the
+     * Workbench and EEVEE Next forward paths (zero-filled when off). */
+    if (mWorkbenchLightBuf == nullptr) {
+        mWorkbenchLightBuf = GPU_storagebuf_create_ex(14 * sizeof(float4),
+                                                      nullptr,
+                                                      GPU_USAGE_DYNAMIC,
+                                                      "tessera_workbench_light");
+    }
+    if (mWorkbenchLightBuf != nullptr) {
+        float light_data[14 * 4];
+        int di = 0;
+        const auto put4 = [&](const float4 &v) {
+            light_data[di++] = v.x;
+            light_data[di++] = v.y;
+            light_data[di++] = v.z;
+            light_data[di++] = v.w;
+        };
+        put4(mWorkbenchLight.light_dir[0]);
+        put4(mWorkbenchLight.light_dir[1]);
+        put4(mWorkbenchLight.light_dir[2]);
+        put4(mWorkbenchLight.light_dir[3]);
+        put4(mWorkbenchLight.diffuse_color_wrap[0]);
+        put4(mWorkbenchLight.diffuse_color_wrap[1]);
+        put4(mWorkbenchLight.diffuse_color_wrap[2]);
+        put4(mWorkbenchLight.diffuse_color_wrap[3]);
+        put4(mWorkbenchLight.specular_color[0]);
+        put4(mWorkbenchLight.specular_color[1]);
+        put4(mWorkbenchLight.specular_color[2]);
+        put4(mWorkbenchLight.specular_color[3]);
+        put4(mWorkbenchLight.material);
+        put4(mWorkbenchLight.ambient);
+        GPU_storagebuf_update(mWorkbenchLightBuf, light_data);
+        GPU_storagebuf_bind(mWorkbenchLightBuf, 6);
+    }
+    gpu::Texture *matcap_tex = (mMatcapTex != nullptr) ? mMatcapTex : mDefaultMatcapTex;
+    if (matcap_tex != nullptr) {
+        GPU_texture_bind(matcap_tex, 4);
+    }
     if (alpha_mask_active) {
         for (int s = 0; s < 4; ++s) {
             const bool slot_has_diffuse = (s < int(mMaterials.size())) &&
@@ -2588,6 +2762,9 @@ void TesseraVisibilityPass::forward_draw_common(gpu::StorageBuf *command_buf,
                           has_tex_flags.w);
     GPU_shader_uniform_1i(mForwardShader, "instance_count", int(instance_count));
     GPU_shader_uniform_1i(mForwardShader, "reverse_z", reverse_z ? 1 : 0);
+    GPU_shader_uniform_mat3(
+        mForwardShader, "view_rot", reinterpret_cast<const float(*)[3]>(mViewRot.ptr()));
+    GPU_shader_uniform_1i(mForwardShader, "studio_match", mStudioMatch ? 1 : 0);
 
     /* Single unified Multi-Draw Indirect pass across all 6 index-count buckets:
      * counter_buf [84 .. 84 + 6*4 - 1] holds 6 contiguous DrawArraysIndirectCommand

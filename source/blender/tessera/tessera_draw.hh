@@ -177,6 +177,14 @@ public:
         return renderer_.isNavigating();
     }
 
+    /** Exact Workbench studio/matcap lighting for forward color parity. */
+    void set_workbench_lighting(const TesseraWorkbenchLight &light, bool studio_match)
+    {
+        renderer_.set_workbench_lighting(light, studio_match);
+    }
+    void set_view_rotation(const float3x3 &view_rot) { renderer_.set_view_rotation(view_rot); }
+    void set_matcap(gpu::Texture *matcap_tex) { renderer_.set_matcap(matcap_tex); }
+
     void getLevelCounts(const TesseraData &data,
                         const float4x4 &lodViewProj,
                         float projScaleY,

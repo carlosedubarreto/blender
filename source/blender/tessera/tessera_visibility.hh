@@ -55,6 +55,23 @@ enum TesseraShadingMode {
 };
 
 /**
+ * Workbench studio/matcap lighting parameters packed for the forward
+ * shader's `workbench_light[]` storage buffer (14 vec4 entries, layout
+ * documented in FORWARD_FRAG_SOURCE). Vectors follow Workbench's own
+ * convention: view space (matching #WorldData in
+ * workbench_shader_shared.hh), so the forward pass must rotate its
+ * world-space normals/positions with the same default-view rotation the
+ * native deferred pipeline uses.
+ */
+struct TesseraWorkbenchLight {
+    float4 light_dir[4]; /** xyz: studio light direction (view space) */
+    float4 diffuse_color_wrap[4]; /** rgb: diffuse color, a: wrap factor */
+    float4 specular_color[4]; /** rgb: specular color */
+    float4 material; /** x: roughness, y: metallic, z: use_specular, w: matcap flip X */
+    float4 ambient; /** rgb: ambient color, w: 1 = perspective camera */
+};
+
+/**
  * Renders the selected clusters with a visibility buffer, then shades.
  * The cluster/vertex data is owned by the caller's TesseraRenderer; this
  * pass receives the indirect draw-command buffer and the draw count.
@@ -234,6 +251,33 @@ class TesseraVisibilityPass
         mAlphaMask = enabled;
     }
 
+    /**
+     * Exact Workbench studio/matcap lighting for the forward solid pass
+     * (color parity with the native deferred Workbench pipeline).
+     * \param light studio light data (view-space, straight from #WorldData)
+     * \param studio_match when set, the forward shader evaluates the exact
+     *                      ported Workbench shading model instead of its
+     *                      cheap headlight approximation (EEVEE Next never
+     *                      sets this).
+     */
+    void set_workbench_lighting(const TesseraWorkbenchLight &light, bool studio_match)
+    {
+        mWorkbenchLight = light;
+        mStudioMatch = studio_match;
+    }
+
+    /** World->view rotation of the default view (float3x3(viewmat())). */
+    void set_view_rotation(const float3x3 &view_rot)
+    {
+        mViewRot = view_rot;
+    }
+
+    /** Workbench matcap texture: 2-layer float array (diffuse, specular). */
+    void set_matcap(gpu::Texture *matcap_tex)
+    {
+        mMatcapTex = matcap_tex;
+    }
+
     void setTextureScale(float scale)
     {
         mTextureScale = std::clamp(scale, 0.05f, 1.0f);
@@ -331,6 +375,15 @@ class TesseraVisibilityPass
     gpu::Texture *mDefaultWhiteTex = nullptr;
     gpu::Texture *mDefaultNormalTex = nullptr;
     gpu::Texture *mDefaultRoughTex = nullptr;
+    // 2-layer 1x1 fallback for the matcap sampler (studio / no matcap bound).
+    gpu::Texture *mDefaultMatcapTex = nullptr;
+
+    // Workbench studio/matcap parity state (see set_workbench_lighting()).
+    TesseraWorkbenchLight mWorkbenchLight = {};
+    bool mStudioMatch = false;
+    float3x3 mViewRot = float3x3::identity();
+    gpu::Texture *mMatcapTex = nullptr;
+    gpu::StorageBuf *mWorkbenchLightBuf = nullptr;
 
     std::vector<TesseraMaterialTextures> mMaterials;
 

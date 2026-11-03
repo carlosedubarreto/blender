@@ -63,6 +63,11 @@ struct TesseraArchetype {
   /** Archetype material base color (Workbench material-color parity). */
   float4 base_color = float4(0.8f, 0.8f, 0.8f, 1.0f);
   bool base_color_valid = false;
+  /** Workbench roughness/metallic of the same first material. Together with
+   * #base_color these give the forward solid pass full studio-lighting parity
+   * with the native Workbench draw (see workbench_world_light.bsl.hh). */
+  float roughness_value = 0.4f;
+  float metallic_value = 0.0f;
   /** Archetype is an instanced object in #Main (engines may re-resolve it). */
   std::string matched_object_name;
   /** True when the geometry is likely alpha-cutout foliage cards. */

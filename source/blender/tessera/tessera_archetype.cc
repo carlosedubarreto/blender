@@ -53,18 +53,27 @@ MeshFingerprint mesh_fingerprint(const Mesh &mesh)
   return fp;
 }
 
-/** Workbench material base color of a mesh or object's first material slot. */
-bool mesh_first_material_color(const Mesh &mesh, const Object *ob, float4 &r_color)
+/** Workbench material base color / roughness / metallic of a mesh or object's
+ * first material slot. */
+bool mesh_first_material_color(const Mesh &mesh,
+                               const Object *ob,
+                               float4 &r_color,
+                               float &r_roughness,
+                               float &r_metallic)
 {
   if (mesh.mat != nullptr && mesh.totcol >= 1 && mesh.mat[0] != nullptr) {
     const Material *ma = mesh.mat[0];
     r_color = float4(ma->r, ma->g, ma->b, 1.0f);
+    r_roughness = ma->roughness;
+    r_metallic = ma->metallic;
     return true;
   }
   if (ob != nullptr) {
     Material *ma = BKE_object_material_get(const_cast<Object *>(ob), 1);
     if (ma != nullptr) {
       r_color = float4(ma->r, ma->g, ma->b, 1.0f);
+      r_roughness = ma->roughness;
+      r_metallic = ma->metallic;
       return true;
     }
   }
@@ -297,7 +306,7 @@ TesseraArchetype ArchetypeResolver::resolve(const Main *bmain,
     result.matched_object_name = std::string(matched_ob->id.name + 2);
     result.two_sided = true;
     float4 col;
-    if (mesh_first_material_color(*matched_mesh, matched_ob, col)) {
+    if (mesh_first_material_color(*matched_mesh, matched_ob, col, result.roughness_value, result.metallic_value)) {
       result.base_color = col;
       result.base_color_valid = true;
     }
@@ -366,7 +375,9 @@ TesseraArchetype ArchetypeResolver::resolve(const Main *bmain,
     }
     result.built_data = std::make_shared<const TesseraData>(std::move(data));
     float4 col;
-    if (!result.base_color_valid && mesh_first_material_color(*realized, matched_ob, col)) {
+    if (!result.base_color_valid
+        && mesh_first_material_color(*realized, matched_ob, col, result.roughness_value, result.metallic_value))
+    {
       result.base_color = col;
       result.base_color_valid = true;
     }

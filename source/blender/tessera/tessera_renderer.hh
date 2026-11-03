@@ -217,6 +217,14 @@ public:
     /** Alpha cutout mode (see TesseraVisibilityPass). */
     void set_alpha_mask(bool enabled) { mVisibilityPass.set_alpha_mask(enabled); }
 
+    /** Exact Workbench studio/matcap lighting for forward color parity. */
+    void set_workbench_lighting(const TesseraWorkbenchLight &light, bool studio_match)
+    {
+        mVisibilityPass.set_workbench_lighting(light, studio_match);
+    }
+    void set_view_rotation(const float3x3 &view_rot) { mVisibilityPass.set_view_rotation(view_rot); }
+    void set_matcap(gpu::Texture *matcap_tex) { mVisibilityPass.set_matcap(matcap_tex); }
+
     size_t drawCount(uint32_t material_index = 0) const
     {
         if (mMaterialDrawCounts.size() > material_index) {
