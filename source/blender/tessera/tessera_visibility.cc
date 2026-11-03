@@ -757,9 +757,9 @@ void main()
 {
   /* Unified Multi-Draw Indirect Instanced:
    * gpu_BaseInstance encodes the bucket index b (0..5).
-   * (gpu_InstanceIndex - bucket_idx) is the flat instance index within bucket b. */
+   * gpu_InstanceIndex is zero-based within this draw command and is the flat instance index. */
   uint bucket_idx = uint(gpu_BaseInstance);
-  uint flat_id = uint(gpu_InstanceIndex) - bucket_idx;
+  uint flat_id = uint(gpu_InstanceIndex);
   uint count_b = forward_args[76 + bucket_idx];
   uint region_base = bucket_idx * uint(cluster_count);
   uint obj_index = 0u;
@@ -797,62 +797,6 @@ void main()
     world_pos = model * vec4(pos, 1.0);
     norm_mat = mat3(model);
     gl_Position = view_proj * world_pos;
-
-    /* Per-instance GPU Distance LOD & Foliage Thinning:
-     * Discard distant micro-triangles directly in vertex shader. */
-    float inst_dist = distance(camera_pos, world_pos.xyz);
-    if (cluster_count > 500) {
-      if (inst_dist > 30.0) {
-        if ((cluster_idx & 31u) != 0u) {
-          gl_Position = vec4(2.0, 2.0, 2.0, 0.0);
-          return;
-        }
-      } else if (inst_dist > 22.0) {
-        if ((cluster_idx & 15u) != 0u) {
-          gl_Position = vec4(2.0, 2.0, 2.0, 0.0);
-          return;
-        }
-      } else if (inst_dist > 15.0) {
-        if ((cluster_idx & 7u) != 0u) {
-          gl_Position = vec4(2.0, 2.0, 2.0, 0.0);
-          return;
-        }
-      } else if (inst_dist > 10.0) {
-        if ((cluster_idx & 3u) != 0u) {
-          gl_Position = vec4(2.0, 2.0, 2.0, 0.0);
-          return;
-        }
-      }
-    } else if (cluster_count > 100) {
-      if (inst_dist > 25.0) {
-        if ((cluster_idx & 15u) != 0u) {
-          gl_Position = vec4(2.0, 2.0, 2.0, 0.0);
-          return;
-        }
-      } else if (inst_dist > 18.0) {
-        if ((cluster_idx & 7u) != 0u) {
-          gl_Position = vec4(2.0, 2.0, 2.0, 0.0);
-          return;
-        }
-      } else if (inst_dist > 12.0) {
-        if ((cluster_idx & 3u) != 0u) {
-          gl_Position = vec4(2.0, 2.0, 2.0, 0.0);
-          return;
-        }
-      }
-    } else if (cluster_count > 10) {
-      if (inst_dist > 20.0) {
-        if ((cluster_idx & 7u) != 0u) {
-          gl_Position = vec4(2.0, 2.0, 2.0, 0.0);
-          return;
-        }
-      } else if (inst_dist > 12.0) {
-        if ((cluster_idx & 3u) != 0u) {
-          gl_Position = vec4(2.0, 2.0, 2.0, 0.0);
-          return;
-        }
-      }
-    }
   }
   else {
     world_pos = model_mat * vec4(pos, 1.0);
@@ -1033,7 +977,7 @@ static const char *FORWARD_GBUFFER_VERT_SOURCE = R"(
 void main()
 {
   uint bucket_idx = uint(gpu_BaseInstance);
-  uint flat_id = uint(gpu_InstanceIndex) - bucket_idx;
+  uint flat_id = uint(gpu_InstanceIndex);
   uint count_b = forward_args[76 + bucket_idx];
   uint region_base = bucket_idx * uint(cluster_count);
   uint obj_index = 0u;
@@ -1077,6 +1021,10 @@ void main()
     norm_mat = normal_mat;
   }
 
+  /* EEVEE Next G-Buffer target writes reverse-Z depth (see reverse_z::transform);
+   * this pass feeds EEVEE's depth_tx, so it must follow the same convention. */
+  gl_Position.z = -gl_Position.z;
+
   vec3 n = norm_mat * nor;
   float len_n = length(n);
   v_world_normal = (len_n > 1e-6) ? (n / len_n) : nor;
@@ -1089,10 +1037,6 @@ void main()
   }
   v_mat = mat_idx;
 }
-
-  /* EEVEE Next G-Buffer target writes reverse-Z depth (see reverse_z::transform);
-   * this pass feeds EEVEE's depth_tx, so it must follow the same convention. */
-  gl_Position.z = -gl_Position.z;
 )";
 
 static const char *FORWARD_GBUFFER_FRAG_SOURCE = R"(
@@ -1326,7 +1270,7 @@ static const char *FORWARD_DEPTH_VERT_SOURCE = R"(
 void main()
 {
   uint bucket_idx = uint(gpu_BaseInstance);
-  uint flat_id = uint(gpu_InstanceIndex) - bucket_idx;
+  uint flat_id = uint(gpu_InstanceIndex);
   uint count_b = forward_args[76 + bucket_idx];
   uint region_base = bucket_idx * uint(cluster_count);
   uint obj_index = 0u;
