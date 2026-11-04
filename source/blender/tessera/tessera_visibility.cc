@@ -21,8 +21,10 @@
 #include "GPU_state.hh"
 #include "GPU_vertex_buffer.hh"
 #include "GPU_vertex_format.hh"
+#include "GPU_texture.hh"
 
 #include <BLI_math_matrix.hh>
+#include <cstdlib>
 
 #include <cstdio>
 #include <cstring>
@@ -2156,6 +2158,9 @@ void TesseraVisibilityPass::render_gbuffer(gpu::StorageBuf *command_buf,
 
     (void)cam_pos;
     gpu::FrameBuffer *target_gbuffer_fb = GPU_framebuffer_active_get();
+    if (const char *e = std::getenv("TESSERA_DEBUG"); e && e[0] == '1') {
+        printf("[tess-gfb] render_gbuffer active fb=%p\n", (const void *)target_gbuffer_fb);
+    }
 
     /* Encode "no geometry" as 0u (and 0xFFFFFFFF). */
     const uint32_t clear_value[4] = {0u, 0u, 0u, 0u};
@@ -2209,6 +2214,37 @@ void TesseraVisibilityPass::render_gbuffer(gpu::StorageBuf *command_buf,
 
     GPU_color_mask(true, true, true, true);
     GPU_memory_barrier(GPU_BARRIER_TEXTURE_FETCH);
+
+    const char *dbg_env = std::getenv("TESSERA_DEBUG");
+    const bool dbg = (dbg_env && dbg_env[0] == '1');
+    if (dbg) {
+      /* Download the visibility texture and count non-zero texels. */
+      const uint vis_w = uint(viewport_width);
+      const uint vis_h = uint(viewport_height);
+      const uint vis_count = vis_w * vis_h;
+      std::vector<uint> vis_data;
+      vis_data.resize(vis_count * 4);
+      GPU_texture_read(mVisTexture, GPU_DATA_UINT, 0, vis_data.data());
+      ulong nz = 0;
+      for (uint i = 0; i < vis_count; i++) {
+        const uint x = vis_data[i * 4 + 0];
+        if (x != 0u && x != 0xFFFFFFFFu) {
+          nz++;
+        }
+      }
+      /* Sample the depth texture at a few spots. */
+      const uint idx0 = (vis_h / 2) * vis_w + (vis_w / 2);
+      const uint idx1 = (vis_h * 7 / 10) * vis_w + (vis_w * 3 / 10);
+      const uint idx2 = (vis_h * 2 / 10) * vis_w + (vis_w * 8 / 10);
+      std::vector<float> depths;
+      depths.resize(vis_count);
+      GPU_texture_read(mDepthTexture, GPU_DATA_FLOAT, 0, depths.data());
+      printf("[tess-vis-dl] vis=%ux%u nz=%u depth_center=%.4f p1=%.4f p2=%.4f\n",
+             vis_w, vis_h, nz, depths[idx0], depths[idx1], depths[idx2]);
+      printf("[tess-vis-dl] bounds_min=(%.2f,%.2f,%.2f) bounds_max=(%.2f,%.2f,%.2f)\n",
+             mBoundsMin[0], mBoundsMin[1], mBoundsMin[2],
+             mBoundsMax[0], mBoundsMax[1], mBoundsMax[2]);
+    }
 
     /* ---------------- Pass 2: G-Buffer output ---------------- */
     GPU_framebuffer_bind(target_gbuffer_fb);
@@ -2348,6 +2384,10 @@ void TesseraVisibilityPass::render_gbuffer(gpu::StorageBuf *command_buf,
     if (use_scissor) {
         GPU_scissor_test(true);
         GPU_scissor(sc_x, sc_y, sc_w, sc_h);
+    }
+    if (dbg) {
+        printf("[tess-gbuffer] scissor rect: use=%d x=%d y=%d w=%d h=%d\n",
+               use_scissor ? 1 : 0, sc_x, sc_y, sc_w, sc_h);
     }
     GPU_batch_draw(mFullscreenBatch);
     if (use_scissor) {
@@ -2654,7 +2694,7 @@ void TesseraVisibilityPass::forward_draw_common(gpu::StorageBuf *command_buf,
     (void)viewport_width;
     (void)viewport_height;
 
-    GPU_clip_control_unit_range(false);
+    GPU_clip_control_unit_range(reverse_z);
     GPU_depth_test(reverse_z ? GPU_DEPTH_GREATER_EQUAL : GPU_DEPTH_LESS_EQUAL);
     GPU_depth_mask(true);
     GPU_color_mask(true, true, true, true);
@@ -2792,18 +2832,50 @@ void TesseraVisibilityPass::render_gbuffer_instances(gpu::StorageBuf *command_bu
                                                      bool reverse_z,
                                                      gpu::StorageBuf *counter_buf)
 {
+    const bool dbg_gbi = []() {
+        const char *e = std::getenv("TESSERA_DEBUG");
+        return e && e[0] == '1';
+    }();
+    if (dbg_gbi) {
+        printf("[tess-gbi] vis entry: draw=%zu counter=%p cmd=%p fwdBatch=%p packedVerts=%p indices=%p clusterMeta=%p active_fb=%p\n",
+               draw_count,
+               (const void *)counter_buf,
+               (const void *)command_buf,
+               (const void *)mForwardBatch,
+               (const void *)mPackedVertsBuf,
+               (const void *)mIndicesBuf,
+               (const void *)mClusterMetaBuf,
+               (const void *)GPU_framebuffer_active_get());
+    }
     if (command_buf == nullptr || counter_buf == nullptr || draw_count == 0 ||
         instance_mats == nullptr || instance_count == 0 || mForwardBatch == nullptr ||
         mPackedVertsBuf == nullptr || mIndicesBuf == nullptr || mClusterMetaBuf == nullptr)
     {
+        if (dbg_gbi) {
+            printf("[tess-gbi] BAIL bufcheck: cmd=%p counter=%p draw=%zu inst=%zu fwd=%p pv=%p idx=%p cm=%p\n",
+                   (const void *)command_buf,
+                   (const void *)counter_buf,
+                   draw_count,
+                   instance_count,
+                   (const void *)mForwardBatch,
+                   (const void *)mPackedVertsBuf,
+                   (const void *)mIndicesBuf,
+                   (const void *)mClusterMetaBuf);
+        }
         return;
     }
     if (viewport_width <= 0 || viewport_height <= 0) {
+        if (dbg_gbi) {
+            printf("[tess-gbi] BAIL viewport %dx%d\n", viewport_width, viewport_height);
+        }
         return;
     }
     if (mForwardGbufferShader == nullptr) {
         mForwardGbufferShader = createForwardGbufferShader();
         if (mForwardGbufferShader == nullptr) {
+            if (dbg_gbi) {
+                printf("[tess-gbi] BAIL shader compile failed\n");
+            }
             return;
         }
     }
@@ -2948,11 +3020,25 @@ void TesseraVisibilityPass::render_gbuffer_instances(gpu::StorageBuf *command_bu
 
     GPU_storagebuf_sync_as_indirect_buffer(counter_buf);
     GPU_batch_set_shader(mForwardBatch, mForwardGbufferShader);
+    bool nodepth = false;
+    if (const char *e = std::getenv("TESSERA_NODEPTH"); e && e[0] == '1') {
+        nodepth = true;
+    }
+    if (nodepth) {
+        GPU_depth_test(GPU_DEPTH_NONE);
+        if (dbg_gbi) {
+            printf("[tess-gbi] NODEPTH override applied\n");
+        }
+    }
     GPU_batch_multi_draw_indirect(mForwardBatch,
                                   counter_buf,
                                   6,
                                   intptr_t(84 * sizeof(uint32_t)),
                                   intptr_t(4 * sizeof(uint32_t)));
+    if (dbg_gbi) {
+        printf("[tess-gbi] drew gbuffer instances: draw=%zu inst=%zu rz=%d\n",
+               draw_count, instance_count, reverse_z ? 1 : 0);
+    }
 
     GPU_texture_unbind_all();
     if (command_buf != nullptr) GPU_storagebuf_unbind(command_buf);

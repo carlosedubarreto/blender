@@ -19,9 +19,9 @@
   "compaction": {
     "auto": true,
     "prune": true,
-    "buffer": "25%",
+    "buffer": "20%",
     "keep": {
-      "tokens": 8000
+      "tokens": 5000
     }
   },
 

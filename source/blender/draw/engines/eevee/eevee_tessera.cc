@@ -51,12 +51,48 @@
 #include <chrono>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <map>
 #include <string>
+#include <cstdarg>
 
 namespace blender::eevee {
 
 static bool g_eevee_tessera_instances_cached = false;
+
+/* TEMP DEBUG (Material Preview scatter investigation): enable with env TESSERA_DEBUG=1 */
+bool tess_eevee_dbg_enabled()
+{
+  static const bool enabled = std::getenv("TESSERA_DEBUG") != nullptr;
+  return enabled;
+}
+
+void tess_eevee_log(const char *fmt, ...)
+{
+  char buf[1024];
+  std::va_list ap;
+  va_start(ap, fmt);
+  std::vsnprintf(buf, sizeof(buf), fmt, ap);
+  va_end(ap);
+  std::fputs(buf, stdout);
+  std::fflush(stdout);
+}
+
+void TesseraModule::tess_eevee_dbg_state(const char *stage, const ObjectState &state) const
+{
+  if (!tess_eevee_dbg_enabled()) {
+    return;
+  }
+  tess_eevee_log("[tess-eevee] %s: name=%s used=%d clusters=%zu inst_mats=%zu frame_vis=%zu trav=%d arch=%s\n",
+              stage,
+              state.ob_name.c_str(),
+              int(state.used),
+              state.data.clusters.size(),
+              state.instance_mats.size(),
+              state.frame_visible_instances.size(),
+              int(state.traversed_this_frame),
+              state.matched_archetype_name.c_str());
+}
 
 bool DRW_eevee_tessera_instances_cached()
 {
@@ -114,6 +150,12 @@ void TesseraModule::end_sync()
   for (const auto it : objects_.items()) {
     tot_cached_instances += it.value->instance_mats.size();
   }
+  if (tess_eevee_dbg_enabled()) {
+    tess_eevee_log("[tess-eevee] end_sync: objs=%zu cached_instances=%zu\n", objects_.size(), tot_cached_instances);
+    for (const auto it : objects_.items()) {
+      tess_eevee_dbg_state("end_sync", *it.value);
+    }
+  }
   if (tot_cached_instances > 0) {
     instances_cached_ = true;
     g_eevee_tessera_instances_cached = true;
@@ -158,17 +200,19 @@ static IDProperty *tessera_property_find_safe(Object *ob, const char *prop_name)
   if (!ob) {
     return nullptr;
   }
-  /* Check evaluated ID first */
-  if (ob->id.properties && ob->id.properties->type == IDP_GROUP) {
-    IDProperty *prop = IDP_GetPropertyFromGroup(ob->id.properties, prop_name);
+  /* Check original datablock first (where user edits / Python properties live).
+   * The evaluated object may hold a stale IDProperty snapshot taken when the
+   * depsgraph was built, which breaks live viewport property updates. */
+  ID *orig_id = DEG_get_original_id(&ob->id);
+  if (orig_id && orig_id->properties && orig_id->properties->type == IDP_GROUP) {
+    IDProperty *prop = IDP_GetPropertyFromGroup(orig_id->properties, prop_name);
     if (prop) {
       return prop;
     }
   }
-  /* Fallback to original datablock */
-  ID *orig_id = DEG_get_original_id(&ob->id);
-  if (orig_id && orig_id->properties && orig_id->properties->type == IDP_GROUP) {
-    return IDP_GetPropertyFromGroup(orig_id->properties, prop_name);
+  /* Fallback to evaluated ID */
+  if (ob->id.properties && ob->id.properties->type == IDP_GROUP) {
+    return IDP_GetPropertyFromGroup(ob->id.properties, prop_name);
   }
   return nullptr;
 }
@@ -328,12 +372,18 @@ static bool tessera_enabled_get(const Scene *scene, Object *ob)
     if (const IDProperty *sprop = tessera_scene_property_find_safe(scene, "tessera_enabled")) {
       const bool sen = (sprop->type == IDP_INT) ? (IDP_int_get(sprop) != 0) : (sprop->data.val != 0);
       if (!sen) {
+        if (tess_eevee_dbg_enabled()) {
+          tess_eevee_log("[tess-eevee] en-get FAIL scene-en=0 scene=%s\n", scene->id.name);
+        }
         return false;
       }
     }
     if (const IDProperty *sprop = tessera_scene_property_find_safe(scene, "tessera_batch_enabled")) {
       const bool sben = (sprop->type == IDP_INT) ? (IDP_int_get(sprop) != 0) : (sprop->data.val != 0);
       if (!sben) {
+        if (tess_eevee_dbg_enabled()) {
+          tess_eevee_log("[tess-eevee] en-get FAIL scene-batch=0 scene=%s\n", scene->id.name);
+        }
         return false;
       }
     }
@@ -355,10 +405,20 @@ static bool tessera_enabled_get(const Scene *scene, Object *ob)
   }
   const IDProperty *prop = tessera_property_find_safe(ob, "tessera_enabled");
   if (prop != nullptr) {
-    return (prop->type == IDP_INT) ? (IDP_int_get(prop) != 0) : (prop->data.val != 0);
+    const bool val = (prop->type == IDP_INT) ? (IDP_int_get(prop) != 0) : (prop->data.val != 0);
+    if (tess_eevee_dbg_enabled() && !val) {
+      tess_eevee_log("[tess-eevee] en-get FAIL ob-prop=0 name=%s scene=%s\n", ob->id.name,
+                  scene ? scene->id.name : "(null)");
+    }
+    return val;
   }
   std::string path;
-  return tessera_path_get(ob, path) && !path.empty();
+  const bool path_ok = tessera_path_get(ob, path) && !path.empty();
+  if (tess_eevee_dbg_enabled() && !path_ok) {
+    tess_eevee_log("[tess-eevee] en-get FAIL no-prop-no-path name=%s scene=%s\n", ob->id.name,
+                scene ? scene->id.name : "(null)");
+  }
+  return path_ok;
 }
 
 static float tessera_pixel_error_get(Object *ob)
@@ -1366,13 +1426,26 @@ static Object *tessera_object_revalidate(const DRWContext *draw_ctx, const std::
 bool TesseraModule::is_enabled(const Scene *scene, Object *ob) const
 {
   if (!is_tessera_eligible_mesh(ob)) {
+    if (tess_eevee_dbg_enabled() && ob != nullptr && ob->data != nullptr) {
+      tess_eevee_log("[tess-eevee] is_enabled NO ineligible: name=%s type=%d\n",
+                  (ob->id.name) ? (ob->id.name + 2) : "?", int(ob->type));
+    }
     return false;
   }
   if (!tessera_enabled_get(scene, ob)) {
+    if (tess_eevee_dbg_enabled()) {
+      tess_eevee_log("[tess-eevee] is_enabled NO enabled-get: name=%s\n",
+                  (ob->id.name) ? (ob->id.name + 2) : "?");
+    }
     return false;
   }
   std::string dummy;
-  return tessera_path_get(ob, dummy);
+  const bool path_ok = tessera_path_get(ob, dummy);
+  if (tess_eevee_dbg_enabled()) {
+    tess_eevee_log("[tess-eevee] is_enabled: name=%s path_ok=%d\n",
+                (ob->id.name) ? (ob->id.name + 2) : "?", int(path_ok));
+  }
+  return path_ok;
 }
 
 bool TesseraModule::record(const draw::ObjectRef &ob_ref)
@@ -1385,6 +1458,13 @@ bool TesseraModule::record(const draw::ObjectRef &ob_ref)
   const bool is_dupli = (ob->base_flag & BASE_FROM_DUPLI) != 0;
   const bool is_range = ob_ref.is_range();
 
+  if (tess_eevee_dbg_enabled()) {
+    tess_eevee_log("[tess-eevee] record-enter: name=%s dupli=%d range=%d\n",
+                (ob->id.name) ? (ob->id.name + 2) : "?",
+                int(is_dupli),
+                int(is_range));
+  }
+
   /* Fast path for consecutive instances of the same object / archetype in scatter fields.
    * Bypasses IDProperty lookups, path conversions, archetype fingerprinting and hash lookups. */
   if (tessera_last_state_ != nullptr &&
@@ -1392,6 +1472,10 @@ bool TesseraModule::record(const draw::ObjectRef &ob_ref)
       tessera_last_data_ == ob->data &&
       tessera_last_sync_round_ == this->tessera_sync_round_)
   {
+    if (tess_eevee_dbg_enabled()) {
+      tess_eevee_log("[tess-eevee] record-fastpath: inst_mats=%zu\n",
+                  tessera_last_state_->instance_mats.size());
+    }
     if (is_range) {
       const int range_count = ob_ref.instances_count();
       const size_t room = (tessera_last_state_->instance_mats.size() < 65536) ?
@@ -1413,13 +1497,22 @@ bool TesseraModule::record(const draw::ObjectRef &ob_ref)
   }
 
   if (!is_tessera_eligible_mesh(ob)) {
+    if (tess_eevee_dbg_enabled()) {
+      tess_eevee_log("[tess-eevee] record-bail: ineligible type=%d data=%p\n", int(ob->type), ob->data);
+    }
     return false;
   }
   if (!tessera_enabled_get(inst_.scene, ob)) {
+    if (tess_eevee_dbg_enabled()) {
+      tess_eevee_log("[tess-eevee] record-bail: tessera_enabled_get false\n");
+    }
     return false;
   }
   std::string idprop_path;
   if (!tessera_path_get(ob, idprop_path)) {
+    if (tess_eevee_dbg_enabled()) {
+      tess_eevee_log("[tess-eevee] record-bail: tessera_path_get false\n");
+    }
     return false;
   }
   char abs_path[FILE_MAX];
@@ -1464,6 +1557,16 @@ bool TesseraModule::record(const draw::ObjectRef &ob_ref)
   tessera_last_ob_ = ob;
   tessera_last_data_ = ob->data;
   tessera_last_sync_round_ = this->tessera_sync_round_;
+
+  if (tess_eevee_dbg_enabled()) {
+    tess_eevee_log("[tess-eevee] record: key=%s dupli=%d range=%d inst_mats=%zu clusters=%zu used=%d\n",
+                state_key.c_str(),
+                int(is_dupli),
+                int(is_range),
+                state.instance_mats.size(),
+                state.data.clusters.size(),
+                int(state.used));
+  }
 
   if (state.sync_round != this->tessera_sync_round_) {
     /* First sync of this object in the current sync round: start a fresh
@@ -2083,6 +2186,10 @@ void TesseraModule::draw_prepass(const draw::View &view,
       }
     }
     state.pass->set_alpha_mask(has_diffuse_tex);
+    /* EEVEE uses bucketed multi-draw indirect args (like Workbench), so the
+     * counter buffer must be populated with per-bucket
+     * DrawArraysIndirectCommand descriptors. */
+    state.pass->setUseElementsIndirect(true);
 
     /* Mesh bounding sphere (object space) for per-instance culling. */
     float3 tessera_bs_center(0.0f);
@@ -2145,6 +2252,9 @@ void TesseraModule::draw_prepass(const draw::View &view,
       state.frame_visible_instances.push_back(s_item.second);
     }
 
+    if (tess_eevee_dbg_enabled()) {
+      tess_eevee_dbg_state("prepass_B", state);
+    }
     /* Rasterize depth for visible scattered instances */
     const auto &draw_mats = state.frame_visible_instances;
     if (!draw_mats.empty()) {
@@ -2255,6 +2365,10 @@ void TesseraModule::draw(const draw::View &view,
         state.pass.reset();
         continue;
       }
+      /* EEVEE uses Reverse-Z depth testing and bucketed multi-draw indirect
+       * args (like Workbench), so the counter buffer must be populated with
+       * per-bucket DrawArraysIndirectCommand descriptors. */
+      state.pass->setUseElementsIndirect(true);
     }
     /* EEVEE uses Reverse-Z depth testing. */
     state.pass->setReverseZ(true);
@@ -2315,7 +2429,9 @@ void TesseraModule::draw(const draw::View &view,
                          viewport_proj_scale_y,
                          float(resolution.y),
                          has_cam_lod ? &lod_object_persmat : nullptr,
-                         has_cam_lod ? &lod_proj_scale_y : nullptr);
+                         has_cam_lod ? &lod_proj_scale_y : nullptr,
+                         uint32_t(state.instance_mats.size()),
+                         1.0f);
       state.traversed_this_frame = true;
     }
 
@@ -2598,6 +2714,18 @@ void TesseraModule::draw_gbuffer(const draw::View &view,
       }
     }
 
+    if (tess_eevee_dbg_enabled()) {
+      tess_eevee_dbg_state("gbuffer_B", state);
+      if (state.pass != nullptr) {
+        tess_eevee_log("[tess-eevee] gbuffer_B pass: drawCount=%u\n", state.pass->drawCount());
+      }
+      if (!state.instance_mats.empty()) {
+        const float4x4 &m0 = state.instance_mats[0];
+        tess_eevee_log("[tess-eevee] gbuffer_B m0: t=%.3f,%.3f,%.3f s=%.3f,%.3f,%.3f\n",
+                       m0[3][0], m0[3][1], m0[3][2],
+                       math::length(m0[0].xyz()), math::length(m0[1].xyz()), math::length(m0[2].xyz()));
+      }
+    }
     const auto &draw_mats = state.frame_visible_instances;
     if (!draw_mats.empty()) {
       if (!state.traversed_this_frame) {

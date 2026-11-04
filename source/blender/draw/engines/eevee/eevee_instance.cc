@@ -411,6 +411,10 @@ void Instance::object_sync(ObjectRef &ob_ref, Manager &manager)
   }
 
   Object *ob = ob_ref.object;
+  if (tess_eevee_dbg_enabled()) {
+    tess_eevee_log("[tess-eevee] objsync: name=%s dupli=%d renderable=%d\n",
+                   ob->id.name, int(ob_ref.is_dupli()), int(DRW_object_is_renderable(ob)));
+  }
   if (!DRW_object_is_renderable(ob)) {
     return;
   }

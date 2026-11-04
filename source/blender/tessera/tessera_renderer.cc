@@ -27,6 +27,7 @@
 
 #include <cstdio>
 #include <cfloat>
+#include <cstdlib>
 
 using namespace blender;
 
@@ -967,13 +968,36 @@ void TesseraRenderer::draw_gbuffer_instances(const float4x4 *instance_mats,
                                              int viewportHeight,
                                              const float4x4 &view_proj)
 {
+    const bool dbg_gbi = []() {
+        const char *e = std::getenv("TESSERA_DEBUG");
+        return e && e[0] == '1';
+    }();
+    if (dbg_gbi) {
+        printf("[tess-gbi] renderer entry: inst=%zu mats=%p mDrawBuffer=%p mDrawCount=%zu vp=%dx%d\n",
+               instance_count,
+               (const void *)instance_mats,
+               (const void *)mDrawBuffer,
+               mDrawCount,
+               viewportWidth,
+               viewportHeight);
+    }
     if (mDrawBuffer == nullptr || mDrawCount == 0 || instance_mats == nullptr ||
         instance_count == 0)
     {
+        if (dbg_gbi) {
+            printf("[tess-gbi] BAIL renderer early: mDrawBuffer=%p mDrawCount=%zu inst=%zu mats=%p\n",
+                   (const void *)mDrawBuffer,
+                   mDrawCount,
+                   instance_count,
+                   (const void *)instance_mats);
+        }
         return;
     }
     if (!mVisibilityInitialized) {
         if (!mVisibilityPass.init()) {
+            if (dbg_gbi) {
+                printf("[tess-gbi] BAIL vis-init failed\n");
+            }
             return;
         }
         mVisibilityInitialized = true;

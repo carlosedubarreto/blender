@@ -42,6 +42,10 @@ namespace blender::eevee {
 bool DRW_eevee_tessera_instances_cached();
 void DRW_eevee_tessera_instances_cache_invalidate();
 
+/* TEMP DEBUG (Material Preview scatter investigation) */
+bool tess_eevee_dbg_enabled();
+void tess_eevee_log(const char *fmt, ...);
+
 class Instance;
 
 class TesseraModule {
@@ -111,6 +115,9 @@ class TesseraModule {
   bool instances_cached_ = false;
 
   void update_telemetry(ObjectState &state, const float3 &cam_pos);
+
+  /* TEMP DEBUG (Material Preview scatter investigation) */
+  void tess_eevee_dbg_state(const char *stage, const ObjectState &state) const;
 
  public:
   TesseraModule(Instance &inst);

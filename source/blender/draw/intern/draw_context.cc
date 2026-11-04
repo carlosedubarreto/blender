@@ -7,6 +7,7 @@
  */
 
 #include <cstdio>
+#include <cstdlib>
 
 #include "CLG_log.h"
 
@@ -871,12 +872,21 @@ static void foreach_obref_in_scene(
   DEG_OBJECT_ITER_BEGIN (&deg_iter_settings, ob) {
 
     if (!DEG_iterator_object_is_visible(eval_mode, ob)) {
+      if (std::getenv("TESSERA_DEBUG") != nullptr) {
+        std::printf("[tess-drawctx] iter-skipvis: name=%s\n", ob->id.name);
+        std::fflush(stdout);
+      }
       continue;
     }
 
     const int visibility = BKE_object_visibility(ob, eval_mode);
     const bool ob_visible = visibility & (OB_VISIBLE_SELF | OB_VISIBLE_PARTICLES);
     const bool instances_visible = (visibility & OB_VISIBLE_INSTANCES) && is_object_instancer(*ob);
+    if (std::getenv("TESSERA_DEBUG") != nullptr) {
+      std::printf("[tess-drawctx] iter: name=%s self=%d inst=%d\n",
+                  ob->id.name, int(ob_visible), int(instances_visible));
+      std::fflush(stdout);
+    }
     /* Don't create duplis from temporary preview objects, object_duplilist_preview already takes
      * care of everything. (See #146194, #146211) */
     const bool is_preview_dupli = data_.dupli_parent && data_.dupli_object_current;
@@ -910,6 +920,11 @@ static void foreach_obref_in_scene(
     /* Generate and walk this instancer's duplis. */
     duplilist.clear();
     object_duplilist(draw_ctx.depsgraph, ob, deg_iter_settings.included_objects, duplilist);
+
+    if (std::getenv("TESSERA_DEBUG") != nullptr) {
+      std::printf("[tess-drawctx] duplis: name=%s empty=%d\n", ob->id.name, int(duplilist.is_empty()));
+      std::fflush(stdout);
+    }
 
     if (duplilist.is_empty()) {
       continue;
@@ -1566,6 +1581,10 @@ static void drw_draw_render_loop_3d(DRWContext &draw_ctx, RenderEngineType *engi
   const bool engine_changed = (engine_type != s_last_engine_type);
   if (engine_changed) {
     s_last_engine_type = engine_type;
+    if (std::getenv("TESSERA_DEBUG") != nullptr) {
+      std::printf("[tess-drawctx] invalidated: engine_changed\n");
+      std::fflush(stdout);
+    }
     blender::DRW_workbench_tessera_instances_cache_invalidate();
     blender::eevee::DRW_eevee_tessera_instances_cache_invalidate();
   }
@@ -1608,6 +1627,10 @@ static void drw_draw_render_loop_3d(DRWContext &draw_ctx, RenderEngineType *engi
           }
         }
         if (is_tess_instancer) {
+          if (std::getenv("TESSERA_DEBUG") != nullptr) {
+            std::printf("[tess-drawctx] skipduplis: name=%s eevee=%d\n", ob.id.name, int(is_eevee));
+            std::fflush(stdout);
+          }
           return DrawFilter::DrawSkipDuplis;
         }
       }
