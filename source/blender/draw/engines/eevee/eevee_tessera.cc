@@ -2442,10 +2442,16 @@ void TesseraModule::draw(const draw::View &view,
     if (state.pass->drawCount() != 0) {
       state.pass->set_two_sided(state.two_sided);
       if (!state.instance_mats.empty()) {
-        const auto &draw_mats = !state.frame_visible_instances.empty() ?
-                                    state.frame_visible_instances :
-                                    state.instance_mats;
-        if (!draw_mats.empty()) {
+        /* Use the per-instance culled set produced by the depth prepass when
+         * it ran this frame. Fall back to the full instance list only when no
+         * prepass culling happened (first frame after sync). When the prepass
+         * ran and culled every instance, draw nothing — falling back to the
+         * full list here would defeat camera culling. */
+        const std::vector<float4x4> *draw_mats_ptr =
+            !state.frame_visible_instances.empty() ? &state.frame_visible_instances :
+            (!state.traversed_this_frame ? &state.instance_mats : nullptr);
+        if (draw_mats_ptr != nullptr && !draw_mats_ptr->empty()) {
+          const std::vector<float4x4> &draw_mats = *draw_mats_ptr;
           const float4 base_col = state.base_color_valid ? state.base_color :
                                                            float4(0.8f, 0.8f, 0.8f, 1.0f);
           state.pass->draw_forward_instances(draw_mats.data(),
