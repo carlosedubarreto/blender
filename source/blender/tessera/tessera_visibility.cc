@@ -28,6 +28,7 @@
 
 #include <cstdio>
 #include <cstring>
+#include <vector>
 
 namespace blender {
 namespace tessera {
@@ -2879,6 +2880,20 @@ void TesseraVisibilityPass::render_gbuffer_instances(gpu::StorageBuf *command_bu
             return;
         }
     }
+    if (dbg_gbi) {
+        size_t nan_count = 0;
+        for (size_t i = 0; i < instance_count; ++i) {
+            const float *mm = instance_mats[i].base_ptr();
+            for (int k = 0; k < 16; ++k) {
+                if (!(mm[k] == mm[k])) {
+                    ++nan_count;
+                    break;
+                }
+            }
+        }
+        printf("[tess-gbi] cluster_count=%zu inst=%zu inst_nan=%zu\n",
+               mClusterCount, instance_count, nan_count);
+    }
 
     const size_t needed_bytes = instance_count * sizeof(float4x4);
     if (mInstanceMatsBuf == nullptr || mInstanceMatsCapacity < needed_bytes) {
@@ -2910,6 +2925,78 @@ void TesseraVisibilityPass::render_gbuffer_instances(gpu::StorageBuf *command_bu
                 alpha_mask_active = true;
             }
         }
+    }
+    if (dbg_gbi) {
+        if (const char *e = std::getenv("TESSERA_NOALPHA"); e && e[0] == '1') {
+            alpha_mask_active = false;
+            has_tex_flags = float4(0.0f);
+            printf("[tess-gbi] NOALPHA override: alpha_mask disabled\n");
+        }
+        printf("[tess-gbi] alpha=%d flags=%g %g %g %g mat_slots=%zu\n",
+               alpha_mask_active ? 1 : 0,
+               has_tex_flags.x, has_tex_flags.y, has_tex_flags.z, has_tex_flags.w,
+               mMaterials.size());
+        const auto tex_probe = [](gpu::Texture *tex, int tag) {
+            if (tex == nullptr) {
+                printf("[tess-gbi-tex] slot=%d null\n", tag);
+                return;
+            }
+            const gpu::TextureFormat fmt = GPU_texture_format(tex);
+            eGPUDataFormat dfmt = GPU_DATA_FLOAT;
+            if (fmt == gpu::TextureFormat::SRGBA_8_8_8_8 || fmt == gpu::TextureFormat::UNORM_8_8_8_8) {
+                dfmt = GPU_DATA_UBYTE;
+            }
+            else if (fmt == gpu::TextureFormat::UINT_32_32_32_32) {
+                dfmt = GPU_DATA_UINT;
+            }
+            else if (fmt != gpu::TextureFormat::SFLOAT_32_32_32_32) {
+                printf("[tess-gbi-tex] slot=%d fmt=%s: readback skipped\n",
+                       tag, GPU_texture_format_name(fmt));
+                return;
+            }
+            printf("[tess-gbi-tex] slot=%d fmt=%s comps=%zu\n",
+                   tag, GPU_texture_format_name(fmt), GPU_texture_component_len(fmt));
+            const size_t bytes = GPU_texture_read_size_get(tex, dfmt, 0);
+            const size_t pixbytes = GPU_texture_dataformat_size(dfmt);
+            if (bytes == 0 || pixbytes == 0) {
+                return;
+            }
+            const size_t comps = GPU_texture_component_len(fmt);
+            const size_t npix = bytes / pixbytes;
+            std::vector<float> buf(npix * comps);
+            if (dfmt == GPU_DATA_UBYTE) {
+                std::vector<unsigned char> raw(bytes);
+                GPU_texture_read(tex, dfmt, 0, raw.data());
+                for (size_t i = 0; i < bytes; ++i) {
+                    buf[i] = float(raw[i]);
+                }
+            }
+            else {
+                GPU_texture_read(tex, dfmt, 0, buf.data());
+            }
+            const float ca = buf[(npix / 2) * comps + (comps - 1)];
+            float amin = 1e9f, amax = -1e9f;
+            size_t below = 0, total = 0;
+            for (size_t p = 0; p < npix; p += 257) {
+                const float a = buf[p * comps + (comps - 1)];
+                if (a < amin) {
+                    amin = a;
+                }
+                if (a > amax) {
+                    amax = a;
+                }
+                if (a < 0.33f) {
+                    ++below;
+                }
+                ++total;
+            }
+            printf("[tess-gbi-tex] slot=%d center_a=%g amin=%g amax=%g below033=%zu/%zu\n",
+                   tag, ca, amin, amax, below, total);
+        };
+        for (size_t s = 0; s < mMaterials.size() && s < 4; ++s) {
+            tex_probe(mMaterials[s].diffuse, int(s));
+        }
+        tex_probe(mDefaultWhiteTex, -1);
     }
 
     /* Upload material parameters: 4 vec4 per slot (base_color, props, rough_params, extra) */

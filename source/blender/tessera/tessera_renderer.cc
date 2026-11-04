@@ -25,6 +25,7 @@
 #  include <epoxy/gl.h>
 #endif
 
+#include <cmath>
 #include <cstdio>
 #include <cfloat>
 #include <cstdlib>
@@ -166,6 +167,29 @@ void TesseraRenderer::terminate()
     mLastTelemetryEnabled = false;
 }
 
+/* TAA jitter shifts the projection matrix by sub-pixel amounts every
+ * accumulation frame (eevee_view.cc applies pixel_jitter_get() to the winmat).
+ * An exact 4x4 comparison treats each jittered frame as a full view change and
+ * re-traverses the LOD DAG every frame, which collapses material-preview
+ * performance. Sub-pixel jitter does not change the screen-space error that
+ * drives LOD selection, so compare with a tolerance that absorbs it while
+ * still triggering on real camera motion (translation/rotation/zoom change
+ * matrix components by orders of magnitude more than one pixel of jitter). */
+static bool tessera_mat4_roughly_equal(const float4x4 &a, const float4x4 &b)
+{
+    for (int c = 0; c < 4; ++c) {
+        for (int r = 0; r < 4; ++r) {
+            const float va = a[c][r];
+            const float vb = b[c][r];
+            const float tol = 5e-3f * std::max(1.0f, std::abs(vb));
+            if (std::abs(va - vb) > tol) {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
 void TesseraRenderer::update(const TesseraData &data,
                             const float4x4 &viewProj,
                             float projScaleY,
@@ -194,7 +218,7 @@ void TesseraRenderer::update(const TesseraData &data,
     bool data_changed = (mLastData == nullptr) || (&data != mLastData);
     bool telem_changed = mTelemetryEnabled && !mLastTelemetryEnabled;
     bool view_changed = !mMatricesCurrent || mCacheDirty ||
-                        (mLastLodViewProj != lod_vp) ||
+                        (!tessera_mat4_roughly_equal(mLastLodViewProj, lod_vp)) ||
                         (mLastLodProjScaleY != lod_scale_y) ||
                         (mLastViewportHeight != viewportHeight) ||
                         (mLastPixelError != mPixelError) ||
@@ -1009,6 +1033,49 @@ void TesseraRenderer::draw_gbuffer_instances(const float4x4 *instance_mats,
     gpu::StorageBuf *param_buf = (mAsyncReadCounterIndex >= 0 && mCounterBuf[mAsyncReadCounterIndex] != nullptr) ?
                                      mCounterBuf[mAsyncReadCounterIndex] :
                                      mCounterBuf[0];
+    if (dbg_gbi) {
+        /* Read back the exact data that drives the gbuffer instances multi-draw:
+         * bucket visible-counts at [76..81], one DrawArraysIndirectCommand per
+         * bucket at [84 + b*4] (vertexCount, instanceCount) and the bucketed
+         * cluster-id regions of mDrawBuffer at [b*cluster_count + slot]. */
+        if (param_buf != nullptr) {
+            uint32_t dbg_counters[128] = {0};
+            GPU_storagebuf_sync_to_host(param_buf);
+            GPU_storagebuf_read(param_buf, dbg_counters);
+            printf("[tess-gbi-dbg] counters[76..81] = %u %u %u %u %u %u\n",
+                   dbg_counters[76], dbg_counters[77], dbg_counters[78],
+                   dbg_counters[79], dbg_counters[80], dbg_counters[81]);
+            printf("[tess-gbi-dbg] descriptors: ");
+            for (int b = 0; b < 6; ++b) {
+                printf("(%u,%u) ", dbg_counters[84 + b * 4], dbg_counters[85 + b * 4]);
+            }
+            printf("\n");
+            const size_t cc = mCachedClusterCount;
+            if (mDrawBuffer != nullptr && cc > 0u) {
+                std::vector<uint32_t> dbg_cmds(5u * mAllocatedCommandCapacity, 0u);
+                GPU_storagebuf_sync_to_host(mDrawBuffer);
+                GPU_storagebuf_read(mDrawBuffer, dbg_cmds.data());
+                for (int b = 0; b < 6; ++b) {
+                    const uint32_t cnt_b = dbg_counters[76 + b];
+                    if (cnt_b == 0u) {
+                        continue;
+                    }
+                    const size_t base = size_t(b) * cc;
+                    uint32_t bad = 0;
+                    printf("[tess-gbi-dbg] bucket %d count=%u head:", b, cnt_b);
+                    for (size_t k = 0; k < cnt_b && base + k < dbg_cmds.size(); ++k) {
+                        if (dbg_cmds[base + k] >= uint32_t(cc)) {
+                            ++bad;
+                        }
+                        if (k < 4u) {
+                            printf(" id=%u", dbg_cmds[base + k]);
+                        }
+                    }
+                    printf(" bad_ids=%u\n", bad);
+                }
+            }
+        }
+    }
     mVisibilityPass.render_gbuffer_instances(mDrawBuffer,
                                              mDrawCount,
                                              instance_mats,

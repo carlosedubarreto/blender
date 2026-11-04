@@ -176,24 +176,10 @@ bool TesseraModule::has_valid_cache() const
   return false;
 }
 
-static float eevee_max_draw_dist_get(const std::string &ob_name, const std::string &arch_name)
-{
-  auto contains_ci = [](const std::string &haystack, const char *needle) {
-    auto it = std::search(
-        haystack.begin(), haystack.end(),
-        needle, needle + strlen(needle),
-        [](char ch1, char ch2) { return std::tolower(ch1) == std::tolower(ch2); }
-    );
-    return it != haystack.end();
-  };
-  auto contains_any = [&](const char *needle) {
-    return contains_ci(ob_name, needle) || (!arch_name.empty() && contains_ci(arch_name, needle));
-  };
-
-  /* Allow full view distance for scattered assets matching native Blender placement. */
-  (void)contains_any;
-  return 0.0f;
-}
+/* Per-instance camera culling for scatter fields lives in the property-aware
+ * helpers below (eevee_max_draw_dist_get / eevee_min_screen_radius_get),
+ * mirroring workbench::tessera_max_draw_distance_get so Material Preview
+ * culls scattered instances exactly like Solid View. */
 
 static IDProperty *tessera_property_find_safe(Object *ob, const char *prop_name)
 {
@@ -256,6 +242,165 @@ static bool tessera_object_is_two_sided(Object *ob)
     return IDP_int_get(prop) != 0;
   }
   return false;
+}
+
+/** Read a float/double/int IDProperty value; \a default_value when absent. */
+static float tessera_idprop_float_get(const IDProperty *prop, float default_value)
+{
+  if (prop == nullptr) {
+    return default_value;
+  }
+  if (prop->type == IDP_DOUBLE) {
+    return float(IDP_double_get(prop));
+  }
+  if (prop->type == IDP_FLOAT) {
+    return IDP_float_get(prop);
+  }
+  if (prop->type == IDP_INT) {
+    return float(IDP_int_get(prop));
+  }
+  return default_value;
+}
+
+/** Case-insensitive name match against either the object or archetype name. */
+static bool tessera_name_contains_any(const std::string &name1,
+                                      const std::string &name2,
+                                      const char *needle)
+{
+  auto contains_ci = [](const std::string &haystack, const char *need) {
+    auto it = std::search(
+        haystack.begin(), haystack.end(),
+        need, need + strlen(need),
+        [](char ch1, char ch2) { return std::tolower(ch1) == std::tolower(ch2); });
+    return it != haystack.end();
+  };
+  return (!name1.empty() && contains_ci(name1, needle)) ||
+         (!name2.empty() && contains_ci(name2, needle));
+}
+
+/* Per-instance draw-distance culling limits for scatter fields (mirrors
+ * workbench::tessera_max_draw_distance_get): object property, then scene
+ * properties, then asset-calibrated defaults. Without these, Material Preview
+ * rasterizes every scattered instance at full detail out to the far plane. */
+static const IDProperty *tessera_scene_property_find_safe(const Scene *scene,
+                                                          const char *prop_name);
+static float eevee_max_draw_dist_get(const Scene *scene,
+                                     Object *ob,
+                                     const std::string &ob_name,
+                                     const std::string &arch_name)
+{
+  if (ob != nullptr) {
+    const float value = tessera_idprop_float_get(
+        tessera_property_find_safe(ob, "tessera_max_draw_distance"), 0.0f);
+    if (value > 0.0f) {
+      return value;
+    }
+  }
+  if (scene != nullptr) {
+    const float batch = tessera_idprop_float_get(
+        tessera_scene_property_find_safe(scene, "tessera_batch_max_draw_distance"), 0.0f);
+    if (batch > 0.0f) {
+      return batch;
+    }
+    const float scene_val = tessera_idprop_float_get(
+        tessera_scene_property_find_safe(scene, "tessera_max_draw_distance"), 0.0f);
+    if (scene_val > 0.0f) {
+      return scene_val;
+    }
+  }
+
+  /* Asset-aware default draw distances (same table as Workbench):
+   * Small details: cull beyond 20-22m. Medium foliage/shrubs: 28-35m.
+   * Large features (Rocks_Large, terrain): full view distance (0.0f). */
+  const std::string name1 = (ob_name.empty() && ob != nullptr) ? std::string(ob->id.name + 2) : ob_name;
+  const std::string name2 = arch_name;
+  if (tessera_name_contains_any(name1, name2, "Debris") ||
+      tessera_name_contains_any(name1, name2, "LeafScatter"))
+  {
+    return 20.0f;
+  }
+  if (tessera_name_contains_any(name1, name2, "Rocks_Small") ||
+      tessera_name_contains_any(name1, name2, "SweetViolet") ||
+      tessera_name_contains_any(name1, name2, "Pebble") ||
+      tessera_name_contains_any(name1, name2, "Stick"))
+  {
+    return 22.0f;
+  }
+  if (tessera_name_contains_any(name1, name2, "Galetta") ||
+      tessera_name_contains_any(name1, name2, "Grass"))
+  {
+    return 28.0f;
+  }
+  if (tessera_name_contains_any(name1, name2, "StickyWilly") ||
+      tessera_name_contains_any(name1, name2, "StingingNettle"))
+  {
+    return 30.0f;
+  }
+  if (tessera_name_contains_any(name1, name2, "DewBerry") ||
+      tessera_name_contains_any(name1, name2, "Shrub") ||
+      tessera_name_contains_any(name1, name2, "Bush") ||
+      tessera_name_contains_any(name1, name2, "Flower") ||
+      tessera_name_contains_any(name1, name2, "Cactus"))
+  {
+    return 35.0f;
+  }
+  return 0.0f;
+}
+
+/* Sub-pixel instance culling threshold in screen pixels (mirrors
+ * workbench::tessera_min_screen_radius_get): object property, then scene
+ * properties, then asset-calibrated defaults. Instances smaller than this
+ * projected radius are culled with zero visual degradation. */
+static float eevee_min_screen_radius_get(const Scene *scene,
+                                         Object *ob,
+                                         const std::string &arch_name)
+{
+  if (ob != nullptr) {
+    const float value = tessera_idprop_float_get(
+        tessera_property_find_safe(ob, "tessera_min_screen_radius"), -1.0f);
+    if (value >= 0.0f) {
+      return value;
+    }
+  }
+  if (scene != nullptr) {
+    const float batch = tessera_idprop_float_get(
+        tessera_scene_property_find_safe(scene, "tessera_batch_min_screen_radius"), -1.0f);
+    if (batch >= 0.0f) {
+      return batch;
+    }
+    const float scene_val = tessera_idprop_float_get(
+        tessera_scene_property_find_safe(scene, "tessera_min_screen_radius"), -1.0f);
+    if (scene_val >= 0.0f) {
+      return scene_val;
+    }
+  }
+
+  /* Asset-calibrated sub-pixel thresholds (same table as Workbench):
+   * Tiny clutter: 4.5px removes tens of thousands of sub-pixel instances.
+   * Medium foliage: 2.5px. Large rocks and trees: 1.5px. */
+  const std::string name1 = (ob != nullptr) ? std::string(ob->id.name + 2) : "";
+  const std::string name2 = arch_name;
+  if (tessera_name_contains_any(name1, name2, "Rocks_Small") ||
+      tessera_name_contains_any(name1, name2, "SweetViolet") ||
+      tessera_name_contains_any(name1, name2, "Debris") ||
+      tessera_name_contains_any(name1, name2, "LeafScatter") ||
+      tessera_name_contains_any(name1, name2, "Stick") ||
+      tessera_name_contains_any(name1, name2, "Pebble"))
+  {
+    return 4.5f;
+  }
+  if (tessera_name_contains_any(name1, name2, "Galetta") ||
+      tessera_name_contains_any(name1, name2, "DewBerry") ||
+      tessera_name_contains_any(name1, name2, "StickyWilly") ||
+      tessera_name_contains_any(name1, name2, "StingingNettle") ||
+      tessera_name_contains_any(name1, name2, "Grass") ||
+      tessera_name_contains_any(name1, name2, "Bush") ||
+      tessera_name_contains_any(name1, name2, "Flower") ||
+      tessera_name_contains_any(name1, name2, "Cactus"))
+  {
+    return 2.5f;
+  }
+  return 1.5f;
 }
 
 /* Expand the traversal culling margin for scattered instance fields so the
@@ -671,15 +816,18 @@ static bool tessera_camera_persmat(const Scene *scene,
                                   const int2 &resolution,
                                   const Object *state_ob,
                                   float4x4 &r_persmat,
-                                  float &r_proj_scale_y)
+                                  float &r_proj_scale_y,
+                                  const Object *arch_ob = nullptr)
 {
   if (scene == nullptr || draw_ctx->depsgraph == nullptr) {
     return false;
   }
-  const Object *cam_ob = nullptr;
-  if (state_ob != nullptr) {
-    const IDProperty *cull_cam_prop = tessera_property_find(
-        const_cast<Object *>(state_ob), "tessera_cull_camera");
+  auto find_cull_cam = [&](const Object *target) -> const Object * {
+    if (target == nullptr) {
+      return nullptr;
+    }
+    IDProperty *cull_cam_prop = tessera_property_find_safe(
+        const_cast<Object *>(target), "tessera_cull_camera");
     if (cull_cam_prop != nullptr && cull_cam_prop->type == IDP_STRING) {
       const char *cam_name = IDP_string_get(cull_cam_prop);
       if (cam_name != nullptr && cam_name[0] != '\0') {
@@ -688,11 +836,19 @@ static bool tessera_camera_persmat(const Scene *scene,
           Object *found = static_cast<Object *>(
               BLI_findstring(&bmain->objects, cam_name, offsetof(ID, name) + 2));
           if (found != nullptr) {
-            cam_ob = DEG_get_evaluated(draw_ctx->depsgraph, found);
+            return DEG_get_evaluated(draw_ctx->depsgraph, found);
           }
         }
       }
     }
+    return nullptr;
+  };
+  const Object *cam_ob = nullptr;
+  if (arch_ob != nullptr) {
+    cam_ob = find_cull_cam(arch_ob);
+  }
+  if (cam_ob == nullptr && state_ob != nullptr) {
+    cam_ob = find_cull_cam(state_ob);
   }
   if (cam_ob == nullptr && scene->camera != nullptr) {
     cam_ob = DEG_get_evaluated(draw_ctx->depsgraph, scene->camera);
@@ -2025,14 +2181,25 @@ void TesseraModule::draw_prepass(const draw::View &view,
         tessera_view_source_get(state.ob) : state.view_source;
     state.view_source = view_source;
 
+    Object *arch_ob = (!state.matched_archetype_name.empty() && inst_.draw_ctx != nullptr) ?
+                          tessera_object_revalidate(inst_.draw_ctx, state.matched_archetype_name) :
+                          nullptr;
+    /* A dedicated culling camera ("tessera_cull_camera", the camera fulcrum)
+     * marks the object as camera-driven even in a user perspective view, just
+     * like Workbench does, so per-instance frustum culling can reject copies
+     * outside the fulcrum camera's view while orbiting in the viewport. */
+    const bool has_explicit_cull_cam =
+        (tessera_property_find_safe(ob, "tessera_cull_camera") != nullptr) ||
+        (arch_ob != nullptr && tessera_property_find_safe(arch_ob, "tessera_cull_camera") != nullptr);
     float4x4 cam_persmat;
     float cam_proj_scale_y = viewport_proj_scale_y;
     const bool is_cam_view = (state.view_source != 0) ||
+                             has_explicit_cull_cam ||
                              (inst_.rv3d != nullptr && inst_.rv3d->persp == RV3D_CAMOB);
     bool has_cam_lod = false;
     if (is_cam_view) {
       if (tessera_camera_persmat(
-              inst_.scene, inst_.draw_ctx, resolution, state.ob, cam_persmat, cam_proj_scale_y))
+              inst_.scene, inst_.draw_ctx, resolution, state.ob, cam_persmat, cam_proj_scale_y, arch_ob))
       {
         has_cam_lod = true;
       }
@@ -2124,14 +2291,25 @@ void TesseraModule::draw_prepass(const draw::View &view,
         tessera_view_source_get(state.ob) : state.view_source;
     state.view_source = view_source;
 
+    Object *arch_ob = (!state.matched_archetype_name.empty() && inst_.draw_ctx != nullptr) ?
+                          tessera_object_revalidate(inst_.draw_ctx, state.matched_archetype_name) :
+                          nullptr;
+    /* A dedicated culling camera ("tessera_cull_camera", the camera fulcrum)
+     * marks the object as camera-driven even in a user perspective view, just
+     * like Workbench does, so per-instance frustum culling can reject copies
+     * outside the fulcrum camera's view while orbiting in the viewport. */
+    const bool has_explicit_cull_cam =
+        (tessera_property_find_safe(ob, "tessera_cull_camera") != nullptr) ||
+        (arch_ob != nullptr && tessera_property_find_safe(arch_ob, "tessera_cull_camera") != nullptr);
     float4x4 cam_persmat;
     float cam_proj_scale_y = viewport_proj_scale_y;
     const bool is_cam_view = (state.view_source != 0) ||
+                             has_explicit_cull_cam ||
                              (inst_.rv3d != nullptr && inst_.rv3d->persp == RV3D_CAMOB);
     bool has_cam_lod = false;
     if (is_cam_view) {
       if (tessera_camera_persmat(
-              inst_.scene, inst_.draw_ctx, resolution, state.ob, cam_persmat, cam_proj_scale_y))
+              inst_.scene, inst_.draw_ctx, resolution, state.ob, cam_persmat, cam_proj_scale_y, arch_ob))
       {
         has_cam_lod = true;
       }
@@ -2197,11 +2375,21 @@ void TesseraModule::draw_prepass(const draw::View &view,
     const bool tessera_have_bs = tessera::mesh_bounds_sphere(
         state.data, tessera_bs_center, tessera_bs_radius);
 
+    /* Per-instance culling uses the fulcrum camera's frustum when LOD is
+     * camera-driven, like Workbench: scattered copies outside the camera
+     * fulcrum's view are hidden even in a user perspective viewport. */
+    const tessera::TesseraViewInfo instance_cull_view = has_cam_lod ?
+        tessera::getViewInfo(cam_persmat, float(resolution.y), cam_proj_scale_y) :
+        tessera_cull_view;
+
     state.frame_visible_instances.clear();
-    const float max_draw_dist = eevee_max_draw_dist_get(state.ob_name, state.matched_archetype_name);
+    const float max_draw_dist = eevee_max_draw_dist_get(
+        inst_.scene, state.ob, state.ob_name, state.matched_archetype_name);
     const float max_d_sq = max_draw_dist > 0.0f ? (max_draw_dist * max_draw_dist) : 0.0f;
-    const float px_scale = viewport_proj_scale_y * (float(resolution.y) * 0.5f);
-    constexpr float min_screen_radius_px = 0.5f;
+    const float px_scale = (has_cam_lod ? cam_proj_scale_y : viewport_proj_scale_y) *
+                           (float(resolution.y) * 0.5f);
+    const float min_screen_radius_px = eevee_min_screen_radius_get(
+        inst_.scene, state.ob, state.matched_archetype_name);
 
     const bool is_scatter = state.instance_mats.size() > 1;
     std::vector<std::pair<float, float4x4>> sorted_instances;
@@ -2211,8 +2399,7 @@ void TesseraModule::draw_prepass(const draw::View &view,
       float4x4 inst_mat = state.instance_mats[inst_idx];
       if (tessera_have_bs) {
         const float3 inst_pos = (inst_mat * float4(tessera_bs_center, 1.0f)).xyz();
-        const float dist_sq = math::distance_squared(tessera_cull_view.camPos, inst_pos);
-
+        const float dist_sq = math::distance_squared(instance_cull_view.camPos, inst_pos);
         if (max_d_sq > 0.0f && dist_sq > max_d_sq) {
           continue;
         }
@@ -2229,7 +2416,7 @@ void TesseraModule::draw_prepass(const draw::View &view,
           }
         }
 
-        if (!tessera::instance_in_frustum(tessera_cull_view,
+        if (!tessera::instance_in_frustum(instance_cull_view,
                                           inst_mat,
                                           tessera_bs_center,
                                           tessera_bs_radius,
@@ -2270,7 +2457,7 @@ void TesseraModule::draw_prepass(const draw::View &view,
                                       state.data,
                                       ref_mat,
                                       draw_mats,
-                                      tessera_cull_view,
+                                      instance_cull_view,
                                       state.culling_margin);
       state.pass->update(state.data,
                          ref_obj_persmat,
@@ -2342,14 +2529,25 @@ void TesseraModule::draw(const draw::View &view,
         tessera_view_source_get(state.ob) : state.view_source;
     state.view_source = view_source;
 
+    Object *arch_ob = (!state.matched_archetype_name.empty() && inst_.draw_ctx != nullptr) ?
+                          tessera_object_revalidate(inst_.draw_ctx, state.matched_archetype_name) :
+                          nullptr;
+    /* A dedicated culling camera ("tessera_cull_camera", the camera fulcrum)
+     * marks the object as camera-driven even in a user perspective view, just
+     * like Workbench does, so per-instance frustum culling can reject copies
+     * outside the fulcrum camera's view while orbiting in the viewport. */
+    const bool has_explicit_cull_cam =
+        (tessera_property_find_safe(ob, "tessera_cull_camera") != nullptr) ||
+        (arch_ob != nullptr && tessera_property_find_safe(arch_ob, "tessera_cull_camera") != nullptr);
     float4x4 cam_persmat;
     float cam_proj_scale_y = viewport_proj_scale_y;
     const bool is_cam_view = (state.view_source != 0) ||
+                             has_explicit_cull_cam ||
                              (inst_.rv3d != nullptr && inst_.rv3d->persp == RV3D_CAMOB);
     bool has_cam_lod = false;
     if (is_cam_view) {
       if (tessera_camera_persmat(
-              inst_.scene, inst_.draw_ctx, resolution, state.ob, cam_persmat, cam_proj_scale_y))
+              inst_.scene, inst_.draw_ctx, resolution, state.ob, cam_persmat, cam_proj_scale_y, arch_ob))
       {
         has_cam_lod = true;
       }
@@ -2417,12 +2615,17 @@ void TesseraModule::draw(const draw::View &view,
     const bool show_fps_panel = state.show_fps_panel;
     const bool show_fps_hud = state.show_fps_hud;
     state.pass->setTelemetryEnabled(show_stats || log_console || show_fps_panel || show_fps_hud);
+    /* Fulcrum-aware view for traversal margin expansion (matches the culling
+     * view used for the scattered instances). */
+    const tessera::TesseraViewInfo instance_cull_view = has_cam_lod ?
+        tessera::getViewInfo(cam_persmat, float(resolution.y), cam_proj_scale_y) :
+        tessera_cull_view;
     if (!state.traversed_this_frame) {
       tessera_expand_traversal_margin(*state.pass,
                                       state.data,
                                       state.object_mat,
                                       state.instance_mats,
-                                      tessera_cull_view,
+                                      instance_cull_view,
                                       state.culling_margin);
       state.pass->update(state.data,
                          object_persmat,
@@ -2539,14 +2742,25 @@ void TesseraModule::draw_gbuffer(const draw::View &view,
         tessera_view_source_get(state.ob) : state.view_source;
     state.view_source = view_source;
 
+    Object *arch_ob = (!state.matched_archetype_name.empty() && inst_.draw_ctx != nullptr) ?
+                          tessera_object_revalidate(inst_.draw_ctx, state.matched_archetype_name) :
+                          nullptr;
+    /* A dedicated culling camera ("tessera_cull_camera", the camera fulcrum)
+     * marks the object as camera-driven even in a user perspective view, just
+     * like Workbench does, so per-instance frustum culling can reject copies
+     * outside the fulcrum camera's view while orbiting in the viewport. */
+    const bool has_explicit_cull_cam =
+        (tessera_property_find_safe(ob, "tessera_cull_camera") != nullptr) ||
+        (arch_ob != nullptr && tessera_property_find_safe(arch_ob, "tessera_cull_camera") != nullptr);
     float4x4 cam_persmat;
     float cam_proj_scale_y = viewport_proj_scale_y;
     const bool is_cam_view = (state.view_source != 0) ||
+                             has_explicit_cull_cam ||
                              (inst_.rv3d != nullptr && inst_.rv3d->persp == RV3D_CAMOB);
     bool has_cam_lod = false;
     if (is_cam_view) {
       if (tessera_camera_persmat(
-              inst_.scene, inst_.draw_ctx, resolution, state.ob, cam_persmat, cam_proj_scale_y))
+              inst_.scene, inst_.draw_ctx, resolution, state.ob, cam_persmat, cam_proj_scale_y, arch_ob))
       {
         has_cam_lod = true;
       }
@@ -2640,14 +2854,25 @@ void TesseraModule::draw_gbuffer(const draw::View &view,
         tessera_view_source_get(state.ob) : state.view_source;
     state.view_source = view_source;
 
+    Object *arch_ob = (!state.matched_archetype_name.empty() && inst_.draw_ctx != nullptr) ?
+                          tessera_object_revalidate(inst_.draw_ctx, state.matched_archetype_name) :
+                          nullptr;
+    /* A dedicated culling camera ("tessera_cull_camera", the camera fulcrum)
+     * marks the object as camera-driven even in a user perspective view, just
+     * like Workbench does, so per-instance frustum culling can reject copies
+     * outside the fulcrum camera's view while orbiting in the viewport. */
+    const bool has_explicit_cull_cam =
+        (tessera_property_find_safe(ob, "tessera_cull_camera") != nullptr) ||
+        (arch_ob != nullptr && tessera_property_find_safe(arch_ob, "tessera_cull_camera") != nullptr);
     float4x4 cam_persmat;
     float cam_proj_scale_y = viewport_proj_scale_y;
     const bool is_cam_view = (state.view_source != 0) ||
+                             has_explicit_cull_cam ||
                              (inst_.rv3d != nullptr && inst_.rv3d->persp == RV3D_CAMOB);
     bool has_cam_lod = false;
     if (is_cam_view) {
       if (tessera_camera_persmat(
-              inst_.scene, inst_.draw_ctx, resolution, state.ob, cam_persmat, cam_proj_scale_y))
+              inst_.scene, inst_.draw_ctx, resolution, state.ob, cam_persmat, cam_proj_scale_y, arch_ob))
       {
         has_cam_lod = true;
       }
@@ -2692,19 +2917,27 @@ void TesseraModule::draw_gbuffer(const draw::View &view,
 
     /* If prepass was bypassed, run frustum & distance culling for scatter instances */
     if (state.frame_visible_instances.empty() && !state.traversed_this_frame) {
+      /* Fulcrum-aware culling view: cull scattered copies against the camera
+       * fulcrum's frustum (and distance), not the user viewport's. */
+      const tessera::TesseraViewInfo instance_cull_view = has_cam_lod ?
+          tessera::getViewInfo(cam_persmat, float(resolution.y), cam_proj_scale_y) :
+          tessera_cull_view;
       float3 tessera_bs_center(0.0f);
       float tessera_bs_radius = 0.0f;
       const bool tessera_have_bs = tessera::mesh_bounds_sphere(
           state.data, tessera_bs_center, tessera_bs_radius);
-      const float max_draw_dist = eevee_max_draw_dist_get(state.ob_name, state.matched_archetype_name);
+      const float max_draw_dist = eevee_max_draw_dist_get(
+          inst_.scene, state.ob, state.ob_name, state.matched_archetype_name);
       const float max_d_sq = max_draw_dist > 0.0f ? (max_draw_dist * max_draw_dist) : 0.0f;
-      const float px_scale = viewport_proj_scale_y * (float(resolution.y) * 0.5f);
-      constexpr float min_screen_radius_px = 0.5f;
+      const float px_scale = (has_cam_lod ? cam_proj_scale_y : viewport_proj_scale_y) *
+                             (float(resolution.y) * 0.5f);
+      const float min_screen_radius_px = eevee_min_screen_radius_get(
+          inst_.scene, state.ob, state.matched_archetype_name);
 
       for (const float4x4 &inst_mat : state.instance_mats) {
         if (tessera_have_bs) {
           const float3 inst_pos = (inst_mat * float4(tessera_bs_center, 1.0f)).xyz();
-          const float dist_sq = math::distance_squared(tessera_cull_view.camPos, inst_pos);
+          const float dist_sq = math::distance_squared(instance_cull_view.camPos, inst_pos);
           if (max_d_sq > 0.0f && dist_sq > max_d_sq) continue;
           if (px_scale > 0.0f && tessera_bs_radius > 0.0f) {
             const float inst_scale = std::max({math::length(inst_mat[0].xyz()),
@@ -2714,7 +2947,7 @@ void TesseraModule::draw_gbuffer(const draw::View &view,
             const float d = std::sqrt(std::max(0.001f, dist_sq));
             if ((world_radius * px_scale) / d < min_screen_radius_px) continue;
           }
-          if (!tessera::instance_in_frustum(tessera_cull_view, inst_mat, tessera_bs_center, tessera_bs_radius, state.culling_margin)) continue;
+          if (!tessera::instance_in_frustum(instance_cull_view, inst_mat, tessera_bs_center, tessera_bs_radius, state.culling_margin)) continue;
         }
         state.frame_visible_instances.push_back(inst_mat);
       }
@@ -2735,6 +2968,10 @@ void TesseraModule::draw_gbuffer(const draw::View &view,
     const auto &draw_mats = state.frame_visible_instances;
     if (!draw_mats.empty()) {
       if (!state.traversed_this_frame) {
+        /* Fulcrum-aware view for margin expansion, matching the culling view. */
+        const tessera::TesseraViewInfo instance_cull_view = has_cam_lod ?
+            tessera::getViewInfo(cam_persmat, float(resolution.y), cam_proj_scale_y) :
+            tessera_cull_view;
         const float4x4 &ref_mat = draw_mats[0];
         const float4x4 ref_obj_persmat = viewport_persmat * ref_mat;
         const float4x4 ref_lod_obj_persmat = has_cam_lod ? (cam_persmat * ref_mat) : ref_obj_persmat;
@@ -2747,7 +2984,7 @@ void TesseraModule::draw_gbuffer(const draw::View &view,
                                         state.data,
                                         ref_mat,
                                         draw_mats,
-                                        tessera_cull_view,
+                                        instance_cull_view,
                                         state.culling_margin);
         state.pass->update(state.data,
                            ref_obj_persmat,

@@ -1608,7 +1608,19 @@ static void drw_draw_render_loop_3d(DRWContext &draw_ctx, RenderEngineType *engi
       const bool is_selected = (ob.base_flag & BASE_SELECTED) != 0;
       const bool instances_cached = (is_workbench && blender::DRW_workbench_tessera_instances_cached()) ||
                                     (is_eevee && blender::eevee::DRW_eevee_tessera_instances_cached());
-      if (!is_selected && instances_cached) {
+      /* Tessera instancer duplis must be skipped regardless of selection:
+       * both Tessera pipelines (Workbench solid and EEVEE material preview)
+       * bypass native geometry for tessera-enabled objects. Leaving the dupli
+       * ObjectRefs in the iteration when the emitter happens to be selected
+       * makes EEVEE draw the full unculled instance cloud through its standard
+       * material pipeline (very slow, defeats camera culling). Selection is
+       * still visible via the overlay outline on the emitter itself. */
+      if (std::getenv("TESSERA_DEBUG") != nullptr && (is_selected || !instances_cached)) {
+        std::printf("[tess-drawctx] duplis-native: name=%s selected=%d cached=%d eevee=%d\n",
+                    ob.id.name + 2, int(is_selected), int(instances_cached), int(is_eevee));
+        std::fflush(stdout);
+      }
+      if (instances_cached) {
         bool is_tess_instancer = false;
         if (ob.id.properties != nullptr) {
           if (IDP_GetPropertyFromGroup(ob.id.properties, "tessera_nc2") != nullptr ||
