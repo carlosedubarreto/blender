@@ -1583,6 +1583,11 @@ bool TesseraVisibilityPass::ensure_vis_resources()
     if (!gpu_available()) {
         return false;
     }
+    if (mDefaultWhiteTex == nullptr || mDefaultNormalTex == nullptr || mDefaultRoughTex == nullptr) {
+        if (!init()) {
+            return false;
+        }
+    }
     if (mVisShader == nullptr) {
         mVisShader = createVisShader();
     }
@@ -1622,6 +1627,7 @@ bool TesseraVisibilityPass::ensure_vis_resources()
 
 void TesseraVisibilityPass::terminate()
 {
+    GPU_texture_unbind_all();
     GPU_FRAMEBUFFER_FREE_SAFE(mFrameBuffer);
     GPU_TEXTURE_FREE_SAFE(mVisTexture);
     GPU_TEXTURE_FREE_SAFE(mDepthTexture);
@@ -2022,6 +2028,15 @@ void TesseraVisibilityPass::render(gpu::StorageBuf *command_buf,
     if (use_scissor) {
         GPU_scissor_test(false);
     }
+    GPU_texture_unbind_all();
+    if (mPositionsBuf != nullptr) GPU_storagebuf_unbind(mPositionsBuf);
+    if (mNormalsBuf != nullptr) GPU_storagebuf_unbind(mNormalsBuf);
+    if (mUvsBuf != nullptr) GPU_storagebuf_unbind(mUvsBuf);
+    if (mIndicesBuf != nullptr) GPU_storagebuf_unbind(mIndicesBuf);
+    if (mTangentsBuf != nullptr) GPU_storagebuf_unbind(mTangentsBuf);
+    if (mTriMaterialsBuf != nullptr) GPU_storagebuf_unbind(mTriMaterialsBuf);
+    if (mMaterialParamsBuf != nullptr) GPU_storagebuf_unbind(mMaterialParamsBuf);
+    GPU_shader_unbind();
 }
 
 void TesseraVisibilityPass::render_depth_prepass(gpu::StorageBuf *command_buf,
@@ -2075,9 +2090,7 @@ void TesseraVisibilityPass::render_depth_prepass(gpu::StorageBuf *command_buf,
         const bool slot_has_diffuse = (s < int(mMaterials.size())) &&
                                       mMaterials[s].has_diffuse &&
                                       (mMaterials[s].diffuse != nullptr);
-        gpu::Texture *diff = slot_has_diffuse ?
-                                 mMaterials[s].diffuse :
-                                 ((mDefaultWhiteTex != nullptr) ? mDefaultWhiteTex : nullptr);
+        gpu::Texture *diff = slot_has_diffuse ? mMaterials[s].diffuse : mDefaultWhiteTex;
         if (diff != nullptr) {
             GPU_texture_bind(diff, s);
         }
@@ -2122,6 +2135,13 @@ void TesseraVisibilityPass::render_depth_prepass(gpu::StorageBuf *command_buf,
     }
 
     GPU_color_mask(true, true, true, true);
+    GPU_texture_unbind_all();
+    if (mIndicesBuf != nullptr) GPU_storagebuf_unbind(mIndicesBuf);
+    if (mPositionsBuf != nullptr) GPU_storagebuf_unbind(mPositionsBuf);
+    if (mUvsBuf != nullptr) GPU_storagebuf_unbind(mUvsBuf);
+    if (mTriMaterialsBuf != nullptr) GPU_storagebuf_unbind(mTriMaterialsBuf);
+    if (counter_buf != nullptr) GPU_storagebuf_unbind(counter_buf);
+    GPU_shader_unbind();
 }
 
 void TesseraVisibilityPass::render_gbuffer(gpu::StorageBuf *command_buf,
@@ -2394,6 +2414,15 @@ void TesseraVisibilityPass::render_gbuffer(gpu::StorageBuf *command_buf,
     if (use_scissor) {
         GPU_scissor_test(false);
     }
+    GPU_texture_unbind_all();
+    if (mPositionsBuf != nullptr) GPU_storagebuf_unbind(mPositionsBuf);
+    if (mNormalsBuf != nullptr) GPU_storagebuf_unbind(mNormalsBuf);
+    if (mUvsBuf != nullptr) GPU_storagebuf_unbind(mUvsBuf);
+    if (mIndicesBuf != nullptr) GPU_storagebuf_unbind(mIndicesBuf);
+    if (mTangentsBuf != nullptr) GPU_storagebuf_unbind(mTangentsBuf);
+    if (mTriMaterialsBuf != nullptr) GPU_storagebuf_unbind(mTriMaterialsBuf);
+    if (mMaterialParamsBuf != nullptr) GPU_storagebuf_unbind(mMaterialParamsBuf);
+    GPU_shader_unbind();
 }
 
 

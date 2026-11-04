@@ -1548,6 +1548,25 @@ static std::vector<tessera::TesseraMaterialTextures> tessera_extract_materials(O
   return result;
 }
 
+static void tessera_acquire_materials(draw::Manager *manager,
+                                      const std::vector<tessera::TesseraMaterialTextures> &materials)
+{
+  if (manager == nullptr) {
+    return;
+  }
+  for (const auto &m : materials) {
+    if (m.has_diffuse && m.diffuse != nullptr) {
+      manager->acquire_texture(m.diffuse);
+    }
+    if (m.has_normal && m.normal != nullptr) {
+      manager->acquire_texture(m.normal);
+    }
+    if (m.has_roughness && m.roughness != nullptr) {
+      manager->acquire_texture(m.roughness);
+    }
+  }
+}
+
 static std::string tessera_texture_lod_mode_get(Object *ob)
 {
   if (ob == nullptr) {
@@ -1855,6 +1874,7 @@ bool TesseraModule::record(const draw::ObjectRef &ob_ref)
       state.materials[0].base_color = state.base_color;
     }
   }
+  tessera_acquire_materials(inst_.manager, state.materials);
 
   if (arch_resolved && arch.built_data != nullptr) {
     if (state.data_source_key != arch.source_name || state.data.clusters.empty()) {
@@ -2264,6 +2284,17 @@ void TesseraModule::draw_prepass(const draw::View &view,
 
     state.pass->setTextureScale(state.current_tex_scale);
     state.pass->set_material_textures(state.materials);
+    state.pass->set_two_sided(state.two_sided);
+    tessera_acquire_materials(inst_.manager, state.materials);
+    bool has_diffuse_tex = false;
+    for (const auto &m : state.materials) {
+      if (m.has_diffuse && m.diffuse != nullptr) {
+        has_diffuse_tex = true;
+        break;
+      }
+    }
+    state.pass->set_alpha_mask(has_diffuse_tex);
+    tessera_acquire_materials(inst_.manager, state.materials);
 
     if (state.pass->drawCount() != 0) {
       state.pass->draw_prepass(resolution.x, resolution.y);
@@ -2791,6 +2822,7 @@ void TesseraModule::draw(const draw::View &view,
 
     state.pass->setTextureScale(state.current_tex_scale);
     state.pass->set_material_textures(state.materials);
+    tessera_acquire_materials(inst_.manager, state.materials);
     if (state.pass->drawCount() != 0) {
       state.pass->set_two_sided(state.two_sided);
       if (!state.instance_mats.empty()) {
@@ -3304,6 +3336,7 @@ void TesseraModule::draw_gbuffer(const draw::View &view,
 
     if (state.frame_band_count > 0) {
       update_telemetry(state, view.location());
+      tessera_acquire_materials(inst_.manager, state.materials);
 
       bool has_diffuse_tex = false;
       for (const auto &m : state.materials) {
