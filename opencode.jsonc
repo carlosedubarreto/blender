@@ -21,7 +21,7 @@
     "prune": true,
     "buffer": "20%",
     "keep": {
-      "tokens": 5000
+      "tokens": 4000
     }
   },
 

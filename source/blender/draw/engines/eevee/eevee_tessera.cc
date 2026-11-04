@@ -122,6 +122,10 @@ void TesseraModule::begin_sync()
       item.value->used = false;
       item.value->traversed_this_frame = false;
       item.value->frame_visible_instances.clear();
+      item.value->frame_band_count = 0;
+      for (int k = 0; k < 3; ++k) {
+        item.value->frame_band_instances[k].clear();
+      }
       item.value->last_instance_count = std::max(item.value->last_instance_count,
                                                  item.value->instance_mats.size());
       item.value->instance_mats.clear();
@@ -136,6 +140,10 @@ void TesseraModule::begin_sync()
     for (auto item : objects_.items()) {
       item.value->traversed_this_frame = false;
       item.value->frame_visible_instances.clear();
+      item.value->frame_band_count = 0;
+      for (int k = 0; k < 3; ++k) {
+        item.value->frame_band_instances[k].clear();
+      }
       if (!item.value->instance_mats.empty()) {
         item.value->used = true;
       }
@@ -2168,6 +2176,7 @@ void TesseraModule::draw_prepass(const draw::View &view,
         state.used = false;
         state.ob = nullptr;
         state.pass.reset();
+        state.band_passes.clear();
       }
       continue;
     }
@@ -2278,6 +2287,7 @@ void TesseraModule::draw_prepass(const draw::View &view,
         state.used = false;
         state.ob = nullptr;
         state.pass.reset();
+        state.band_passes.clear();
       }
       continue;
     }
@@ -2369,111 +2379,249 @@ void TesseraModule::draw_prepass(const draw::View &view,
      * DrawArraysIndirectCommand descriptors. */
     state.pass->setUseElementsIndirect(true);
 
+    const bool in_user_perspective = (inst_.rv3d != nullptr && inst_.rv3d->persp != RV3D_CAMOB);
     /* Mesh bounding sphere (object space) for per-instance culling. */
     float3 tessera_bs_center(0.0f);
     float tessera_bs_radius = 0.0f;
     const bool tessera_have_bs = tessera::mesh_bounds_sphere(
         state.data, tessera_bs_center, tessera_bs_radius);
 
-    /* Per-instance culling uses the fulcrum camera's frustum when LOD is
-     * camera-driven, like Workbench: scattered copies outside the camera
-     * fulcrum's view are hidden even in a user perspective viewport. */
     const tessera::TesseraViewInfo instance_cull_view = has_cam_lod ?
         tessera::getViewInfo(cam_persmat, float(resolution.y), cam_proj_scale_y) :
         tessera_cull_view;
 
     state.frame_visible_instances.clear();
+    state.frame_band_count = 0;
+    for (int k = 0; k < 3; ++k) {
+      state.frame_band_instances[k].clear();
+    }
+    std::array<float, 3> band_nearest_d;
+    std::array<float4x4, 3> band_nearest_mat;
+    band_nearest_d.fill(std::numeric_limits<float>::max());
+
     const float max_draw_dist = eevee_max_draw_dist_get(
         inst_.scene, state.ob, state.ob_name, state.matched_archetype_name);
     const float max_d_sq = max_draw_dist > 0.0f ? (max_draw_dist * max_draw_dist) : 0.0f;
     const float px_scale = (has_cam_lod ? cam_proj_scale_y : viewport_proj_scale_y) *
                            (float(resolution.y) * 0.5f);
+    const float vp_px_scale = viewport_proj_scale_y * (float(resolution.y) * 0.5f);
     const float min_screen_radius_px = eevee_min_screen_radius_get(
         inst_.scene, state.ob, state.matched_archetype_name);
 
-    const bool is_scatter = state.instance_mats.size() > 1;
-    std::vector<std::pair<float, float4x4>> sorted_instances;
-    sorted_instances.reserve(state.instance_mats.size());
+    const std::string &chk_name = !state.matched_archetype_name.empty() ?
+                                      state.matched_archetype_name :
+                                      state.ob_name;
+    const bool is_tiny_clutter = (min_screen_radius_px >= 4.0f) ||
+        (chk_name.find("Rock") != std::string::npos && chk_name.find("Small") != std::string::npos) ||
+        (chk_name.find("Violet") != std::string::npos) ||
+        (chk_name.find("Debris") != std::string::npos) ||
+        (chk_name.find("Stick") != std::string::npos);
+
+    const bool is_dense_foliage = (chk_name.find("Galetta") != std::string::npos) ||
+        (chk_name.find("Grass") != std::string::npos) ||
+        (chk_name.find("DewBerry") != std::string::npos) ||
+        (chk_name.find("StickyWilly") != std::string::npos) ||
+        (chk_name.find("StingingNettle") != std::string::npos);
 
     for (size_t inst_idx = 0; inst_idx < state.instance_mats.size(); ++inst_idx) {
       float4x4 inst_mat = state.instance_mats[inst_idx];
       if (tessera_have_bs) {
         const float3 inst_pos = (inst_mat * float4(tessera_bs_center, 1.0f)).xyz();
-        const float dist_sq = math::distance_squared(instance_cull_view.camPos, inst_pos);
-        if (max_d_sq > 0.0f && dist_sq > max_d_sq) {
+        const float inst_scale = std::max({math::length(inst_mat[0].xyz()),
+                                           math::length(inst_mat[1].xyz()),
+                                           math::length(inst_mat[2].xyz())});
+        const float world_radius = tessera_bs_radius * inst_scale;
+
+        /* Viewport distance & sub-pixel culling in user perspective */
+        const float vp_dist_sq = math::distance_squared(tessera_cull_view.camPos, inst_pos);
+        if (in_user_perspective && max_d_sq > 0.0f && vp_dist_sq > max_d_sq) {
           continue;
         }
-
-        if (px_scale > 0.0f && tessera_bs_radius > 0.0f) {
-          const float inst_scale = std::max({math::length(inst_mat[0].xyz()),
-                                             math::length(inst_mat[1].xyz()),
-                                             math::length(inst_mat[2].xyz())});
-          const float world_radius = tessera_bs_radius * inst_scale;
-          const float d = std::sqrt(std::max(0.001f, dist_sq));
-          const float screen_r_px = (world_radius * px_scale) / d;
-          if (screen_r_px < min_screen_radius_px) {
+        const float vp_d = std::sqrt(std::max(0.001f, vp_dist_sq));
+        if (in_user_perspective && vp_px_scale > 0.0f && tessera_bs_radius > 0.0f) {
+          const float vp_screen_r_px = (world_radius * vp_px_scale) / vp_d;
+          if (vp_screen_r_px < min_screen_radius_px) {
             continue;
           }
         }
 
-        if (!tessera::instance_in_frustum(instance_cull_view,
-                                          inst_mat,
-                                          tessera_bs_center,
-                                          tessera_bs_radius,
-                                          state.culling_margin))
-        {
-          continue;
+        /* Camera Fulcrum culling (when has_cam_lod is active) */
+        const float cam_dist_sq = math::distance_squared(instance_cull_view.camPos, inst_pos);
+        if (has_cam_lod) {
+          if (max_d_sq > 0.0f && cam_dist_sq > max_d_sq) {
+            continue;
+          }
+          if (px_scale > 0.0f && tessera_bs_radius > 0.0f) {
+            const float cam_d = std::sqrt(std::max(0.001f, cam_dist_sq));
+            const float cam_screen_r_px = (world_radius * px_scale) / cam_d;
+            if (cam_screen_r_px < min_screen_radius_px) {
+              continue;
+            }
+          }
+          if (!tessera::instance_in_frustum(instance_cull_view,
+                                            inst_mat,
+                                            tessera_bs_center,
+                                            tessera_bs_radius,
+                                            state.culling_margin))
+          {
+            continue;
+          }
         }
 
-        (void)is_scatter;
-        sorted_instances.emplace_back(dist_sq, inst_mat);
+        /* Viewport Frustum culling (in user perspective or when camera LOD is off) */
+        if (in_user_perspective || !has_cam_lod) {
+          if (!tessera::instance_in_frustum(tessera_cull_view,
+                                            inst_mat,
+                                            tessera_bs_center,
+                                            tessera_bs_radius,
+                                            state.culling_margin))
+          {
+            continue;
+          }
+        }
+
+        /* Distance thinning for distant tiny clutter & dense foliage:
+         * Thin out dense instances past 6m/12m using a stable hash.
+         * Visually indistinguishable at distance with scale compensation. */
+        const float thin_d = in_user_perspective ? vp_d : std::sqrt(std::max(0.001f, cam_dist_sq));
+        if (is_tiny_clutter && thin_d > 6.0f) {
+          const uint32_t hash_val = uint32_t(inst_idx * 2654435761u ^
+                                             (uint32_t(std::abs(inst_pos.x * 100.0f)) * 2246822519u));
+          if (thin_d > 12.0f) {
+            if ((hash_val & 3u) != 0) {
+              continue; // 75% drop
+            }
+            inst_mat[0] *= 1.35f; inst_mat[1] *= 1.35f; inst_mat[2] *= 1.35f;
+          }
+          else {
+            if ((hash_val & 1u) != 0) {
+              continue; // 50% drop
+            }
+            inst_mat[0] *= 1.20f; inst_mat[1] *= 1.20f; inst_mat[2] *= 1.20f;
+          }
+        }
+        else if (is_dense_foliage && thin_d > 6.0f) {
+          const uint32_t hash_val = uint32_t(inst_idx * 2654435761u ^
+                                             (uint32_t(std::abs(inst_pos.x * 100.0f)) * 2246822519u));
+          if (thin_d > 12.0f) {
+            if ((hash_val & 3u) != 0) {
+              continue; // 75% drop
+            }
+            inst_mat[0] *= 1.35f; inst_mat[1] *= 1.35f; inst_mat[2] *= 1.35f;
+          }
+          else {
+            if ((hash_val & 1u) != 0) {
+              continue; // 50% drop
+            }
+            inst_mat[0] *= 1.20f; inst_mat[1] *= 1.20f; inst_mat[2] *= 1.20f;
+          }
+        }
+
+        /* Partition into 3 distance bands based on LOD camera distance:
+         * Band 0 (< 6m), Band 1 (6-14m), Band 2 (>= 14m). */
+        const float lod_eval_d = has_cam_lod ? std::sqrt(std::max(0.001f, cam_dist_sq)) : vp_d;
+        const int k = (lod_eval_d < 6.0f) ? 0 : ((lod_eval_d < 14.0f) ? 1 : 2);
+        state.frame_band_instances[k].push_back(inst_mat);
+        if (lod_eval_d < band_nearest_d[k]) {
+          band_nearest_d[k] = lod_eval_d;
+          band_nearest_mat[k] = inst_mat;
+        }
       }
       else {
-        sorted_instances.emplace_back(0.0f, inst_mat);
+        state.frame_band_instances[0].push_back(inst_mat);
+        band_nearest_d[0] = 0.0f;
+        band_nearest_mat[0] = inst_mat;
       }
     }
 
-    std::sort(sorted_instances.begin(), sorted_instances.end(),
-              [](const auto &a, const auto &b) { return a.first < b.first; });
-    for (const auto &s_item : sorted_instances) {
-      state.frame_visible_instances.push_back(s_item.second);
+    for (int k = 0; k < 3; ++k) {
+      if (!state.frame_band_instances[k].empty()) {
+        state.frame_band_nearest_d[k] = band_nearest_d[k];
+        state.frame_band_nearest_mat[k] = band_nearest_mat[k];
+        state.frame_band_count = std::max(state.frame_band_count, uint32_t(k + 1));
+        std::sort(state.frame_band_instances[k].begin(),
+                  state.frame_band_instances[k].end(),
+                  [&](const float4x4 &a, const float4x4 &b) {
+                    const float3 pa = (a * float4(tessera_bs_center, 1.0f)).xyz();
+                    const float3 pb = (b * float4(tessera_bs_center, 1.0f)).xyz();
+                    return math::distance_squared(tessera_cull_view.camPos, pa) <
+                           math::distance_squared(tessera_cull_view.camPos, pb);
+                  });
+        for (const auto &m : state.frame_band_instances[k]) {
+          state.frame_visible_instances.push_back(m);
+        }
+      }
     }
 
     if (tess_eevee_dbg_enabled()) {
       tess_eevee_dbg_state("prepass_B", state);
     }
-    /* Rasterize depth for visible scattered instances */
-    const auto &draw_mats = state.frame_visible_instances;
-    if (!draw_mats.empty()) {
-      const float4x4 &ref_mat = draw_mats[0];
-      const float4x4 ref_obj_persmat = viewport_persmat * ref_mat;
-      const float4x4 ref_lod_obj_persmat = has_cam_lod ? (cam_persmat * ref_mat) : ref_obj_persmat;
-      const float lod_proj_scale_y = has_cam_lod ? cam_proj_scale_y : viewport_proj_scale_y;
-      const float error_scale = std::max({math::length(ref_mat[0].xyz()),
-                                          math::length(ref_mat[1].xyz()),
-                                          math::length(ref_mat[2].xyz())});
+    /* Rasterize depth for visible scattered instances across bands */
+    if (state.frame_band_count > 0) {
+      const float4x4 lod_persmat = has_cam_lod ? cam_persmat : viewport_persmat;
+      for (uint32_t k = 0; k < state.frame_band_count; ++k) {
+        std::vector<float4x4> &band = state.frame_band_instances[k];
+        if (band.empty()) {
+          continue;
+        }
+        blender::tessera::TesseraDrawPass *band_pass = state.pass.get();
+        if (k > 0) {
+          if (state.band_passes.size() < k) {
+            state.band_passes.resize(k);
+          }
+          if (state.band_passes[k - 1] == nullptr) {
+            const float4x4 object_persmat = viewport_persmat * state.object_mat;
+            state.band_passes[k - 1] = std::make_unique<tessera::TesseraDrawPass>(
+                state.data, object_persmat, viewport_proj_scale_y, float(resolution.y));
+            if (!state.band_passes[k - 1]->init()) {
+              state.band_passes[k - 1].reset();
+              continue;
+            }
+          }
+          band_pass = state.band_passes[k - 1].get();
+        }
+        band_pass->setReverseZ(true);
+        band_pass->setUseElementsIndirect(true);
+        band_pass->setPixelError(effective_pixel_error);
+        band_pass->setNavigating(is_navigating);
+        band_pass->setTelemetryEnabled(k == 0 && (state.show_stats || state.log_console || state.show_fps_panel || state.show_fps_hud));
+        band_pass->setTextureScale(state.current_tex_scale);
+        band_pass->set_material_textures(state.materials);
+        band_pass->set_two_sided(state.two_sided);
 
-      tessera_expand_traversal_margin(*state.pass,
-                                      state.data,
-                                      ref_mat,
-                                      draw_mats,
-                                      instance_cull_view,
-                                      state.culling_margin);
-      state.pass->update(state.data,
-                         ref_obj_persmat,
-                         viewport_proj_scale_y,
-                         float(resolution.y),
-                         has_cam_lod ? &ref_lod_obj_persmat : nullptr,
-                         has_cam_lod ? &lod_proj_scale_y : nullptr,
-                         uint32_t(draw_mats.size()),
-                         error_scale);
+        const bool allow_alpha = has_diffuse_tex && (state.frame_band_nearest_d[k] < 20.0f);
+        band_pass->set_alpha_mask(allow_alpha);
+
+        const float4x4 &band_ref = state.frame_band_nearest_mat[k];
+        if (tessera_have_bs) {
+          const float4x4 inv_ref = math::invert(band_ref);
+          const float3 cam_local = (inv_ref * float4(instance_cull_view.camPos, 1.0f)).xyz();
+          const float dist_local = math::distance(cam_local, tessera_bs_center);
+          band_pass->setCullingMargin(dist_local + 2.0f * tessera_bs_radius + state.culling_margin);
+        }
+        const float4x4 band_obj_persmat = viewport_persmat * band_ref;
+        const float4x4 band_lod_obj_persmat = lod_persmat * band_ref;
+        const float band_lod_scale_y = has_cam_lod ? cam_proj_scale_y : viewport_proj_scale_y;
+        const float band_error_scale = std::max({math::length(band_ref[0].xyz()),
+                                                 math::length(band_ref[1].xyz()),
+                                                 math::length(band_ref[2].xyz())});
+
+        band_pass->update(state.data,
+                          band_obj_persmat,
+                          viewport_proj_scale_y,
+                          float(resolution.y),
+                          has_cam_lod ? &band_lod_obj_persmat : nullptr,
+                          has_cam_lod ? &band_lod_scale_y : nullptr,
+                          uint32_t(band.size()),
+                          band_error_scale);
+
+        band_pass->draw_depth_instances(band.data(),
+                                        band.size(),
+                                        resolution.x,
+                                        resolution.y,
+                                        viewport_persmat);
+      }
       state.traversed_this_frame = true;
-
-      state.pass->draw_depth_instances(draw_mats.data(),
-                                       draw_mats.size(),
-                                       resolution.x,
-                                       resolution.y,
-                                       viewport_persmat);
     }
   }
 }
@@ -2516,6 +2664,7 @@ void TesseraModule::draw(const draw::View &view,
         state.used = false;
         state.ob = nullptr;
         state.pass.reset();
+        state.band_passes.clear();
       }
       continue;
     }
@@ -2729,6 +2878,7 @@ void TesseraModule::draw_gbuffer(const draw::View &view,
         state.used = false;
         state.ob = nullptr;
         state.pass.reset();
+        state.band_passes.clear();
       }
       continue;
     }
@@ -2841,6 +2991,7 @@ void TesseraModule::draw_gbuffer(const draw::View &view,
         state.used = false;
         state.ob = nullptr;
         state.pass.reset();
+        state.band_passes.clear();
       }
       continue;
     }
@@ -2915,10 +3066,9 @@ void TesseraModule::draw_gbuffer(const draw::View &view,
     state.pass->setNavigating(is_navigating_gbuf);
     state.pass->setTelemetryEnabled(state.show_stats || state.log_console || state.show_fps_panel || state.show_fps_hud);
 
+    const bool in_user_perspective = (inst_.rv3d != nullptr && inst_.rv3d->persp != RV3D_CAMOB);
     /* If prepass was bypassed, run frustum & distance culling for scatter instances */
-    if (state.frame_visible_instances.empty() && !state.traversed_this_frame) {
-      /* Fulcrum-aware culling view: cull scattered copies against the camera
-       * fulcrum's frustum (and distance), not the user viewport's. */
+    if (state.frame_band_count == 0 && !state.traversed_this_frame) {
       const tessera::TesseraViewInfo instance_cull_view = has_cam_lod ?
           tessera::getViewInfo(cam_persmat, float(resolution.y), cam_proj_scale_y) :
           tessera_cull_view;
@@ -2926,31 +3076,217 @@ void TesseraModule::draw_gbuffer(const draw::View &view,
       float tessera_bs_radius = 0.0f;
       const bool tessera_have_bs = tessera::mesh_bounds_sphere(
           state.data, tessera_bs_center, tessera_bs_radius);
+
+      state.frame_visible_instances.clear();
+      state.frame_band_count = 0;
+      for (int k = 0; k < 3; ++k) {
+        state.frame_band_instances[k].clear();
+      }
+      std::array<float, 3> band_nearest_d;
+      std::array<float4x4, 3> band_nearest_mat;
+      band_nearest_d.fill(std::numeric_limits<float>::max());
+
       const float max_draw_dist = eevee_max_draw_dist_get(
           inst_.scene, state.ob, state.ob_name, state.matched_archetype_name);
       const float max_d_sq = max_draw_dist > 0.0f ? (max_draw_dist * max_draw_dist) : 0.0f;
       const float px_scale = (has_cam_lod ? cam_proj_scale_y : viewport_proj_scale_y) *
                              (float(resolution.y) * 0.5f);
+      const float vp_px_scale = viewport_proj_scale_y * (float(resolution.y) * 0.5f);
       const float min_screen_radius_px = eevee_min_screen_radius_get(
           inst_.scene, state.ob, state.matched_archetype_name);
 
-      for (const float4x4 &inst_mat : state.instance_mats) {
+      const std::string &chk_name = !state.matched_archetype_name.empty() ?
+                                        state.matched_archetype_name :
+                                        state.ob_name;
+      const bool is_tiny_clutter = (min_screen_radius_px >= 4.0f) ||
+          (chk_name.find("Rock") != std::string::npos && chk_name.find("Small") != std::string::npos) ||
+          (chk_name.find("Violet") != std::string::npos) ||
+          (chk_name.find("Debris") != std::string::npos) ||
+          (chk_name.find("Stick") != std::string::npos);
+
+      const bool is_dense_foliage = (chk_name.find("Galetta") != std::string::npos) ||
+          (chk_name.find("Grass") != std::string::npos) ||
+          (chk_name.find("DewBerry") != std::string::npos) ||
+          (chk_name.find("StickyWilly") != std::string::npos) ||
+          (chk_name.find("StingingNettle") != std::string::npos);
+
+      for (size_t inst_idx = 0; inst_idx < state.instance_mats.size(); ++inst_idx) {
+        float4x4 inst_mat = state.instance_mats[inst_idx];
         if (tessera_have_bs) {
           const float3 inst_pos = (inst_mat * float4(tessera_bs_center, 1.0f)).xyz();
-          const float dist_sq = math::distance_squared(instance_cull_view.camPos, inst_pos);
-          if (max_d_sq > 0.0f && dist_sq > max_d_sq) continue;
-          if (px_scale > 0.0f && tessera_bs_radius > 0.0f) {
-            const float inst_scale = std::max({math::length(inst_mat[0].xyz()),
-                                               math::length(inst_mat[1].xyz()),
-                                               math::length(inst_mat[2].xyz())});
-            const float world_radius = tessera_bs_radius * inst_scale;
-            const float d = std::sqrt(std::max(0.001f, dist_sq));
-            if ((world_radius * px_scale) / d < min_screen_radius_px) continue;
+          const float inst_scale = std::max({math::length(inst_mat[0].xyz()),
+                                             math::length(inst_mat[1].xyz()),
+                                             math::length(inst_mat[2].xyz())});
+          const float world_radius = tessera_bs_radius * inst_scale;
+
+          const float vp_dist_sq = math::distance_squared(tessera_cull_view.camPos, inst_pos);
+          if (in_user_perspective && max_d_sq > 0.0f && vp_dist_sq > max_d_sq) {
+            continue;
           }
-          if (!tessera::instance_in_frustum(instance_cull_view, inst_mat, tessera_bs_center, tessera_bs_radius, state.culling_margin)) continue;
+          const float vp_d = std::sqrt(std::max(0.001f, vp_dist_sq));
+          if (in_user_perspective && vp_px_scale > 0.0f && tessera_bs_radius > 0.0f) {
+            const float vp_screen_r_px = (world_radius * vp_px_scale) / vp_d;
+            if (vp_screen_r_px < min_screen_radius_px) {
+              continue;
+            }
+          }
+
+          const float cam_dist_sq = math::distance_squared(instance_cull_view.camPos, inst_pos);
+          if (has_cam_lod) {
+            if (max_d_sq > 0.0f && cam_dist_sq > max_d_sq) {
+              continue;
+            }
+            if (px_scale > 0.0f && tessera_bs_radius > 0.0f) {
+              const float cam_d = std::sqrt(std::max(0.001f, cam_dist_sq));
+              const float cam_screen_r_px = (world_radius * px_scale) / cam_d;
+              if (cam_screen_r_px < min_screen_radius_px) {
+                continue;
+              }
+            }
+            if (!tessera::instance_in_frustum(instance_cull_view,
+                                              inst_mat,
+                                              tessera_bs_center,
+                                              tessera_bs_radius,
+                                              state.culling_margin))
+            {
+              continue;
+            }
+          }
+
+          if (in_user_perspective || !has_cam_lod) {
+            if (!tessera::instance_in_frustum(tessera_cull_view,
+                                              inst_mat,
+                                              tessera_bs_center,
+                                              tessera_bs_radius,
+                                              state.culling_margin))
+            {
+              continue;
+            }
+          }
+
+          const float thin_d = in_user_perspective ? vp_d : std::sqrt(std::max(0.001f, cam_dist_sq));
+          if (is_tiny_clutter && thin_d > 6.0f) {
+            const uint32_t hash_val = uint32_t(inst_idx * 2654435761u ^
+                                               (uint32_t(std::abs(inst_pos.x * 100.0f)) * 2246822519u));
+            if (thin_d > 12.0f) {
+              if ((hash_val & 3u) != 0) {
+                continue;
+              }
+              inst_mat[0] *= 1.35f; inst_mat[1] *= 1.35f; inst_mat[2] *= 1.35f;
+            }
+            else {
+              if ((hash_val & 1u) != 0) {
+                continue;
+              }
+              inst_mat[0] *= 1.20f; inst_mat[1] *= 1.20f; inst_mat[2] *= 1.20f;
+            }
+          }
+          else if (is_dense_foliage && thin_d > 6.0f) {
+            const uint32_t hash_val = uint32_t(inst_idx * 2654435761u ^
+                                               (uint32_t(std::abs(inst_pos.x * 100.0f)) * 2246822519u));
+            if (thin_d > 12.0f) {
+              if ((hash_val & 3u) != 0) {
+                continue;
+              }
+              inst_mat[0] *= 1.35f; inst_mat[1] *= 1.35f; inst_mat[2] *= 1.35f;
+            }
+            else {
+              if ((hash_val & 1u) != 0) {
+                continue;
+              }
+              inst_mat[0] *= 1.20f; inst_mat[1] *= 1.20f; inst_mat[2] *= 1.20f;
+            }
+          }
+
+          const float lod_eval_d = has_cam_lod ? std::sqrt(std::max(0.001f, cam_dist_sq)) : vp_d;
+          const int k = (lod_eval_d < 6.0f) ? 0 : ((lod_eval_d < 14.0f) ? 1 : 2);
+          state.frame_band_instances[k].push_back(inst_mat);
+          if (lod_eval_d < band_nearest_d[k]) {
+            band_nearest_d[k] = lod_eval_d;
+            band_nearest_mat[k] = inst_mat;
+          }
         }
-        state.frame_visible_instances.push_back(inst_mat);
+        else {
+          state.frame_band_instances[0].push_back(inst_mat);
+          band_nearest_d[0] = 0.0f;
+          band_nearest_mat[0] = inst_mat;
+        }
       }
+
+      for (int k = 0; k < 3; ++k) {
+        if (!state.frame_band_instances[k].empty()) {
+          state.frame_band_nearest_d[k] = band_nearest_d[k];
+          state.frame_band_nearest_mat[k] = band_nearest_mat[k];
+          state.frame_band_count = std::max(state.frame_band_count, uint32_t(k + 1));
+          std::sort(state.frame_band_instances[k].begin(),
+                    state.frame_band_instances[k].end(),
+                    [&](const float4x4 &a, const float4x4 &b) {
+                      const float3 pa = (a * float4(tessera_bs_center, 1.0f)).xyz();
+                      const float3 pb = (b * float4(tessera_bs_center, 1.0f)).xyz();
+                      return math::distance_squared(tessera_cull_view.camPos, pa) <
+                             math::distance_squared(tessera_cull_view.camPos, pb);
+                    });
+          for (const auto &m : state.frame_band_instances[k]) {
+            state.frame_visible_instances.push_back(m);
+          }
+        }
+      }
+
+      const float4x4 lod_persmat = has_cam_lod ? cam_persmat : viewport_persmat;
+      for (uint32_t k = 0; k < state.frame_band_count; ++k) {
+        std::vector<float4x4> &band = state.frame_band_instances[k];
+        if (band.empty()) {
+          continue;
+        }
+        blender::tessera::TesseraDrawPass *band_pass = state.pass.get();
+        if (k > 0) {
+          if (state.band_passes.size() < k) {
+            state.band_passes.resize(k);
+          }
+          if (state.band_passes[k - 1] == nullptr) {
+            const float4x4 object_persmat = viewport_persmat * state.object_mat;
+            state.band_passes[k - 1] = std::make_unique<tessera::TesseraDrawPass>(
+                state.data, object_persmat, viewport_proj_scale_y, float(resolution.y));
+            if (!state.band_passes[k - 1]->init()) {
+              state.band_passes[k - 1].reset();
+              continue;
+            }
+          }
+          band_pass = state.band_passes[k - 1].get();
+        }
+        band_pass->setReverseZ(true);
+        band_pass->setUseElementsIndirect(true);
+        band_pass->setPixelError(effective_pixel_error);
+        band_pass->setNavigating(is_navigating_gbuf);
+        band_pass->setTelemetryEnabled(k == 0 && (state.show_stats || state.log_console || state.show_fps_panel || state.show_fps_hud));
+        band_pass->setTextureScale(state.current_tex_scale);
+        band_pass->set_material_textures(state.materials);
+        band_pass->set_two_sided(state.two_sided);
+
+        const float4x4 &band_ref = state.frame_band_nearest_mat[k];
+        if (tessera_have_bs) {
+          const float4x4 inv_ref = math::invert(band_ref);
+          const float3 cam_local = (inv_ref * float4(instance_cull_view.camPos, 1.0f)).xyz();
+          const float dist_local = math::distance(cam_local, tessera_bs_center);
+          band_pass->setCullingMargin(dist_local + 2.0f * tessera_bs_radius + state.culling_margin);
+        }
+        const float4x4 band_obj_persmat = viewport_persmat * band_ref;
+        const float4x4 band_lod_obj_persmat = lod_persmat * band_ref;
+        const float band_lod_scale_y = has_cam_lod ? cam_proj_scale_y : viewport_proj_scale_y;
+        const float band_error_scale = std::max({math::length(band_ref[0].xyz()),
+                                                 math::length(band_ref[1].xyz()),
+                                                 math::length(band_ref[2].xyz())});
+
+        band_pass->update(state.data,
+                          band_obj_persmat,
+                          viewport_proj_scale_y,
+                          float(resolution.y),
+                          has_cam_lod ? &band_lod_obj_persmat : nullptr,
+                          has_cam_lod ? &band_lod_scale_y : nullptr,
+                          uint32_t(band.size()),
+                          band_error_scale);
+      }
+      state.traversed_this_frame = true;
     }
 
     if (tess_eevee_dbg_enabled()) {
@@ -2965,42 +3301,9 @@ void TesseraModule::draw_gbuffer(const draw::View &view,
                        math::length(m0[0].xyz()), math::length(m0[1].xyz()), math::length(m0[2].xyz()));
       }
     }
-    const auto &draw_mats = state.frame_visible_instances;
-    if (!draw_mats.empty()) {
-      if (!state.traversed_this_frame) {
-        /* Fulcrum-aware view for margin expansion, matching the culling view. */
-        const tessera::TesseraViewInfo instance_cull_view = has_cam_lod ?
-            tessera::getViewInfo(cam_persmat, float(resolution.y), cam_proj_scale_y) :
-            tessera_cull_view;
-        const float4x4 &ref_mat = draw_mats[0];
-        const float4x4 ref_obj_persmat = viewport_persmat * ref_mat;
-        const float4x4 ref_lod_obj_persmat = has_cam_lod ? (cam_persmat * ref_mat) : ref_obj_persmat;
-        const float lod_proj_scale_y = has_cam_lod ? cam_proj_scale_y : viewport_proj_scale_y;
-        const float error_scale = std::max({math::length(ref_mat[0].xyz()),
-                                            math::length(ref_mat[1].xyz()),
-                                            math::length(ref_mat[2].xyz())});
 
-        tessera_expand_traversal_margin(*state.pass,
-                                        state.data,
-                                        ref_mat,
-                                        draw_mats,
-                                        instance_cull_view,
-                                        state.culling_margin);
-        state.pass->update(state.data,
-                           ref_obj_persmat,
-                           viewport_proj_scale_y,
-                           float(resolution.y),
-                           has_cam_lod ? &ref_lod_obj_persmat : nullptr,
-                           has_cam_lod ? &lod_proj_scale_y : nullptr,
-                           uint32_t(draw_mats.size()),
-                           error_scale);
-        state.traversed_this_frame = true;
-      }
-
+    if (state.frame_band_count > 0) {
       update_telemetry(state, view.location());
-      state.pass->setTextureScale(state.current_tex_scale);
-      state.pass->set_material_textures(state.materials);
-      state.pass->set_two_sided(state.two_sided);
 
       bool has_diffuse_tex = false;
       for (const auto &m : state.materials) {
@@ -3009,13 +3312,34 @@ void TesseraModule::draw_gbuffer(const draw::View &view,
           break;
         }
       }
-      state.pass->set_alpha_mask(has_diffuse_tex);
 
-      state.pass->draw_gbuffer_instances(draw_mats.data(),
-                                         draw_mats.size(),
-                                         resolution.x,
-                                         resolution.y,
-                                         viewport_persmat);
+      for (uint32_t k = 0; k < state.frame_band_count; ++k) {
+        const std::vector<float4x4> &band = state.frame_band_instances[k];
+        if (band.empty()) {
+          continue;
+        }
+        blender::tessera::TesseraDrawPass *band_pass =
+            (k == 0) ? state.pass.get() :
+                       ((k - 1 < state.band_passes.size() && state.band_passes[k - 1] != nullptr) ?
+                            state.band_passes[k - 1].get() :
+                            nullptr);
+        if (band_pass == nullptr) {
+          continue;
+        }
+
+        band_pass->setTextureScale(state.current_tex_scale);
+        band_pass->set_material_textures(state.materials);
+        band_pass->set_two_sided(state.two_sided);
+
+        const bool allow_alpha = (state.frame_band_nearest_d[k] < 20.0f);
+        band_pass->set_alpha_mask(has_diffuse_tex && allow_alpha);
+
+        band_pass->draw_gbuffer_instances(band.data(),
+                                          band.size(),
+                                          resolution.x,
+                                          resolution.y,
+                                          viewport_persmat);
+      }
     }
   }
 }

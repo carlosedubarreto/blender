@@ -16,6 +16,7 @@
 #include "BLI_map.hh"
 #include "BLI_math_matrix_types.hh"
 
+#include <array>
 #include <chrono>
 #include <memory>
 #include <mutex>
@@ -76,6 +77,12 @@ class TesseraModule {
     std::vector<float4x4> instance_mats;
     /* Surviving instance matrices for the current frame after distance, screen-radius, and frustum culling */
     std::vector<float4x4> frame_visible_instances;
+    /* Distance bands for scattered instances: Band 0 (< 6m), Band 1 (6-14m), Band 2 (>= 14m) */
+    std::array<std::vector<float4x4>, 3> frame_band_instances;
+    std::array<float, 3> frame_band_nearest_d{};
+    std::array<float4x4, 3> frame_band_nearest_mat{};
+    uint32_t frame_band_count = 0;
+    std::vector<std::unique_ptr<tessera::TesseraDrawPass>> band_passes;
     /* Two-sided / foliage-card detection (drives opaque solid shading). */
     bool two_sided = false;
     /* True when this state is the base sync of a Geometry-Nodes instancer
